@@ -100,10 +100,17 @@ Hope you enjoy if you give it a try!
 # Update History (from newest to oldest)
 # ---------------------------------------
 
-# Version: 0.1.7.1 (Public Experimental Snapshot - 11th Release | March 16, 2025)
+# Version: 0.1.7.2 (Public Experimental Snapshot - 12th Release | March 16, 2025)
 
 
 - Fixed memory leaks associated with reloading the main list. The memory footprint of the mod has now been reduced drastically, especially when collapsing categories, searching, filtering, and more.
+
+
+
+# Version: 0.1.7.1 (Public Experimental Snapshot - 11th Release | March 15, 2025)
+
+
+- Fixed cases where customizing a config color would spawn the previous vehicle sometimes.
 
 
 
