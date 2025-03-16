@@ -8,7 +8,6 @@ import re # Import the regular expression module
 
 
 class CustomSlider(tk.Frame):
-    # ... (CustomSlider class remains the same as before)
     def __init__(self, master=None, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=None, **kwargs):
         super().__init__(master, **kwargs)
         self.from_value = from_
