@@ -29,7 +29,7 @@ Featuring:
 
 # How to Install?
 
-Copy the EllexiumModManager folder and the EllexiumModManagerInput.zip file from the zip provided and put it in your Mods folder.
+Copy the EllexiumModManager folder and the EllexiumModManagerInput.zip file from the EllexiumModManager zip provided and put it in your Mods folder.
 
 This means that the mod folder will now contain 2 or more folders:
 
