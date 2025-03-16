@@ -11582,17 +11582,6 @@ class ConfigViewerApp:
              print(f"Error creating PhotoImage or updating UI: {e}")
              
              
-
-    def _add_to_cache(self, cache_key, photo_image):
-        """Adds a PhotoImage to the LRU cache, evicting the least recently used if full."""
-        self.image_cache[cache_key] = photo_image # Add/update item
-        self.image_cache.move_to_end(cache_key)   # Mark as recently used
-
-        if len(self.image_cache) > self.image_cache_capacity:
-            self.image_cache.popitem(last=False) # Remove LRU item (first item in OrderedDict)
-            print("DEBUG: _add_to_cache - Evicting LRU cache item") # Debug print for eviction
-
-
 ########################
 
 
