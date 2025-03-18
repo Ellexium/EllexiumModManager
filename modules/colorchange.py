@@ -614,6 +614,7 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
 
         try:
             with open(lua_filepath, 'w', encoding='utf-8') as f:
+                f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                 f.write(lua_content)
             #messagebox.showinfo("Success", f"'{lua_filepath}' created/updated successfully!\n\nContents:\n{lua_content}")
         except Exception as e:
