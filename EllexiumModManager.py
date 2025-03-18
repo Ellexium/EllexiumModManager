@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------------
-# Version: 0.1.7.2.1 (Public Experimental Snapshot - 13th Release | March 18, 2025)
+# Version: 0.1.7.3 (Public Experimental Snapshot - 13th Release | March 18, 2025)
 # -----------------------------------------------------------------------------------
 
 import builtins
@@ -6594,10 +6594,16 @@ class ConfigViewerApp:
         window_width = 600
         window_height = 70
 
+        # Check if text contains "restart the game" and adjust window size if it does
+        if "restart the game" in text.lower(): # Convert text to lowercase for case-insensitive check
+            window_width = 700  # Smaller width
+            window_height = 140 # Smaller height
+
         # Check if text contains "disappears" and adjust window size if it does
         if "disappears" in text.lower(): # Convert text to lowercase for case-insensitive check
             window_width = 600  # Smaller width
             window_height = 140 # Smaller height
+
 
         # Set background color of the window
         scanning_window.configure(bg="#333333")  # Set background color
@@ -6862,7 +6868,17 @@ class ConfigViewerApp:
 
         
 
-    def run_spawn_queue(self):
+    def run_spawn_queue(self, retry=False, attempt_number=1):
+
+
+        if retry:
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text=f"Spawn queue spawning attempts: {attempt_number}")
+            time.sleep(0.725)
+            if scanning_win:
+                scanning_win.destroy()
+
 
         scanning_window = None # Initialize scanning_window outside try block
 
@@ -6901,9 +6917,9 @@ class ConfigViewerApp:
                 scanning_win.destroy()
             return False # Indicate failure
 
-        self.on_details_window_close()
+
         print("BeamNG.drive is running.") # Added print
-        #time.sleep(0.125) # Reduced time.sleep to quarter
+        time.sleep(1.125) # Reduced time.sleep to quarter
 
         print("Focusing BeamNG.drive window...") # Added print
         self.focus_beamng_window()
@@ -6923,8 +6939,9 @@ class ConfigViewerApp:
             return False # Indicate failure
 
         print("BeamNG.drive window focused.") # Added print
-        #time.sleep(0.125) # Reduced time.sleep to quarter
+        time.sleep(1.125) # Reduced time.sleep to quarter
 
+        self.focus_beamng_window()
 
         pydirectinput.keyDown('shift')
         pydirectinput.keyDown('ctrl')
@@ -6938,15 +6955,64 @@ class ConfigViewerApp:
         pydirectinput.keyUp('alt')
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
-        
+
+        self.on_details_window_close()
 
         if scanning_window:
             scanning_window.destroy() # Destroy the scanning window after spawn attempt
         
+        print(f"Spawn Queue actions completed. ATTEMPT {attempt_number}") # Updated message
 
-    def run_spawn_queue_transient(self): # NEW FUNCTION FOR TRANSIENT QUEUE
- 
 
+        data_folder = self.script_dir / "data"
+        COMMANDconfirmation = data_folder / "commandconfirmation.txt"
+
+        max_attempts = 7
+
+        # --- NOW CHECK FOR THE FILE AFTER RUNNING ACTIONS ---
+        print(f"Checking for file '{COMMANDconfirmation}' - Attempt {attempt_number}/{max_attempts}...")
+        if os.path.exists(COMMANDconfirmation):
+            print(f"File '{COMMANDconfirmation}' exists after actions on attempt {attempt_number}. Deleting it.")
+            try:
+                os.remove(COMMANDconfirmation)
+                print(f"File '{COMMANDconfirmation}' deleted successfully.")
+                return True # Indicate success (file existed and was deleted)
+            except OSError as e:
+                print(f"Error deleting file '{COMMANDconfirmation}': {e}")
+                return False # Indicate failure (file deletion error)
+
+        else: # File does not exist AFTER running actions
+            if attempt_number >= max_attempts: # Check attempt number for max retries
+                print(f"File '{COMMANDconfirmation}' still does not exist after {max_attempts} attempts. Stopping.")
+
+                scanning_win = None  # Initialize scanning_win
+
+                scanning_win = self.show_scanning_window(text=f"Maximum number of attempts ({attempt_number}) to spawn multiple vehicles from Spawn Queue reached. \nPlease ensure EllexiumModManagerInput.zip is in the mods folder and restart the game.")
+                time.sleep(5.725)
+                if scanning_win:
+                    scanning_win.destroy()
+
+                return False # Indicate failure (file never appeared after max attempts)
+            else:
+                print(f"File '{COMMANDconfirmation}' does not exist on attempt {attempt_number}. Retrying function...")
+                time.sleep(1.125) # Reduced time.sleep to quarter
+                return self.run_spawn_queue(retry=True, attempt_number=attempt_number + 1) # Recursive call, incrementing attempt_number
+
+
+    def run_spawn_queue_transient(self, retry=False, attempt_number=1): # NEW FUNCTION FOR TRANSIENT QUEUE, added retry parameter
+
+
+        if retry:
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text=f"Spawn/Replace/Delete/Save attempts: {attempt_number}")
+            time.sleep(0.725)
+            if scanning_win:
+                scanning_win.destroy()
+
+
+
+        # --- RUN THE FUNCTION ACTIONS FIRST ---
         if not self.is_beamng_running():
             #messagebox.showerror("Error", "BeamNG.drive is not running.")
             scanning_win = None  # Initialize scanning_win
@@ -6957,9 +7023,9 @@ class ConfigViewerApp:
                 scanning_win.destroy()
             return False # Indicate failure
 
-        self.on_details_window_close()
+
         print("BeamNG.drive is running.") # Added print
-        #time.sleep(0.125) # Reduced time.sleep to quarter
+        time.sleep(1.125) # Reduced time.sleep to quarter
 
         print("Focusing BeamNG.drive window...") # Added print
         self.focus_beamng_window()
@@ -6977,6 +7043,7 @@ class ConfigViewerApp:
 
         print("BeamNG.drive window focused.") # Added print
 
+        self.focus_beamng_window()
 
         # Press and hold Shift, Ctrl, and Alt keys
         pydirectinput.keyDown('shift')
@@ -6992,13 +7059,51 @@ class ConfigViewerApp:
         pydirectinput.keyUp('alt')
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
-        
-        
-        print("Transient Spawn Queue reading and processing completed (file not modified).") # Updated success print for transient queue
+
+        self.on_details_window_close()
 
 
-    #def attempt_console_paste_check_loading(self, paste_string, check_string): # NEW FUNCTION FOR LOADING CHECK
-    #    return attempt_console_paste_check(paste_string, check_string, is_loading_check=True) # Call main function with flag
+
+        
+
+        print(f"Transient Spawn Queue actions completed. ATTEMPT {attempt_number}") # Updated message
+
+
+        data_folder = self.script_dir / "data"
+        COMMANDconfirmation = data_folder / "commandconfirmation.txt"
+
+        max_attempts = 7 #change back to 7
+
+        # --- NOW CHECK FOR THE FILE AFTER RUNNING ACTIONS ---
+        print(f"Checking for file '{COMMANDconfirmation}' - Attempt {attempt_number}/{max_attempts}...")
+        if os.path.exists(COMMANDconfirmation):
+            print(f"File '{COMMANDconfirmation}' exists after actions on attempt {attempt_number}. Deleting it.")
+            try:
+                os.remove(COMMANDconfirmation)
+                print(f"File '{COMMANDconfirmation}' deleted successfully.")
+                return True # Indicate success (file existed and was deleted)
+            except OSError as e:
+                print(f"Error deleting file '{COMMANDconfirmation}': {e}")
+                return False # Indicate failure (file deletion error)
+
+        else: # File does not exist AFTER running actions
+            if attempt_number >= max_attempts: # Check attempt number for max retries
+                print(f"File '{COMMANDconfirmation}' still does not exist after {max_attempts} attempts. Stopping.")
+
+                scanning_win = None  # Initialize scanning_win
+
+                scanning_win = self.show_scanning_window(text=f"Maximum number of attempts ({attempt_number}) to spawn, replace, save or delete vehicle(s) reached. \nPlease ensure EllexiumModManagerInput.zip is in the mods folder and restart the game.")
+                time.sleep(5.725)
+                if scanning_win:
+                    scanning_win.destroy()
+
+                return False # Indicate failure (file never appeared after max attempts)
+            else:
+                print(f"File '{COMMANDconfirmation}' does not exist on attempt {attempt_number}. Retrying function...")
+                time.sleep(1.125) # Reduced time.sleep to quarter
+                return self.run_spawn_queue_transient(retry=True, attempt_number=attempt_number + 1) # Recursive call, incrementing attempt_number
+
+
 
 
 ##################################################### SPAWNING VEHICLES 
@@ -7018,7 +7123,7 @@ class ConfigViewerApp:
         # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
         try:
             print(f"Running Spawn Queue Transient Directly (likely through the color picker)")
-            self.run_spawn_queue_transient()
+            self.run_spawn_queue_transient(retry=False, attempt_number=1)
         except Exception as e:
             #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
             print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7087,10 +7192,11 @@ class ConfigViewerApp:
                                 modified_lines.append(line) # Keep the line as is if (USE is not found
 
                         modified_spawn_cmd = '\n'.join(modified_lines)
+                        f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                         f.write(modified_spawn_cmd + '\n') # Write command to file
                     #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                     print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                    self.run_spawn_queue_transient()
+                    self.run_spawn_queue_transient(retry=False, attempt_number=1)
                 except Exception as e:
                     #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                     print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7167,10 +7273,11 @@ class ConfigViewerApp:
                                 modified_lines.append(line) # Keep the line as is if (USE is not found
 
                         modified_spawn_cmd = '\n'.join(modified_lines)
+                        f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                         f.write(modified_spawn_cmd + '\n') # Write command to file
                     #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                     print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                    self.run_spawn_queue_transient()
+                    self.run_spawn_queue_transient(retry=False, attempt_number=1)
                 except Exception as e:
                     #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                     print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7284,10 +7391,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7318,10 +7426,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7353,10 +7462,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7388,10 +7498,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7424,10 +7535,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7441,7 +7553,21 @@ class ConfigViewerApp:
      
      
     def on_delete_parked_and_traffic_vehicles_button_click(self):
-        
+        self.on_delete_parked_and_traffic_vehicles_button_click_handle(retry=False, attempt_number=1)
+
+
+    def on_delete_parked_and_traffic_vehicles_button_click_handle(self, retry=False, attempt_number=1):
+
+
+        if retry:
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text=f"Delete attempts: {attempt_number}")
+            time.sleep(0.725)
+            if scanning_win:
+                scanning_win.destroy()
+
+
         if not self.is_beamng_running():
             #messagebox.showerror("Error", "BeamNG.drive is not running.")
             scanning_win = None  # Initialize scanning_win
@@ -7453,9 +7579,9 @@ class ConfigViewerApp:
             return False # Indicate failure
 
 
-        self.on_details_window_close()
+
         print("BeamNG.drive is running.") # Added print
-        #time.sleep(0.125) # Reduced time.sleep to quarter
+        time.sleep(1.125) # Reduced time.sleep to quarter
 
         print("Focusing BeamNG.drive window...") # Added print
         self.focus_beamng_window()
@@ -7473,6 +7599,7 @@ class ConfigViewerApp:
 
         print("BeamNG.drive window focused.") # Added print
 
+        self.focus_beamng_window()
 
         pydirectinput.keyDown('shift')
         pydirectinput.keyDown('ctrl')
@@ -7486,7 +7613,47 @@ class ConfigViewerApp:
         pydirectinput.keyUp('alt')
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
-        return
+
+
+        self.on_details_window_close()
+
+        print(f"Deletion completed. ATTEMPT {attempt_number}") # Updated message
+
+
+        data_folder = self.script_dir / "data"
+        COMMANDconfirmation = data_folder / "commandconfirmation.txt"
+
+        max_attempts = 7
+
+        # --- NOW CHECK FOR THE FILE AFTER RUNNING ACTIONS ---
+        print(f"Checking for file '{COMMANDconfirmation}' - Attempt {attempt_number}/{max_attempts}...")
+        if os.path.exists(COMMANDconfirmation):
+            print(f"File '{COMMANDconfirmation}' exists after actions on attempt {attempt_number}. Deleting it.")
+            try:
+                os.remove(COMMANDconfirmation)
+                print(f"File '{COMMANDconfirmation}' deleted successfully.")
+                return True # Indicate success (file existed and was deleted)
+            except OSError as e:
+                print(f"Error deleting file '{COMMANDconfirmation}': {e}")
+                return False # Indicate failure (file deletion error)
+
+        else: # File does not exist AFTER running actions
+            if attempt_number >= max_attempts: # Check attempt number for max retries
+                print(f"File '{COMMANDconfirmation}' still does not exist after {max_attempts} attempts. Stopping.")
+
+                scanning_win = None  # Initialize scanning_win
+
+                scanning_win = self.show_scanning_window(text=f"Maximum number of attempts ({attempt_number}) to delete vehicle(s) reached. \nPlease ensure EllexiumModManagerInput.zip is in the mods folder and restart the game.")
+                time.sleep(5.725)
+                if scanning_win:
+                    scanning_win.destroy()
+
+                return False # Indicate failure (file never appeared after max attempts)
+            else:
+                print(f"File '{COMMANDconfirmation}' does not exist on attempt {attempt_number}. Retrying function...")
+                time.sleep(1.125) # Reduced time.sleep to quarter
+                return self.on_delete_parked_and_traffic_vehicles_button_click_handle(retry=True, attempt_number=attempt_number + 1) # Recursive call, incrementing attempt_number
+  
      
      
     def on_save_current_as_default_button_click(self):
@@ -7508,10 +7675,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7584,10 +7752,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: {self.SPAWN_QUEUE_TRANSIENT_FILE}") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7660,10 +7829,11 @@ class ConfigViewerApp:
             # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
             try:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
+                    f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: {self.SPAWN_QUEUE_TRANSIENT_FILE}") # Debug
-                self.run_spawn_queue_transient()
+                self.run_spawn_queue_transient(retry=False, attempt_number=1)
             except Exception as e:
                 #messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}") # Error message if writing fails
                 print(f"ERROR: Failed to spawn: {e}") # Error print
@@ -7966,6 +8136,10 @@ class ConfigViewerApp:
             if not command_line:
                 continue
 
+            if command_line.lower().startswith("local"): # Using lower() for case-insensitive check
+                print(f"DEBUG: Skipping line starting with 'local': {command_line}")
+                continue # Skip to the next line
+
             item_frame = tk.Frame(parent_frame, bg="#444444", pady=5)
             item_frame.pack(fill="x", padx=10, pady=2)
 
@@ -8056,7 +8230,9 @@ class ConfigViewerApp:
 
 
     def on_remove_queue_item(self, command_line, item_frame):
-        """Removes a specific item from the Spawn Queue window and Spawn_Queue_Transient.txt."""
+        """Removes a specific item from the Spawn Queue window and Spawn_Queue_Transient.txt,
+        and deletes the file if it becomes empty.
+        """
         item_frame.destroy() # Remove item frame from UI
         self.spawn_queue_items = [item for item in self.spawn_queue_items if item['frame'] != item_frame] # Update item list
 
@@ -8067,6 +8243,17 @@ class ConfigViewerApp:
                 for line in lines:
                     if line.strip() != command_line.strip(): # Compare stripped lines
                         f_out.write(line)
+
+            # Check if the queue is now empty after removing the item
+            if not self.spawn_queue_items:
+                try:
+                    os.remove(self.SPAWN_QUEUE_FILE)
+                    print(f"Spawn queue file '{self.SPAWN_QUEUE_FILE}' deleted as queue is empty.")
+                except FileNotFoundError:
+                    print(f"Warning: Spawn queue file '{self.SPAWN_QUEUE_FILE}' not found when attempting to delete (queue empty).")
+                except Exception as delete_e:
+                    print(f"Error deleting {self.SPAWN_QUEUE_FILE}: {delete_e}")
+
         except Exception as e:
             print(f"Error updating {self.SPAWN_QUEUE_FILE}: {e}")
 
@@ -8077,7 +8264,7 @@ class ConfigViewerApp:
     def on_spawn_queue_spawn_button_click(self):
         """Handles the 'Spawn' button click in the Spawn Queue window."""
         self.destroy_spawn_queue_window()
-        self.run_spawn_queue() # Execute spawn queue commands
+        self.run_spawn_queue(retry=False, attempt_number=1) # Execute spawn queue commands
 
 
     def on_spawn_queue_clear_button_click(self):
@@ -16646,7 +16833,13 @@ class ConfigViewerApp:
                 self.is_details_sidebar_showing_default = False
                 # --- MODIFIED: Write to spawn queue file instead of clipboard ---
                 try:
+                    # Check if the spawn queue file exists and is not empty
+                    write_ellexium_line = not os.path.exists(self.SPAWN_QUEUE_FILE) or os.stat(self.SPAWN_QUEUE_FILE).st_size == 0
+
                     with open(self.SPAWN_QUEUE_FILE, 'a', encoding="utf-8") as f: # Open in append mode
+                        if write_ellexium_line:
+                            f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
+
                         lines = spawn_cmd.splitlines()
                         modified_lines = []
 
@@ -16662,6 +16855,7 @@ class ConfigViewerApp:
                         spawn_cmd = modified_spawn_cmd
 
                         f.write(f"{spawn_cmd} -- (USE 1|||{picture_path}||| 2[{zip_file}]\n") # MODIFIED: Write command and additional info on the same line
+
                     #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                     print(f"DEBUG: Command written to spawn queue file: '{self.SPAWN_QUEUE_FILE}'") # Debug
                 except Exception as e:
@@ -18412,6 +18606,7 @@ def main():
 
     if not os.path.exists(delete_lua_path):
         with open(delete_lua_path, "w") as f:
+            f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
             f.write("gameplay_parking.deleteVehicles()\n")
             f.write("gameplay_traffic.deleteVehicles()\n")
         print(f"Created Delete.lua file at: {delete_lua_path}")
