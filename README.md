@@ -99,6 +99,14 @@ Hope you enjoy if you give it a try!
 
 # Update History (from newest to oldest)
 # ---------------------------------------
+# Version: 0.1.7.3 (Public Experimental Snapshot - 12th Release | March 18, 2025)
+
+
+- Made the spawning/replacing/saving/deleting processes more reliable by running a check to make sure the commands have actually been run. If this check fails, it will attempt to run the commands a few more times. This should help with cases where the buttons meant to interact with the game seemingly don't do anything sometimes. 
+
+- Changed the wording on the resize window to make the instructions more clear and changed the name of the related button to "Change Window Size"
+
+
 
 # Version: 0.1.7.2 (Public Experimental Snapshot - 12th Release | March 16, 2025)
 
