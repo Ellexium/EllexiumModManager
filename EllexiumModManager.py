@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------------
-# Version: 0.1.8 (Public Experimental Snapshot - 11th Release | March 16, 2025)
+# Version: 0.1.7.2.1 (Public Experimental Snapshot - 13th Release | March 18, 2025)
 # -----------------------------------------------------------------------------------
 
 import builtins
@@ -2604,7 +2604,7 @@ class ConfigViewerApp:
         """Creates and packs the Resize Window button."""
         self.resize_button = tk.Button(
             top_frame,
-            text="Resize Window",
+            text="Change Window Size",
             command=self.open_resize_window,
             **button_style_args
         )
@@ -4517,7 +4517,7 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.settings_button = tk.Button(bottom_frame, text="Resize Window", #font=("Segoe UI", 12), # Removed redundant font argument HERE
+        self.settings_button = tk.Button(bottom_frame, text="Change Window Size", #font=("Segoe UI", 12), # Removed redundant font argument HERE
                                         command=self.open_resize_window,
                                         **button_style_args # Apply the button styles
         )
@@ -8731,7 +8731,7 @@ class ConfigViewerApp:
         def update_resize_label_text():
             width = resize_window.winfo_width()
             height = resize_window.winfo_height()
-            self.resize_label.config(text=f"Resize to\n{width} (Width)\n{height} (Height)\n\nClick here to resize, \nor close this window to cancel resize.\nResizing restarts the application.")
+            self.resize_label.config(text=f"Resize to\n{width} (Width)\n{height} (Height)\n\nDrag the edges of this window to the match the desired\nheight/width of the window then click here to resize. \nClosing this window cancels resizing.\nClicking here to resize will restart the application.")
 
         # Label in the middle, bigger font, orange hover, INITIAL TEXT with dimensions
         initial_width = resize_window.winfo_width()
@@ -11582,6 +11582,7 @@ class ConfigViewerApp:
              print(f"Error creating PhotoImage or updating UI: {e}")
              
              
+
 ########################
 
 
