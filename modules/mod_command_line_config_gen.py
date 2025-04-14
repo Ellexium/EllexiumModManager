@@ -8,7 +8,6 @@ import importlib.util
 import asyncio # Import asyncio
 
 
-
 def run_hidden_on_windows(command_list):
     """
     Run a command in a hidden console window on Windows. On other OS, runs normally.
@@ -36,7 +35,7 @@ def is_file_in_use(filepath):
         # On Windows, try to open the file in exclusive mode
         import msvcrt
         try:
-            with open(filepath, 'r+', encoding="utf-8", errors="replace") as f:
+            with open(filepath, 'r+') as f:
                 msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
             return False
@@ -203,15 +202,6 @@ def main():
     subGoodFile  = os.path.join(script_dir, "data/PicInfoExtractForNewMods", "outputGOOD.txt")
     newModsFile  = os.path.join(script_dir, "data/NewMods.txt")
 
-    print("--- mod_command_line_config_gen.py path debug---") # Print "mod_command_line_config_gen.py"
-    print("Script Directory (script_dir):", script_dir)
-    print("Input File Path (inputFile):", inputFile)
-    print("Good File Path (goodFile):", goodFile)
-    print("Bad File Path (badFile):", badFile)
-    print("Sub Good File Path (subGoodFile):", subGoodFile)
-    print("New Mods File Path (newModsFile):", newModsFile)
-
-
     # --------------------------------------------------------------------------
     # 2.1) Check if 'zip_structure.txt' is in use
     # --------------------------------------------------------------------------
@@ -240,8 +230,6 @@ def main():
     # --------------------------------------------------------------------------
     # 4) Read NewMods.txt if it exists
     # --------------------------------------------------------------------------
-    
-    '''
     newModsSet = set()
     if os.path.exists(newModsFile):
         try:
@@ -252,88 +240,6 @@ def main():
                         newModsSet.add(line.lower()) # Convert to lowercase here
         except:
             pass
-    else:    
-        print(f"something is wrong with newModsSet, forcing reading it anyways")
-
-        try:
-            with open(newModsFile, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        newModsSet.add(line.lower()) # Convert to lowercase here
-        except:
-            print(f"newModsFile not found is still broken")
-            pass
-
-    '''       
-
-
-    print("\n--- Contents of 'data' directory: ---")
-    try:
-        data_files = os.listdir(script_dir + "/data")
-        if data_files:
-            for filename in data_files:
-                print(f"- {filename}")
-        else:
-            print("data directory is empty.")
-    except FileNotFoundError:
-        print(f"Error: 'data' directory not found at path: {script_dir + '/data'}")
-    except Exception as e:
-        print(f"Error listing files in 'data' directory: {e}")
-
-
-
-
-    print(f"Current working directory: {os.getcwd()}")
-    newModsSet = set()
-
-    print(f"Checking if input exists at: {inputFile}") # Added print for file existence check
-    if os.path.exists(inputFile):
-        print(f"inputFile exists") # Added print for read attempt
-    else:
-        print(f"inputFile does NOT exist.")
-
-    print(f"Checking if newModsFile exists at: {newModsFile}") # Added print for file existence check
-    
-    if os.path.exists(newModsFile):
-        print(f"newModsFile exists, attempting to read...") # Added print for read attempt
-        try:
-            with open(newModsFile, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        newModsSet.add(line.lower()) # Convert to lowercase here
-            print(f"Successfully read newModsFile.") # Added print for successful read
-        except Exception as e:
-            print(f"Error reading newModsFile (first attempt): {e}")
-            pass
-    else:
-        print(f"newModsFile does NOT exist.")
-        print(f"something is wrong with newModsSet, forcing reading it anyways")
-
-        try:
-            with open(newModsFile, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        newModsSet.add(line.lower()) # Convert to lowercase here
-            print(f"Successfully read newModsFile (forced read).") # Added print for forced read success
-        except Exception as e:
-            print(f"newModsFile not found and is still broken: {e}")
-            pass
-
-    # --- Print the contents of newModsSet ---
-    print("\nContents of newModsSet:")
-    if newModsSet:
-        for item in newModsSet:
-            print(f"- {item}")
-    else:
-        print("newModsSet content anyways")
-
-        for item in newModsSet:
-            print(f"- {item}")
-
-        print("end of newModsSet content anyways")
 
     # --------------------------------------------------------------------------
     # 5) Hardcode the "bad names"
@@ -343,7 +249,7 @@ def main():
     vanilla_vehicles_folder_file = os.path.join(script_dir, "data", "beamng_VANILLA_vehicles_folder.txt")
     if os.path.exists(vanilla_vehicles_folder_file):
         try:
-            with open(vanilla_vehicles_folder_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(vanilla_vehicles_folder_file, "r", encoding="utf-8") as f:
                 vanilla_vehicles_path = f.readline().strip()
                 if os.path.isdir(vanilla_vehicles_path):
                     for filename in os.listdir(vanilla_vehicles_path):
@@ -717,9 +623,6 @@ woodplanks
 
         else:
             print(f"Warning: '{config_pics_extractor_module_path}' not found, skipping.")
-
-    else:
-        print(f"Warning: 'newModsSet' did not get evaluated.")
 
     # --------------------------------------------------------------------------
     # 13) Modify outputGOOD.txt to produce "outputGOOD (Original).txt"
