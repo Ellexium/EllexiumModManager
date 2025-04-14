@@ -480,8 +480,8 @@ def run_mod_command_line_config_gen_custom_integrated(script_dir, user_folder, c
     debug_print("  Checking if user_folder is valid...") # Debug - User folder check start
     if not user_folder.exists() or not user_folder.is_dir():
         error_msg = "  User folder not provided or invalid. (Integrated Script)"
-        show_message_internal("Error", error_msg) # Use internal show_message
-        debug_print(error_msg) # Debug - User folder invalid
+        #show_message_internal("Error", error_msg) # Use internal show_message
+        #debug_print(error_msg) # Debug - User folder invalid
         return # Changed from sys.exit to return in method
     debug_print("  user_folder is valid.") # Debug - User folder valid
 
@@ -514,27 +514,32 @@ def run_mod_command_line_config_gen_custom_integrated(script_dir, user_folder, c
     debug_print("  MOD_COMMAND_LINE_CONFIG_GEN_CUSTOM.py process completed (integrated method).") # Confirmation print - NEW
     debug_print("--- run_mod_command_line_config_gen_custom_integrated() EXIT - EXTREME DEBUGGING - PATHLIB IMPORTED ---\n") # Debug Exit - EXTREME DEBUGGING - PATHLIB IMPORTED
 
-
-def process_lines(self, lines, data, full_data, is_custom):
+def process_lines(self, lines, full_data, is_custom):
+    """
+    Processes lines (regular or custom) and updates the provided full_data dictionary.
+    Does NOT handle caching or final 'data' dictionary creation.
+    """
+    # NOTE: We DO NOT clear full_data here - it accumulates across calls.
 
     current_zip_file = None
     missing_custom_pic_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
     missing_zip_pic_path = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
-
     last_picture_path = None
-    representative_image_path = None
 
-    print("\n--- process_lines() DEBUGGING: STARTING PROCESSING LINES ---") # Debug start
+    # Ensure missing pictures exist (add checks if needed)
+
+    print(f"\n--- process_lines() PROCESSING {'CUSTOM' if is_custom else 'REGULAR'} LINES ---")
 
     for line in lines:
         line = line.strip()
         folder_name = None
 
+        # --- Start of original processing logic ---
         if is_custom:
             if "(config picture)" in line:
                 try:
                     folder_name_extract, rest = line.split(" - ", 1)
-                    folder_name = folder_name_extract.strip()
+                    folder_name = folder_name_extract.strip().lower()
                     full_path = rest.split("\" (config picture)")[0].strip("\"")
                     file_name_with_ext = os.path.basename(full_path)
                     file_name = os.path.splitext(file_name_with_ext)[0]
@@ -542,159 +547,201 @@ def process_lines(self, lines, data, full_data, is_custom):
                     if file_name.lower().startswith(prefix.lower()):
                         file_name = file_name[len(prefix):]
                 except ValueError:
+                    print(f"  process_lines - Skipping line due to ValueError (custom config picture): {line}")
                     continue
 
-                '''
-                # --- ADD THIS CHECK FOR CUSTOM CONFIGS --- ###################################################################################### testing
-                if folder_name.lower() == "pickup":  # Case-insensitive check
-                    print(f"DEBUG: process_lines - CUSTOM CONFIG - Skipping folder: pickup")
-                    continue  # Skip to the next line
-                # --- END ADDED CHECK ---
-                '''
-
-
-
+                if folder_name is None:
+                        print(f"  process_lines - Skipping line, folder_name is None (custom config picture): {line}")
+                        continue
 
                 picture_path = self.find_image_path(folder_name, file_name)
-                if not picture_path:
+                if not picture_path or not os.path.exists(picture_path):
                     picture_path = missing_custom_pic_path
                 last_picture_path = picture_path
-                current_picture_path = picture_path
 
             elif "core_vehicles.spawnNewVehicle" in line:
                 match = re.search(
                     r'core_vehicles\.spawnNewVehicle\("(.+?)", \{config = \'vehicles/(.+?)/(.+?)\.pc\'\}\)', line)
                 if match:
-                    folder_name, _, file_name = match.groups()
+                    folder_name_raw, _, file_name = match.groups()
+                    folder_name = folder_name_raw.lower()
                 else:
+                    match_nil = re.search(
+                        r'core_vehicles\.spawnNewVehicle\("(.+?)",\s*\{(?:config\s*=\s*(?:nil|\'\'))?\}\)', line
+                    )
+                    if match_nil:
+                        folder_name_raw = match_nil.group(1)
+                        folder_name = folder_name_raw.lower()
+                        file_name = "nil_config"
+                    else:
+                        print(f"  process_lines - Skipping line, regex failed (custom spawn): {line}")
+                        continue
+
+                if folder_name is None:
+                    print(f"  process_lines - Skipping line, folder_name is None (custom spawn): {line}")
                     continue
 
                 current_zip_file = "user_custom_configs"
                 info_data = {}
                 use_match = re.search(r'\(USE\s+(vehicles--[^)]+\.json)\)$', line)
+                info_path = None
+
                 if use_match:
                     use_info_json = use_match.group(1)
                     info_path = os.path.join(self.config_info_folder, use_info_json)
                     if os.path.exists(info_path):
                         info_data = self.extract_fallback_info(info_path)
                     else:
+                        print(f"  process_lines - USE info file not found: {info_path}")
                         info_data = self.find_fallback_info(
-                            os.path.basename(last_picture_path) if last_picture_path else ""
+                        os.path.basename(last_picture_path) if last_picture_path else ""
                         )
                 else:
-                    info_data = self.find_fallback_info(
-                        os.path.basename(last_picture_path) if last_picture_path else ""
-                    )
+                    if last_picture_path and last_picture_path != missing_custom_pic_path:
+                         img_basename = os.path.basename(last_picture_path)
+                         img_name_no_ext = os.path.splitext(img_basename)[0]
+                         # Construct individual info file name based on custom pic naming
+                         # Example: vehicles--FOLDER_user--CONFIG.ext -> vehicles--FOLDER_user--CONFIG_info.json
+                         individual_info_file = f"{img_name_no_ext}_info.json" # Check this format
+                         info_path = os.path.join(self.config_info_folder, individual_info_file)
+
+                    if info_path and os.path.exists(info_path):
+                         info_data = self.extract_fallback_info(info_path)
+                    else:
+                         info_data = self.find_fallback_info(
+                             os.path.basename(last_picture_path) if last_picture_path else ""
+                         )
+
+
+                current_picture_path_to_use = last_picture_path if last_picture_path else missing_custom_pic_path
+                if not os.path.exists(current_picture_path_to_use):
+                    current_picture_path_to_use = missing_custom_pic_path
+
 
                 if folder_name not in full_data:
                     full_data[folder_name] = []
 
-                info_key = self.generate_info_key(info_data)
+                if not isinstance(info_data, dict):
+                     print(f"ERROR: process_lines - info_data is not a dict for custom line: {line}. Resetting.")
+                     info_data = {"Name": "Data Error", "Value": 0}
+                if 'Value' not in info_data or not isinstance(info_data.get('Value'), (int, float)):
+                     info_data['Value'] = 0
+
                 full_data[folder_name].append(
-                    (current_picture_path, line, current_zip_file, info_data, folder_name)
+                    [current_picture_path_to_use, line, current_zip_file, info_data, folder_name]
                 )
+                last_picture_path = None
 
             else:
-                continue
-        else:
+                continue # Skip other custom lines
+        else: # Not is_custom (Regular Processing)
             if "(package)" in line:
                 current_zip_file = line.split(" (package)")[0].strip()
+                last_picture_path = None
                 continue
             if "core_vehicles.spawnNewVehicle" not in line:
                 continue
             if not current_zip_file:
-                continue
-            try:
-                parts = line.split("core_vehicles.spawnNewVehicle(")[1]
-                parts = parts.split(", {config = 'vehicles/")[1]
-                folder_name, rest = parts.split("/", 1)
-                file_name = rest.split(".pc'")[0]
-            except IndexError:
+                # print(f"  process_lines - Skipping line, no current_zip_file: {line}") # Can be noisy
                 continue
 
-            '''
-            # --- ADD THIS CHECK FOR NON-CUSTOM CONFIGS --- ##################################################################################### TESTING
-            if folder_name.lower() == "pickup":  # Case-insensitive check
-                print(f"DEBUG: process_lines - NON-CUSTOM CONFIG - Skipping folder: pickup")
-                continue  # Skip to the next line
-            # --- END ADDED CHECK ---
-            '''
+            try:
+                parts = line.split("core_vehicles.spawnNewVehicle(")[1]
+                nil_match = re.search(r'"(.+?)",\s*\{(?:config\s*=\s*(?:nil|\'\'))?\}\)', parts)
+                if nil_match:
+                    folder_name_raw = nil_match.group(1)
+                    folder_name = folder_name_raw.lower()
+                    file_name = "nil_config"
+                    candidate_base = f"vehicles--{folder_name}_{current_zip_file}--{file_name}" # Need base for info
+                else:
+                    config_match = re.search(r", \{config = 'vehicles/(.+?)/(.+?)\.pc'\}\)", parts)
+                    if not config_match:
+                         # Try finding just the folder name if config part is missing/different
+                         folder_match = re.search(r'"([^"]+)"', parts)
+                         if folder_match:
+                             folder_name_raw = folder_match.group(1)
+                             folder_name = folder_name_raw.lower()
+                             file_name = "unknown_config" # Placeholder if config missing
+                             candidate_base = f"vehicles--{folder_name}_{current_zip_file}--{file_name}"
+                             print(f"  process_lines - Warning: Config path missing/malformed, using folder only for: {line}")
+                         else:
+                              print(f"  process_lines - Skipping line, cannot extract folder/config (non-custom): {line}")
+                              continue
+                    else:
+                         # Standard case with config path
+                         folder_name_raw, file_name = config_match.groups()
+                         folder_name = folder_name_raw.lower()
+                         candidate_base = f"vehicles--{folder_name}_{current_zip_file}--{file_name}"
+
+            except Exception as e:
+                 print(f"  process_lines - Skipping line due to unexpected error during split (non-custom): {line} - Error: {e}")
+                 continue
+
+            if folder_name is None:
+                    print(f"  process_lines - Skipping line, folder_name is None (non-custom): {line}")
+                    continue
 
             extensions = ['jpg', 'jpeg', 'png']
             picture_path = None
             for ext in extensions:
-                candidate = f"vehicles--{folder_name}_{current_zip_file}--{file_name}.{ext}"
+                candidate = f"{candidate_base}.{ext}"
                 check_path = os.path.join(self.config_pics_folder, candidate)
                 if os.path.exists(check_path):
                     picture_path = check_path
                     break
+
             if not picture_path:
                 picture_path = missing_zip_pic_path
-            last_picture_path = picture_path
             current_picture_path = picture_path
 
             info_data = {}
-            use_info_json = re.search(r'\(USE\s+(vehicles--[^)]+\.json)\)$', line)
-            if use_info_json:
-                info_file = use_info_json.group(1)
+            use_info_json_match = re.search(r'\(USE\s+(vehicles--[^)]+\.json)\)$', line)
+            info_path = None
+
+            if use_info_json_match:
+                info_file = use_info_json_match.group(1)
+                info_path = os.path.join(self.config_info_folder, info_file)
             else:
+                # Construct standard individual info filename
+                info_file = f"{candidate_base}_info.json"
+                info_path = os.path.join(self.config_info_folder, info_file)
 
 
-                info_file = f"vehicles--{folder_name}_{current_zip_file}--info.json"
-            info_path = os.path.join(self.config_info_folder, info_file)
-            if os.path.exists(info_path):
+            if info_path and os.path.exists(info_path):
                 info_data = self.extract_fallback_info(info_path)
             else:
-                info_data = self.find_fallback_info(os.path.basename(picture_path))
+                 # Fallback to zip-level info
+                 old_info_file = f"vehicles--{folder_name}_{current_zip_file}--info.json"
+                 old_info_path = os.path.join(self.config_info_folder, old_info_file)
+                 if os.path.exists(old_info_path):
+                      info_data = self.extract_fallback_info(old_info_path)
+                 else:
+                      info_data = self.find_fallback_info(os.path.basename(picture_path))
+
 
             if folder_name not in full_data:
                 full_data[folder_name] = []
-            line_clean = re.sub(r'\(USE\s+vehicles--[^)]+\.json\)$', '', line).strip()
+
+            line_clean = re.sub(r'\s*\(USE\s+vehicles--[^)]+\.json\)$', '', line).strip()
+
+            current_picture_path_to_use = current_picture_path
+            if not os.path.exists(current_picture_path_to_use):
+                current_picture_path_to_use = missing_zip_pic_path
+
+            if not isinstance(info_data, dict):
+                 print(f"ERROR: process_lines - info_data is not a dict for regular line: {line_clean}. Resetting.")
+                 info_data = {"Name": "Data Error", "Value": 0}
+            if 'Value' not in info_data or not isinstance(info_data.get('Value'), (int, float)):
+                info_data['Value'] = 0
+
             full_data[folder_name].append(
-                (current_picture_path, line_clean, current_zip_file, info_data, folder_name)
+                [current_picture_path_to_use, line_clean, current_zip_file, info_data, folder_name]
             )
+        # --- End of original processing logic ---
 
-    # --- NEW: Determine representative image AFTER processing all lines for a folder ---
-    data.clear() # Clear data dict before repopulating
-
-    for folder_name, config_list in full_data.items():
-        representative_image_path = None
-        default_config_item = self.find_default_config_item_details(config_list, "folder_grouped") # Use "folder_grouped" as zip_file for custom configs
-
-        if default_config_item:
-            representative_image_path = default_config_item[0] # Use default config's picture
-            debug_print(f"  process_lines - Folder: {folder_name} - Using DEFAULT config image as representative: {representative_image_path}") # Debug
-        else:
-            # Fallback: Use the first config's picture if no default is set
-            if config_list:
-                representative_image_path = config_list[0][0]
-                debug_print(f"  process_lines - Folder: {folder_name} - Using FIRST config image as representative (no default): {representative_image_path}") # Debug
-            else: # Fallback to placeholder if no configs at all
-                if config_list and config_list[0][2] == "user_custom_configs": # Differentiate placeholders
-                    representative_image_path = missing_custom_pic_path
-                else:
-                    representative_image_path = missing_zip_pic_path
-                debug_print(f"  process_lines - Folder: {folder_name} - Using PLACEHOLDER image as representative (no configs or default not found).") # Debug
-
-        if folder_name not in data:
-             if config_list: # Ensure there's at least one config to take data from
-                # Use data from the first config item to populate main grid entry
-                first_config = config_list[0]
-                _, line_clean, current_zip_file, info_data, folder_name_from_config = first_config # Unpack
-                data[folder_name] = (
-                    representative_image_path, # Determined representative image path
-                    line_clean,
-                    current_zip_file,
-                    info_data,
-                    folder_name_from_config
-                )
-             else:
-                 debug_print(f"Warning: No configs found for folder '{folder_name}', skipping data entry.") # Debug - No Configs Warning
-
-    print("--- process_lines() DEBUGGING: FINISHED PROCESSING LINES ---\n") # Debug end
-
-
-    return data, full_data
+    print(f"--- process_lines() FINISHED PROCESSING {'CUSTOM' if is_custom else 'REGULAR'} LINES ---")
+    # No post-processing here, just return the updated dictionary
+    return full_data
 
 # ------------------------------------------------------------
 # NEW: Integrated modify_output_good functionality
@@ -716,6 +763,15 @@ def run_modify_output_good_integrated(self):
         - output_file (str): Path to the outputGOODcustom.txt file.
         - config_info_dir (str): Path to the configInfo directory containing info.json files.
         """
+
+        cache_file_path = self.script_dir / "data" / "config_processing_cache.json"
+        if cache_file_path.exists():
+            try:
+                cache_file_path.unlink()
+                print(f"DEBUG: Deleted cache file due to mod scan: {cache_file_path}")
+            except OSError as e:
+                print(f"Warning: Failed to delete cache file {cache_file_path}: {e}")
+
 
         # Verify the existence of the output file
         if not os.path.isfile(output_file):
