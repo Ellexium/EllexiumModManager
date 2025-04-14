@@ -8,7 +8,7 @@ import re # Import the regular expression module
 
 
 class CustomSlider(tk.Frame):
-    def __init__(self, master=None, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=None, **kwargs):
+    def __init__(self, master=None, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=None, font_size_add=0, **kwargs):
         super().__init__(master, **kwargs)
         self.from_value = from_
         self.to_value = to
@@ -17,6 +17,8 @@ class CustomSlider(tk.Frame):
         self.command = command
         self._value = tk.DoubleVar(self, value=from_)
         self._enabled = tk.BooleanVar(self, value=True) # Track enabled state
+
+        self.font_size_add = font_size_add
 
         self.canvas_width = 200
         self.canvas_height = 25
@@ -38,7 +40,7 @@ class CustomSlider(tk.Frame):
         self.canvas.bind("<Enter>", self._on_enter) # Bind hover enter event
         self.canvas.bind("<Leave>", self._on_leave) # Bind hover leave event
 
-        self.percentage_label = tk.Label(self, text="0%", width=4, font=("Segoe UI", 12, "bold"), fg="lightgrey", bg="#333333") # Styled label
+        self.percentage_label = tk.Label(self, text="0%", width=4, font=("Segoe UI", 12+self.font_size_add, "bold"), fg="lightgrey", bg="#333333") # Styled label
 
         self.percentage_label.pack(side=tk.RIGHT, padx=5)
 
@@ -236,6 +238,8 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
         self.title("Pick Color") # Changed title
         self.configure(bg="#333333") # Set background for the main window
 
+        self.font_size_add = self._load_font_size_setting()
+
         # Main frame to contain everything and handle centering
         self.main_frame = tk.Frame(self, bg="#333333")
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=0) # Padding around main frame
@@ -243,12 +247,12 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
         self.main_frame.columnconfigure(1, weight=1) # Allow column 1 (sliders) to expand
 
         # Title Label
-        self.app_title_label = tk.Label(self.main_frame, text="Color Configuration", font=("Segoe UI", 13, "bold"), fg="white", bg="#333333")
+        self.app_title_label = tk.Label(self.main_frame, text="Color Configuration", font=("Segoe UI", 13+self.font_size_add, "bold"), fg="white", bg="#333333")
         self.app_title_label.grid(row=0, column=0, columnspan=2, pady=10)
 
 
         # Font for all widgets
-        font = ("Segoe UI", 12)
+        font = ("Segoe UI", 12+self.font_size_add)
 
         # Button default and hover colors
         button_default_bg = "#555555"
@@ -317,27 +321,31 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
 
         # Sliders for paint properties - using grid inside respective column frames - remain the same
         self.clearcoat_label = tk.Label(self.labels_column_frame, text="Clearcoat:", font=font, fg="white", bg="#333333")
-        self.clearcoat_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoat, bg="#333333")
-        self.clearcoat_label.grid(row=1, column=0, sticky='ne', padx=5, pady=7) # Row 1 in labels column, pady increased
-        self.clearcoat_slider.grid(row=1, column=1, sticky='ew', padx=5, pady=7) # Row 1 in sliders column, pady increased
+        # --- ADDED font_size_add ---
+        self.clearcoat_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoat, font_size_add=self.font_size_add, bg="#333333")
+        self.clearcoat_label.grid(row=1, column=0, sticky='ne', padx=5, pady=7)
+        self.clearcoat_slider.grid(row=1, column=1, sticky='ew', padx=5, pady=7)
 
 
         self.clearcoatRoughness_label = tk.Label(self.labels_column_frame, text="Clearcoat Roughness:", font=font, fg="white", bg="#333333")
-        self.clearcoatRoughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoatRoughness, bg="#333333")
-        self.clearcoatRoughness_label.grid(row=2, column=0, sticky='ne', padx=5, pady=7) # Row 2 in labels column, pady increased
-        self.clearcoatRoughness_slider.grid(row=2, column=1, sticky='ew', padx=5, pady=7) # Row 2 in sliders column, pady increased
+        # --- ADDED font_size_add ---
+        self.clearcoatRoughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoatRoughness, font_size_add=self.font_size_add, bg="#333333")
+        self.clearcoatRoughness_label.grid(row=2, column=0, sticky='ne', padx=5, pady=7)
+        self.clearcoatRoughness_slider.grid(row=2, column=1, sticky='ew', padx=5, pady=7)
 
 
         self.metallic_label = tk.Label(self.labels_column_frame, text="Metallic:", font=font, fg="white", bg="#333333")
-        self.metallic_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_metallic, bg="#333333")
-        self.metallic_label.grid(row=3, column=0, sticky='ne', padx=5, pady=7) # Row 3 in labels column, pady increased
-        self.metallic_slider.grid(row=3, column=1, sticky='ew', padx=5, pady=7) # Row 3 in sliders column, pady increased
+        # --- ADDED font_size_add ---
+        self.metallic_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_metallic, font_size_add=self.font_size_add, bg="#333333")
+        self.metallic_label.grid(row=3, column=0, sticky='ne', padx=5, pady=7)
+        self.metallic_slider.grid(row=3, column=1, sticky='ew', padx=5, pady=7)
 
 
         self.roughness_label = tk.Label(self.labels_column_frame, text="Roughness:", font=font, fg="white", bg="#333333")
-        self.roughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_roughness, bg="#333333")
-        self.roughness_label.grid(row=4, column=0, sticky='ne', padx=5, pady=7) # Row 4 in labels column, pady increased
-        self.roughness_slider.grid(row=4, column=1, sticky='ew', padx=5, pady=7) # Row 4 in sliders column, pady increased
+        # --- ADDED font_size_add ---
+        self.roughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_roughness, font_size_add=self.font_size_add, bg="#333333")
+        self.roughness_label.grid(row=4, column=0, sticky='ne', padx=5, pady=7)
+        self.roughness_slider.grid(row=4, column=1, sticky='ew', padx=5, pady=7)
 
 
         self.save_button = tk.Button(self.main_frame, text="Save File", command=self.save_file, state=tk.DISABLED, font=font, bg="#555555", fg="white", relief=tk.FLAT, highlightthickness=0) # Initially disabled save button
@@ -370,6 +378,41 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
 
 
         self.auto_load_file() # Call auto_load_file at startup
+
+
+    def _load_font_size_setting(self):
+        """Reads FontSizeAdd from data/MMSelectorSettings.txt."""
+        default_size = 0 # Default value if file/setting is missing or invalid
+        try:
+            # Determine the correct path relative to the script's parent directory
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(script_dir) # Assumes script is in a subdir
+            settings_file_path = os.path.join(parent_dir, "data", "MMSelectorSettings.txt")
+
+            if not os.path.exists(settings_file_path):
+                print(f"Warning: Settings file not found at {settings_file_path}. Using default font size addon ({default_size}).")
+                return default_size
+
+            with open(settings_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("FontSizeAdd:"):
+                        try:
+                            # Extract the value after the colon
+                            value_str = line.split(':', 1)[1].strip()
+                            return int(value_str) # Convert to integer and return
+                        except (IndexError, ValueError):
+                            print(f"Warning: Invalid format for FontSizeAdd in {settings_file_path}. Using default ({default_size}).")
+                            return default_size # Return default if value is not integer
+
+            # If loop finishes without finding the key
+            print(f"Warning: 'FontSizeAdd:' key not found in {settings_file_path}. Using default font size addon ({default_size}).")
+            return default_size
+
+        except Exception as e: # Catch potential file reading errors etc.
+            print(f"Error reading settings file {settings_file_path}: {e}. Using default font size addon ({default_size}).")
+            return default_size
+        
 
 
     def auto_load_file(self):
@@ -716,22 +759,31 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
                     self.update_color_swatch("#FFFFFF") # Default white swatch for invalid color
 
 
-                # Initialize sliders with values from JSON or defaults if missing
-                self.clearcoat_slider.set(paint.get('clearcoat', paint.get('clearcoat', 1.0))) # Default to 1.0 as float
-                self.clearcoatRoughness_slider.set(paint.get('clearcoatRoughness', paint.get('clearcoatRoughness', 0.03)))
-                self.metallic_slider.set(paint.get('metallic', paint.get('metallic', 1.0))) # Default to 1.0 as float
-                self.roughness_slider.set(paint.get('roughness', paint.get('roughness', 0.65)))
+                # --- FIX IS HERE: Convert values to float before setting sliders ---
+                def get_paint_value_as_float(key, default_value):
+                    raw_value = paint.get(key, default_value)
+                    try:
+                        return float(raw_value)
+                    except (ValueError, TypeError):
+                        print(f"Warning: Could not convert paint value '{raw_value}' for key '{key}' to float. Using default {default_value}.")
+                        return float(default_value) # Ensure default is also float
+
+                self.clearcoat_slider.set(get_paint_value_as_float('clearcoat', 1.0))
+                self.clearcoatRoughness_slider.set(get_paint_value_as_float('clearcoatRoughness', 0.03))
+                self.metallic_slider.set(get_paint_value_as_float('metallic', 1.0))
+                self.roughness_slider.set(get_paint_value_as_float('roughness', 0.65))
+                # --- END FIX ---
 
 
-            # self.color_display_label.config(text=color_text if color_text else "No base colors found in loaded file.") # No longer needed - text display removed
         else:
             self.update_color_swatch("#FFFFFF") # Default white swatch if no data loaded
-            # self.color_display_label.config(text="No base colors to display. Load a file first.") # No longer needed - text display removed
             self.reset_slider_values() # Reset sliders if no data loaded
+
+        # Enable/Disable swatch based on data presence (unchanged)
         if not hasattr(self, 'data') or self.data is None:
-            self.color_swatch_canvas.config(state=tk.DISABLED) # Disable swatch if no file loaded
+            self.color_swatch_canvas.config(state=tk.DISABLED)
         else:
-            self.color_swatch_canvas.config(state=tk.NORMAL) # Enable swatch if file loaded
+            self.color_swatch_canvas.config(state=tk.NORMAL)
 
 
     def update_color_swatch(self, color_hex):
