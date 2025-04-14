@@ -1,43 +1,189 @@
 import os
 import tkinter as tk
+import inspect 
+
 
 def throttled_resize(app, event):
-        """
-        Handles the main window resize event with debounce, only updating layout on column breakpoint change.
-        """
-        if event.widget == app.master:
-            new_width = app.master.winfo_width()
-            new_height = app.master.winfo_height()
-            if (new_width != app.last_width) or (new_height != app.last_height):
-                app.last_width = new_width
-                app.last_height = new_height
-                # Pause loading during resize
-                app.pause_loading = True
-                # Cancel any existing debounce timer
-                if app.resize_timer is not None:
-                    app.master.after_cancel(app.resize_timer)
-                    app.resize_timer = None
-                # Set a new debounce timer (e.g., 300ms)
-                debounce_delay = 1000  # milliseconds
-                app.resize_timer = app.master.after(debounce_delay, lambda: on_resize_complete(app))
+    """
+    Handles the main window resize event with debounce, only updating layout on column breakpoint change.
+    """
+
+    if event.widget == app.master:
+        new_width = app.master.winfo_width()
+        new_height = app.master.winfo_height()
+        if (new_width != app.last_width) or (new_height != app.last_height):
+            
+            app.resizing_window = True
+            app.window_was_resized = True
+            app.window_was_resized_2 = True
+            
+
+
+
+            
+            if app.search_results_window_on_screen:
+                print(f"if app.search_results_window_on_screen is true, temporarily destroying search results window with  app.search_results_window.destroy()")
+                app.search_results_window.destroy()
+            
+
+            app.hide_main_grid_and_sidebar_start_passed += 1 # Set the flag for subsequent calls
+
+            app.hide_main_grid_and_sidebar()
+            print("DEBUG: hide_main_grid_and_sidebar called")
+
+            if (hasattr(app, 'details_window') and      # Condition 1
+                app.details_window is not None and      # Condition 2
+                app.details_window.winfo_exists() and   # Condition 3
+                app.details_window.wm_state() != 'withdrawn'): # Condition 4
+                    # This block only runs if ALL conditions are True
+                    try:
+                        app.details_window.withdraw()
+                        print("DEBUG: details_window.withdraw() called")
+                    except tk.TclError as e:
+                        print(f"Error withdrawing details window: {e}")
+                    app.details_page_before_resize = getattr(app, 'details_page', 0)
+                    print(f"DEBUG: Storing details page before resize: {app.details_page_before_resize}")
+
+
+            #app.text_to_switch_back_to = app.new_button_label
+
+            #if app.switch_to_beamng_button:
+            #    app.switch_to_beamng_button.config(
+            #        text=f"Resizing window to {new_height}x{new_width}",
+            #        fg=app.global_highlight_color
+            #    )
+            
+            app.no_configs_label.config(text=f"Adjusting window size... ({new_height}x{new_width})") # Set text
+            app.no_configs_label.pack(side="left", padx=(10, 10)) # Make label visible
+
+
+            # Determine the available width for images
+            app.canvas.update_idletasks()
+            width = app.canvas.winfo_width() - 60
+            if app.columns is None:
+                app.columns, app.column_padding = app.calculate_columns_for_width(width)
+            else:
+                _, app.column_padding = app.calculate_columns_for_width(width)
+
+
+
+        print("Size changed to:", new_width, new_height)
+        app.last_width = new_width
+        app.last_height = new_height
+        # Pause loading during resize
+        app.pause_loading = True
+        # Cancel any existing debounce timer
+        if app.resize_timer is not None:
+            app.master.after_cancel(app.resize_timer)
+            app.resize_timer = None
+        # Set a new debounce timer (e.g., 300ms)
+        debounce_delay = 2000  # milliseconds
+        app.resize_timer = app.master.after(debounce_delay, lambda: on_resize_complete(app))
+
+        app.on_resize_complete_called += 1  # Increment the call count
 
 
 def on_resize_complete(app):
-        """
-        Callback function triggered after debounce for main window resize.
-        Updates the grid layout only if the number of columns needs to change.
-        """
+    """
+    Callback function triggered after debounce.
+    MODIFIED: Only performs actions if a resize actually occurred.
+    """
+    print("\n--- DEBUG: on_resize_complete triggered ---")
+    # Always clear the timer ID, regardless of resize or move
+    app.resize_timer = None
+    
+    app.hide_no_configs_label()
+    
+    
+    # --- ADDED CHECK ---
+    # Only proceed with layout updates and state restoration IF the flag
+    # indicates a size change happened during the sequence of events.
+    if app.window_was_resized:
+        print("DEBUG: Actual resize detected (window_was_resized=True). Performing actions.")
+
+        # --- Start of Original on_resize_complete Logic (Now Indented) ---
         canvas_width = app.canvas.winfo_width() - 60 # Adjust for margins
         if canvas_width <= 0:
-            return # Avoid calculations with non-positive width
+             print("DEBUG: Canvas width invalid, aborting resize actions.") # Added log
+             # Need to reset flags even if aborting here
+             app.resizing_window = False
+             app.pause_loading = False
+             app.window_was_resized = False # Reset the flag
+             app.window_was_resized_2 = False # Reset the flag
+             return
 
         potential_columns = app.calculate_columns_for_width(canvas_width)
-        if app.columns is None or potential_columns != app.columns: # Check if app.columns is None for initial setup
-            app.columns = potential_columns # Update column count
+        app.columns = potential_columns # Update column count
+
+        app.is_search_results_window_active_bypass_flag = True
+        app.is_search_results_window_active = False
+
+        app._track_normal_geometry()
+        app.save_window_geometry()
+        print("DEBUG: on_resize_complete - app._track_normal_geometry() and app.save_window_geometry() called")
+
+        if app.search_results_window_on_screen:
+            app.window_size_changed_during_search_results_window = True
+            print("DEBUG - app.window_size_changed_during_search_results_window = True")
+            if not app.details_window:
+                app.search_results_window = app.show_search_results_window(app.data)
+                print("DEBUG - recreating search results window because the details window is not open")
+            else:
+                print("DEBUG - not recreating search results window because details window is open, this should be handled in the on details window close function")
+            print("DEBUG: on_resize_complete thinks the search result is active -  if app.search_results_window_on_screen: is true")
+        else:
+            print("DEBUG: on_resize_complete DOES NOT THINK the search result is active -  if app.search_results_window_on_screen: is False")
+
+        if app.details_window: 
+            app.window_size_changed_during_details_window = True
+            print("DEBUG: on_resize_complete - app.details_window is not None, details window on screen, window_size_changed_during_details_window = True")
+            try: # Minor safety addition
+                app.details_window.deiconify()
+                print("DEBUG: on_resize_complete - app.details_window.deiconify() called")
+            except tk.TclError:
+                print("DEBUG: Error during details_window.deiconify(), window might not exist.")
+
+
+        #if app.switch_to_beamng_button:
+        #     try: # Minor safety addition + avoid duplicate config
+        #         app.switch_to_beamng_button.config(
+        #             text=app.text_to_switch_back_to,
+        #             fg="white"
+        #         )
+        #     except tk.TclError:
+        #         print("DEBUG: Error configuring switch_to_beamng_button.")
+
+
+        app.show_main_grid_and_sidebar() # Show the main grid and sidebar again
+        print("DEBUG: show_main_grid_and_sidebar called after resize")
+
+        if not app.details_window and not app.search_results_window_on_screen: 
+            print("if not app.details_window and not app.search_results_window_on_screen: Condition met, calling update_grid_layout")
             app.update_grid_layout()
-        # Resume loading after layout check (or update)
-        app.pause_loading = False
-        app.resize_timer = None
+
+        # Reset flags specific to resize completion *inside* the 'if'
+        app.resizing_window = False # Reset resizing state
+        print("DEBUG: Resizing window completed, app.resizing_window = False")
+        app.pause_loading = False # Resume loading
+        print("DEBUG: Resuming loading")
+
+        # *** IMPORTANT: Reset the flag that was checked ***
+        app.window_was_resized = False
+        app.window_was_resized_2 = False # Reset this too if it's used elsewhere
+
+        # --- End of Original on_resize_complete Logic ---
+
+    else:
+        # --- ADDED ELSE BLOCK ---
+        # This block runs if the timer fired, but no resize occurred (just a move)
+        print("DEBUG: No resize detected (window_was_resized=False). Skipping layout actions.")
+        # Ensure essential state flags are reset even after just a move
+        app.resizing_window = False # Ensure this is false
+        app.pause_loading = False   # Ensure loading is not paused
+
+    print("--- END on_resize_complete ---")
+
+
 
 
 # ------------------------------------------------------------
@@ -92,7 +238,6 @@ def start_scroll_debounce_timer_main_grid(app):
         lambda: on_scroll_debounce_complete_main_grid(app) # Callback when timer finishes
     )
 
-import tkinter as tk
 
 def on_scroll_debounce_complete_main_grid(app):
     """Callback function when main grid scroll debounce timer completes.
@@ -282,14 +427,36 @@ def calculate_columns_for_width(app, width, is_details=False): #using the window
     """
     Given the window width, determine how many columns can fit and calculate dynamic horizontal padding.
     """
+
+
+    stack = inspect.stack()
+    caller_function_name = "<unknown>"
+    caller_filename = "<unknown>"
+    caller_lineno = 0
+    if len(stack) > 1:
+        # stack[0] is the current frame (update_grid_layout)
+        # stack[1] is the caller's frame
+        caller_frame_record = stack[1]
+        caller_function_name = caller_frame_record.function
+        caller_filename = caller_frame_record.filename
+        caller_lineno = caller_frame_record.lineno
+        # You can even get the specific code line that made the call:
+        caller_code_context = caller_frame_record.code_context
+        print(f"    Code context: {caller_code_context}") # Might be None
+
+    print(f"--- calculate_columns_for_width CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
     image_width = 252
     min_padding = 1  # Minimum spacing between images
 
     # Get window width directly from app master
     
     if not is_details:
+        print(f"function signature [[ def calculate_columns_for_width(app, width, is_details=False): ]] - is_details is false")
         width = app.master.winfo_width()
     else:
+        print(f"function signature [[ def calculate_columns_for_width(app, width, is_details=False): ]] - is_details is true")
         width = app.details_window.winfo_width()
 
     # Subtract sidebar width (270 pixels) from available width for layout calculations
@@ -350,4 +517,3 @@ def animate_scroll_search_results(app, step, canvas_sub):
         app.scroll_animation_duration // app.scroll_animation_steps,
         lambda: animate_scroll_search_results(app, step + 1, canvas_sub)
     )
-    
