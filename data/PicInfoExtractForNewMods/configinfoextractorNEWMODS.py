@@ -6,6 +6,9 @@ import shutil
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+import tkinter as tk
+
+
 #changing the encoding
 
 # ========================
@@ -26,6 +29,97 @@ print(f"MODS_REPO_PATH: {MODS_REPO_PATH}")
 print(f"CONFIG_INFO_FOLDER: {CONFIG_INFO_FOLDER}")
 print(f"LOG_FILE_PATH: {LOG_FILE_PATH}")
 print(f"ERROR_LOG_PATH: {ERROR_LOG_PATH}")
+
+
+# ========================
+# Show the scanning window
+# ========================
+
+
+scan_window_position_file = os.path.abspath(os.path.join(SCRIPT_PATH, "..", "data/scanning_window_position.txt")) 
+
+
+scanning_window = tk.Toplevel() # Assuming you have a root window created elsewhere
+
+scanning_window.attributes('-topmost', True)
+scanning_window.tk.call('tk', 'scaling', 1.25)
+scanning_window.resizable(False, False)
+
+# Define scanning window size - default values
+window_width = 600
+window_height = 70
+
+# --- Load position from file or use default ---
+pos_x = None
+pos_y = None
+position_loaded = False
+
+# Use the pathlib path directly
+if os.path.exists(scan_window_position_file):
+    try:
+        with open(scan_window_position_file, 'r') as f:
+            content = f.read().strip() # Read and remove leading/trailing whitespace
+            if content: # Check if the file is not empty
+                parts = content.split(',')
+                if len(parts) == 2:
+                    # Try converting parts to integers
+                    loaded_x = int(parts[0].strip())
+                    loaded_y = int(parts[1].strip())
+                    pos_x = loaded_x
+                    pos_y = loaded_y
+                    position_loaded = True
+                    print(f"Loaded position from file: ({pos_x}, {pos_y})") # Optional logging
+                else:
+                    print(f"Warning: Invalid format in {scan_window_position_file}. Expected 'x,y'. Using default position.")
+            else:
+                 print(f"Warning: Position file {scan_window_position_file} is empty. Using default position.")
+    except ValueError:
+        print(f"Warning: Non-numeric coordinates found in {scan_window_position_file}. Using default position.")
+    except Exception as e:
+        # Catch other potential errors during file reading
+        print(f"Error reading position file {scan_window_position_file}: {e}. Using default position.")
+else:
+    print(f"Position file not found: {scan_window_position_file}. Using default position.") # Optional logging
+
+
+# --- Fallback to centering if position wasn't loaded ---
+if not position_loaded:
+    # Ensure window manager has processed geometry requests before getting screen size
+    scanning_window.update_idletasks()
+    screen_width = scanning_window.winfo_screenwidth()
+    screen_height = scanning_window.winfo_screenheight()
+    pos_x = (screen_width // 2) - (window_width // 2)
+    pos_y = (screen_height // 2) - (window_height // 2)
+    print(f"Using default centered position: ({pos_x}, {pos_y})") # Optional logging
+
+# --- Configure and place the window ---
+
+# Set background color of the window
+scanning_window.configure(bg="#333333")  # Set background color
+
+scanning_window.overrideredirect(True)  # Remove window border
+scanning_window.config(highlightthickness=5, highlightbackground="#555555") # Add border here
+
+# Set the geometry of the scanning window using the determined position
+if pos_x is not None and pos_y is not None: # Check if pos_x/pos_y were set
+    scanning_window.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+else:
+    # Handle the unlikely case where neither loading nor centering worked (shouldn't happen with this logic)
+    print("Error: Window position could not be determined. Placing at default.")
+    scanning_window.geometry(f"{window_width}x{window_height}") # Place without position offset
+
+lbl = tk.Label(
+    scanning_window,
+    text="Copying mod and vehicle information to data folder...",
+    font=("Segoe UI", 12, "bold"),
+    fg="#ffffff",
+    bg="#333333"
+)
+lbl.pack(expand=True, padx=20, pady=20)
+
+scanning_window.update()
+
+
 
 
 # ========================
@@ -288,9 +382,37 @@ async def main():
     log_file.close()
     error_log.close()
 
+    if scanning_window: # Check if the window variable exists
+            try:
+                scanning_window.destroy() # Close the Tkinter window
+            except tk.TclError as e:
+                # Handle cases where the window might already be destroyed
+                # or in an invalid state (less likely here, but good practice)
+                print(f"Info: Could not destroy scanning window (might already be closed): {e}")
+
 
 if __name__ == "__main__":
     start_time = time.time()
-    asyncio.run(main())
+    try:
+        # Run the main asynchronous function
+        asyncio.run(main())
+
+    finally:
+        # This block executes after asyncio.run(main()) finishes,
+        # regardless of whether main() completed successfully or raised an error.
+        print("Main execution finished. Attempting to close scanning window.") # Optional debug print
+
+        try:
+
+            if scanning_window:
+                scanning_window.destroy() # Close the Tkinter window
+        except NameError:
+            # Handle case where 'scanning_window' might not have been defined
+            print("Info: 'scanning_window' variable not found.")
+        except tk.TclError as e:
+            # Handle cases where the window might already be destroyed or invalid
+            print(f"Info: Could not destroy scanning window (might already be closed/invalid): {e}")
+
+    # Calculate and print time *after* the main work and cleanup attempt
     end_time = time.time()
     print(f"Execution time: {end_time - start_time:.2f} seconds")
