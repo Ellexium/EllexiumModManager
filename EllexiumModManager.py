@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------------
-# Version: 0.1.7.3 (Public Experimental Snapshot - 13th Release | March 18, 2025)
+# Version: 0.1.9 (Public Experimental Snapshot - 14th Release | April 13, 2025)
 # -----------------------------------------------------------------------------------
 
 import builtins
@@ -28,6 +28,9 @@ import importlib.util
 import functools
 import zipfile
 import gc
+import inspect
+import random
+
 #from memory_profiler import profile  
 
 from collections import OrderedDict
@@ -35,10 +38,26 @@ from collections import OrderedDict
 
 import pydirectinput
 import win32gui
+import win32con
+import win32api
+import win32process
+
+import win32com.client # For COM objects
+import pythoncom       # For COM initialization/uninitialization
+from win32com.shell import shell, shellcon # For getting Desktop path
+
+
+
 import ctypes
 import pywintypes
 
 from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+
+from threading import Thread
+import queue
+
 
 from modules.config_processors import (
     run_configpicextractor_custom_integrated,
@@ -87,11 +106,119 @@ from modules.resize_and_scroll import (
 from modules.colorchange import (
     create_color_picker_window,
 )
+
 # ------------------------------------------------------------
-# List of zip base names for fallback info extraction
+#  First time initialization
 # ------------------------------------------------------------
 
 
+def create_desktop_shortcut_pywin32(script_dir, bat_filename, shortcut_name, icon_filename=None, description=""):
+
+    target_bat_path = script_dir / bat_filename
+    shortcut_filename = f"{shortcut_name}.lnk"
+
+    # --- Verify target .bat file exists ---
+    if not target_bat_path.is_file():
+        # Use a temporary root for messagebox if main one isn't ready
+        temp_root = tk.Tk()
+        temp_root.withdraw()
+        # Attempt to set icon for the error messagebox
+        icon_path_for_msgbox_str = None
+        if icon_filename:
+             icon_path_obj = script_dir / icon_filename
+             if icon_path_obj.is_file():
+                 icon_path_for_msgbox_str = str(icon_path_obj.resolve())
+        if icon_path_for_msgbox_str:
+            try:
+                temp_root.iconbitmap(icon_path_for_msgbox_str)
+            except tk.TclError:
+                print(f"Warning: Could not set iconbitmap for error messagebox.")
+        messagebox.showerror("Error", f"Target batch file not found:\n{target_bat_path}", parent=temp_root)
+        temp_root.destroy()
+        return False
+
+    # --- Construct and verify icon path if provided ---
+    icon_path = None
+    icon_path_for_msgbox_str = None # Also store for internal messageboxes
+    if icon_filename:
+        icon_path_obj = script_dir / icon_filename # icon_filename is relative path like "data/icon.ico"
+        if icon_path_obj.is_file():
+            icon_path = str(icon_path_obj.resolve()) # Use absolute path for shortcut icon
+            icon_path_for_msgbox_str = icon_path # Use same path for messagebox icon
+            print(f"Using icon: {icon_path}")
+        else:
+            # Use a temporary root for messagebox
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            # Set icon for this temporary root if possible (redundant here as icon wasn't found, but good practice)
+            # We won't have icon_path_for_msgbox_str here if the file is missing
+            messagebox.showwarning("Warning", f"Icon file not found:\n{icon_path_obj}\nShortcut will use default icon.", parent=temp_root)
+            temp_root.destroy()
+            # Keep icon_path as None
+
+    try:
+        # --- Get Desktop Path using COM ---
+        try:
+            pythoncom.CoInitialize()
+            com_initialized_here = True
+        except pythoncom.com_error: # Already initialized
+            com_initialized_here = False
+
+        try:
+            desktop_path_str = shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0)
+            desktop_path = Path(desktop_path_str)
+            shortcut_path = str(desktop_path / shortcut_filename)
+
+            print(f"Script Directory: {script_dir}")
+            print(f"Target BAT Path: {target_bat_path}")
+            print(f"Shortcut Path: {shortcut_path}")
+            print(f"Working Directory: {str(script_dir)}")
+
+            # --- Create Shortcut using COM ---
+            shell_obj = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell_obj.CreateShortcut(shortcut_path)
+            shortcut.TargetPath = str(target_bat_path.resolve())
+            shortcut.Arguments = ""
+            shortcut.Description = description
+            shortcut.WorkingDirectory = str(script_dir)
+            shortcut.WindowStyle = 1
+
+            if icon_path:
+                shortcut.IconLocation = f"{icon_path},0"
+
+            shortcut.Save()
+            print("Shortcut created successfully.")
+            return True
+        except Exception as e:
+            # Use a temporary root for messagebox
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            # Attempt to set icon for the error messagebox
+            if icon_path_for_msgbox_str:
+                 try:
+                     temp_root.iconbitmap(icon_path_for_msgbox_str)
+                 except tk.TclError:
+                     print(f"Warning: Could not set iconbitmap for error messagebox.")
+            messagebox.showerror("Shortcut Error", f"Failed to create shortcut using COM:\n{e}", parent=temp_root)
+            temp_root.destroy()
+            return False
+        finally:
+            if com_initialized_here:
+                pythoncom.CoUninitialize()
+
+    except Exception as e:
+        # Use a temporary root for messagebox
+        temp_root = tk.Tk()
+        temp_root.withdraw()
+        # Attempt to set icon for the error messagebox
+        if icon_path_for_msgbox_str:
+             try:
+                 temp_root.iconbitmap(icon_path_for_msgbox_str)
+             except tk.TclError:
+                 print(f"Warning: Could not set iconbitmap for error messagebox.")
+        messagebox.showerror("Error", f"An unexpected error occurred:\n{e}", parent=temp_root)
+        temp_root.destroy()
+        return False
 
 
 
@@ -776,29 +903,152 @@ class ConsoleWindow(tk.Toplevel):
 
 
 
+class KeyboardDiffHandler(FileSystemEventHandler):
+    """
+    Handles file system events for keyboard.diff using a timer-based
+    debounce to process only after a period of inactivity.
+    """
+    def __init__(self, filepath, queue, parse_func):
+        self.filepath = filepath
+        self.queue = queue
+        self.parse_func = parse_func
+        self.debounce_timer = None
+        # Wait this long after the *last* event before processing
+        self.processing_delay = 0.2 # 200ms, adjust as needed
+
+    def _schedule_processing(self):
+        """Cancels any existing timer and schedules a new one."""
+        # Cancel previous timer if it exists and hasn't run yet
+        if self.debounce_timer and self.debounce_timer.is_alive():
+            # print("DEBUG Handler: Cancelling previous timer.") # Optional debug
+            self.debounce_timer.cancel()
+
+        # Schedule the actual processing function
+        # print(f"DEBUG Handler: Scheduling processing in {self.processing_delay}s") # Optional debug
+        self.debounce_timer = threading.Timer(self.processing_delay, self._process_file_change)
+        self.debounce_timer.start()
+
+    def _process_file_change(self):
+        """
+        This function runs after the delay. It checks the final state
+        of the file and queues the result.
+        """
+        print(f"DEBUG Handler: Timer expired, processing final state of {self.filepath}")
+        # Check if file exists *now* and parse it
+        new_binding = self.parse_func(self.filepath) # Parse func handles non-existence
+        print(f"DEBUG Handler: Final parse result: {new_binding}")
+        self.queue.put(new_binding)
+        self.debounce_timer = None # Timer has finished
+
+    # --- Event Handlers ---
+    # All handlers now just call _schedule_processing
+
+    def on_modified(self, event):
+        if not event.is_directory and os.path.normpath(event.src_path) == self.filepath:
+            print("DEBUG Handler: keyboard.diff got modified (scheduling process)")
+            self._schedule_processing()
+
+    def on_created(self, event):
+        if not event.is_directory and os.path.normpath(event.src_path) == self.filepath:
+            print("DEBUG Handler: keyboard.diff got created (scheduling process)")
+            self._schedule_processing()
+
+    def on_deleted(self, event):
+        if not event.is_directory and os.path.normpath(event.src_path) == self.filepath:
+            print("DEBUG Handler: keyboard.diff got deleted (scheduling process)")
+            # Even on delete, we wait briefly to see if it's immediately recreated
+            # The _process_file_change will handle the file not existing then.
+            self._schedule_processing()
+
+class SwitcherConfirmationHandler(FileSystemEventHandler):
+    """
+    Watches for creation/modification of the confirmation file,
+    deletes it, and puts a message on a queue for the Tkinter thread.
+    """
+    # <<< MODIFIED __init__ >>>
+    def __init__(self, filepath_to_watch, queue_to_notify):
+        self.target_filepath = Path(filepath_to_watch).resolve()
+        self.notify_queue = queue_to_notify # <<< Use the queue
+        print(f"DEBUG Switcher Handler: Monitoring target: {self.target_filepath}")
+
+    def _trigger_action(self):
+        """Deletes the file and puts a message on the queue."""
+        deleted_ok = False # Flag to check if deletion happened
+        try:
+            if self.target_filepath.is_file():
+                print(f"DEBUG Switcher Handler: Change detected. Deleting {self.target_filepath}")
+                os.remove(self.target_filepath)
+                print(f"DEBUG Switcher Handler: File deleted.")
+                deleted_ok = True
+            # else:
+            #     print(f"DEBUG Switcher Handler: Triggered, but file already deleted.")
+
+        except FileNotFoundError:
+             print(f"DEBUG Switcher Handler: File not found during delete attempt (likely already handled): {self.target_filepath}")
+        except PermissionError:
+             print(f"ERROR Switcher Handler: Permission denied trying to delete {self.target_filepath}")
+        except OSError as e:
+             print(f"ERROR Switcher Handler: OS error deleting file {self.target_filepath}: {e}")
+        except Exception as e:
+             print(f"ERROR Switcher Handler: Unexpected error during action: {e}")
+
+
+        if deleted_ok or not self.target_filepath.exists(): # Check existence again just in case
+            print(f"DEBUG Switcher Handler: Putting 'run_focus' message on queue.")
+            self.notify_queue.put("run_focus") # Put a simple message
+
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            event_path = Path(event.src_path).resolve()
+            if event_path == self.target_filepath:
+                print(f"DEBUG Switcher Handler: on_modified triggered for target.")
+                self._trigger_action()
+
+    def on_created(self, event):
+        if not event.is_directory:
+            event_path = Path(event.src_path).resolve()
+            if event_path == self.target_filepath:
+                print(f"DEBUG Switcher Handler: on_created triggered for target.")
+                self._trigger_action()
+
+    def on_moved(self, event):
+         if not event.is_directory:
+            event_path = Path(event.dest_path).resolve() # Check the destination path
+            if event_path == self.target_filepath:
+                print(f"DEBUG Switcher Handler: on_moved triggered for target.")
+                self._trigger_action()
+
+
+
 # ------------------------------------------------------------
 # ConfigViewerApp Class
 # ------------------------------------------------------------
 class ConfigViewerApp:
 
-
-
-
     def __init__(self, master, script_dir, input_file,
                  config_pics_folder, config_info_folder,
                  repo_folder, vehicles_content_folder, user_folder,
-                 config_pics_custom_folder, hidden_txt_file):
+                 config_pics_custom_folder, hidden_txt_file, final_instantiation=False):
         
 
+        if final_instantiation:
+            final_instantiation_check = "FINAL INSTANTIATION CHECK: TRUE"
+            self.final_instantiation = True
+
+        else:
+            final_instantiation_check = "FINAL INSTANTIATION CHECK: FALSE"
+            self.final_instantiation = False
 
         print("\n--- DEBUG PRINTS in ConfigViewerApp.__init__() ENTRY ---") # Debug Entry
-        print(f"DEBUG-INIT: ConfigViewerApp instance created - SELF OBJECT ID: {id(self)}") # <--- DEBUG PRINT in __init__
+        print(f"DEBUG-INIT: ConfigViewerApp instance created - SELF OBJECT ID: {id(self)}")
+        print(f"DEBUG-INIT: ConfigViewerApp {final_instantiation_check}") # <--- DEBUG PRINT in __init__
         print(f"DEBUG-INIT: Type of config_pics_custom_folder (received): {type(config_pics_custom_folder)}, Value: {config_pics_custom_folder}") # Debug - Check type in __init__
         print(f"DEBUG-INIT: Type of config_pics_folder (received): {type(config_pics_folder)}, Value: {config_pics_folder}") # Debug - Check type in __init__ - ADDED
         print(f"DEBUG-INIT: Type of config_info_folder (received): {type(config_info_folder)}, Value: {config_info_folder}") # Debug - Check type in __init__ - ADDED
         print(f"DEBUG-INIT: Type of repo_folder (received): {type(repo_folder)}, Value: {repo_folder}") # Debug - Check type in __init__ - ADDED
         print(f"DEBUG-INIT: Type of script_dir (received): {type(script_dir)}, Value: {script_dir}") # Debug - Check type in __init__ - ADDED
-        print("--- DEBUG PRINTS in ConfigViewerApp.__init__() EXIT ---\n") # Debug Exit
+
 
         self.master = master
         self.script_dir = script_dir
@@ -807,7 +1057,17 @@ class ConfigViewerApp:
         self.config_info_folder = config_info_folder
         self.hidden_txt_file = hidden_txt_file
 
+
+
+        self.cache_file_path = os.path.join(self.script_dir, "data", "config_processing_cache.json")
+
+
+        self.main_window_title = "Ellexium's Mod Manager/Vehicle Selector (ver. 0.1.9)"
+
         self.DEFAULT_IMAGE_PATH = os.path.join("data/MissingZipConfigPic.png")
+
+
+
 
         self.show_scanning_window_count = 0 # Initialize the amount of times the window is called, the first couple of times it's called should have it be in the center of the screen, not the master
         self.show_scanning_window_currently_on_screen = False
@@ -817,8 +1077,601 @@ class ConfigViewerApp:
         self.original_stderr = sys.stderr
         self.is_console_visible = False
 
+        self.ZIP_BASE_NAMES = [] 
 
-        self.ZIP_BASE_NAMES = []  # Initialize as an empty list
+        if final_instantiation:
+            self.setup_zip_base_names()
+
+
+        scanning_win = None  # Initialize scanning_win
+
+
+
+
+        #scanning_win = self.show_scanning_window(text="Loading Mod Manager...")
+            
+            
+        self.SPAWN_QUEUE_FILE = "data/spawn_queue.lua"
+        self.SPAWN_QUEUE_TRANSIENT_FILE = "data/Spawn_Queue_Transient.lua"
+
+
+        self.repo_folder = repo_folder
+        self.vehicles_content_folder = vehicles_content_folder
+        self.user_folder = user_folder
+        self.config_pics_custom_folder = config_pics_custom_folder
+
+        self.data_subset_file = "data/data_subset.txt" # Initialize data_subset_file path
+        self.data_subset_favorites_file = "data/data_subset_favorites.txt"
+        
+
+        self.matches_txt = "data/matches.txt"
+
+
+        self.resize_scan_win = None
+
+        scanning_win = None
+
+
+        initial_scan_win_txt_file = os.path.join(script_dir, "data/initial_scan_win_text.txt")
+
+        if os.path.exists(initial_scan_win_txt_file):
+            print(f"{initial_scan_win_txt_file} exsts. Customizing initialization text.")
+            # MAKE the text equal the contents of the text file here 
+            try:
+                with open(initial_scan_win_txt_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("Loading Stage:"):
+                            try:
+                                # Extract the value after the colon
+                                value_str = line.split(':', 1)[1].strip()
+
+                                self.scanning_win = self.show_scanning_window(text=value_str)
+
+                            except Exception as e:
+                                    print(f"Error reading file {initial_scan_win_txt_file}: {e}. Using default initialization text.") 
+        
+            except Exception as e:
+                print(f"Error opening file {initial_scan_win_txt_file}: {e}. Using default initialization text.") 
+
+
+        else: 
+            print(f"{initial_scan_win_txt_file} does not exist. Using default initialization text.") 
+            self.scanning_win = self.show_scanning_window(text="Initializing...")
+
+
+        if os.path.exists(initial_scan_win_txt_file):
+            print(f"ConfigViewerApp __init__:  existing initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+            try:
+                os.remove(initial_scan_win_txt_file) # Remove the file if it exists
+                print(f"ConfigViewerApp __init__: removed existing initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+            except Exception as e:
+                print(f"Error removing initial_scan_win.txt: {e}") 
+
+
+        if final_instantiation:
+
+            self.button_style_args = {
+                "relief": tk.FLAT, # Flat buttons
+                "borderwidth": 0,
+                "bg": "#555555", # Default button background color (dark grey)
+                "fg": "white",    # Default text color
+                "activebackground": "white", # Clicked background - will be set dynamically
+                "activeforeground": "black", # Clicked text color - will be set dynamically
+                "highlightthickness": 0 # Remove highlight
+            }
+
+            self.restart_button_active_fg_color = "white"
+
+            self.warning_color_sidebar = "#ff4747" # Store the warning colors
+            self.warning_color_restart_button = "#ffa1a1"
+
+            self._fade_animation_running_sidebar = False # Flags to track if animation is running
+            self._fade_animation_running_restart = False
+
+            self.default_sidebar_color = "#ffffff"  # Changed to hex code for white
+            self.default_restart_color = "#ffffff"
+
+
+            self.pause_loading = False  # Initialize the pause_loading flag
+
+            self.category_hidden_states = {} # Initialize category hidden states in __init__
+
+            self.debounce_timer = None  # Initialize debounce timer attribute
+            self.is_debouncing = False
+            self.details_debounce_timer = None
+
+            # Define resampling filter
+            try:
+                self.RESAMPLE_FILTER = Image.Resampling.LANCZOS  # For Pillow >= 10
+            except AttributeError:
+                self.RESAMPLE_FILTER = Image.LANCZOS
+
+
+            self.main_grid_widget_cache = {}  # NEW: Cache for main grid item widgets - State-Aware Cache
+
+            self.image_cache_capacity = 50 # Example capacity - adjust as needed
+            self.image_cache = OrderedDict() # Using OrderedDict for LRU
+
+            # --- NEW: Eviction Batching ---
+            self.eviction_count = 0
+            self.eviction_batch_delay_ms = 4000 # Print summary every 4 seconds
+            self.eviction_timer_running = False
+
+
+            self.image_cache_pil = {}  # Cache to store PIL Images
+            self.individual_info_cache = {}  # NEW: In-memory cache for individual info JSON data  <--- INSERT HERE
+            self.full_data_cache = {} # NEW: Cache for full_data from load_data
+            self.data_cache = [] 
+            self.config_info_cache = {}
+            self._view_all_data_cache = {} # NEW: Initialize cache for "View All" data
+
+            
+                
+
+            
+
+            self.highlight_images = {}  # Dictionary to store highlight images per widget
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=18)
+            self.lock = threading.Lock()
+
+            # Initialize image counts per category
+            self.image_counts = {}
+
+
+            # --- NEW: Disk Image Cache Directory --- # <---- INSERT HERE
+            self.disk_image_cache_dir = os.path.join(self.script_dir, "data/image_cache_disk")
+            if not os.path.exists(self.disk_image_cache_dir):
+                os.makedirs(self.disk_image_cache_dir) # Create directory if it doesn't exist
+            #disabling cache
+
+            self.disk_image_cache_dir = os.path.join(self.script_dir, "data/empty_folder_check")
+            if not os.path.exists(self.disk_image_cache_dir):
+                os.makedirs(self.disk_image_cache_dir) 
+
+            # Details Window state
+            self.details_window_closed = True
+            self.details_window = None
+            self.details_scrollable_frame = None
+            self.details_canvas_sub = None
+            self.details_pagination_bar = None  # For details pagination
+
+            self.details_batch_retry_count = 0
+            self.MAX_DETAILS_BATCH_RETRIES = 5
+
+            self.details_window_should_open_in_favorites_mode = False
+
+            self.no_configs_messagebox_condition = False
+
+            # Dynamic bindings files and folders
+
+            userfolder_root = os.path.dirname(os.path.dirname(self.script_dir))
+
+            #self.userfolder_root_settings_folder = os.path.normpath(os.path.join(userfolder_root, "settings"))
+
+            self.keyboard_diff_path = os.path.normpath(os.path.join(userfolder_root, "settings/inputmaps/keyboard.diff"))
+
+            self.settings_json_file = os.path.normpath(os.path.join(userfolder_root, "settings/settings.json"))
+
+            data_folder = self.script_dir / "data"
+            self.switcher_confirmation_path = data_folder / "switcher_binding_confirmation_file.txt"
+
+
+
+
+
+            self.main_search_entry_widget_focused_but_window_not_focus = False
+            self.window_has_os_focus = False
+
+
+            # Global Filters
+
+            self.skip_perform_search = False
+            self.ignore_keyrelease_after_focus_msec = 1200 # Milliseconds to ignore keys after focus
+            self._ignore_keyrelease_timer_id = None # To store the timer ID
+
+            
+            self.filters_window = None
+            self.current_tooltip_global_filter_window = None
+            self.tooltip_global_filter_original_bg_color = None
+            self.on_off_buttons_list = []
+            self.numeric_criteria = ["Top Speed (km/h)", "Power", "0-100 km/h", "Off-Road Score", "Braking G"]
+            self.filter_settings_file = "data/global_filter_settings.txt"
+            self.configinfo_folder = "data/configinfo" # Define configinfo folder
+            self.filter_output_file = "data/filter_results.txt" # Define output file for filter results
+            self.data_subset_file = "data/data_subset.txt"
+            
+            self.search_results_window = None
+
+
+            self.is_search_results_window_active = False
+
+            self.is_search_results_window_active_bypass_flag = False
+            
+            self.is_search_results_window_closing = False
+            
+            self.all_filters_all = True
+            
+            self.is_constraints_results_window_active = False 
+
+            self.delayed_sort_by_install_date = False
+            
+            
+            
+
+            self.search_results_data = []          # Initialize data for search results window
+            self.search_results_filtered_data = [] # Initialize filtered data for search results
+            self.search_results_grouped_data = {}   # Initialize grouped data for search results
+            
+            
+
+            # For pagination & searching in details
+            self.details_data = []
+            self.details_filtered_data = []
+            self.details_page = 0
+            self.items_per_page = 50  # (Still used in some fallback pagination logic)
+
+            self.columns = None  # Initialize columns for main grid
+            self.details_columns = None  # Initialize columns for details grid
+
+            self.details_last_width = None
+            self.details_last_height = None
+            self.details_resize_timer = None
+
+            # Keep track of main window size to prevent unnecessary reloads
+            self.last_width = self.master.winfo_width()
+            self.last_height = self.master.winfo_height()
+            self.resize_timer = None
+
+            # Flags for "Deleting..." flashing
+            self.is_deleting = False
+            self.deleting_color_flag = True
+            self.deleting_label = None
+            
+
+            # Flags for details window "Deleting..."
+            self.details_is_deleting = False
+            self.details_deleting_color_flag = True
+            self.details_deleting_label = None
+
+            # Flags for "Editing Settings..."
+            self.is_editing = False
+            self.editing_color_flag = True
+            self.editing_label = None
+
+            # Categorization mode
+            self.categorization_mode = 'Type'  # Default
+
+            # Sort by install date
+            self.sort_by_install_date = False
+
+
+            self.global_highlight_color = "orange" # you can swap this out for other stuff in the future, like for eg making this a setting, but not right now
+
+            # Switcher - Initialize settings_file_path **BEFORE loading settings**
+            self.settings_file_path = os.path.join(script_dir, "data/MMSelectorSettings.txt") # <--- INITIALIZE settings_file_path HERE - CORRECT ORDER
+
+
+            self.floating_window_last_position = None # Initialize to None, will be loaded or centered
+
+
+            self.placeholder_settings = False
+            self.middle_click_settings = False
+            self.show_folder_settings = False
+            self.jump_to_page_button_should_be_bottom = False
+            self.collapse_categories_by_default = False # Initialize to False (Off) by default
+
+
+            # --- NEW: Font Size Setting ---
+            # Stores the numeric value to add (0 for Default, 2 for Medium, 4 for Large)
+            self.font_size_add = 0 # Default to 0 ('Default' size)
+
+            self.font_size_changed_this_session = False
+
+
+            print("DEBUG-INIT: Calling load_settings() NOW (BEFORE format_grouped_data)...") # Debug - Call Order - BEFORE
+            self.load_settings() # Load settings AFTER initializations, BEFORE GUI setup - CORRECTED CALL ORDER
+            print("DEBUG-INIT: load_settings() RETURNED.") # Debug - Call Order - BEFORE
+
+
+ 
+
+
+
+            self.original_data, self.original_full_data = self.load_data() # Load data NOW
+            self.data = list(self.original_data)
+            self.full_data = dict(self.original_full_data)
+            self.grouped_data = self.format_grouped_data(self.data)
+
+
+
+
+            self.main_grid_item_widgets = {} # Initialize dictionary to store widgets for main grid items
+
+            
+            
+            print("DEBUG-INIT: format_grouped_data() RETURNED - AFTER load_settings()") # Debug - Call Order - AFTER
+            # --------------------------------------------------------------------------------
+            # MODIFICATION END - Load data AFTER GUI setup for testing
+            # -------------------------------------------------------------------------------
+
+            # --- NEW: Flag to track if all main grid images are cached ---
+            self.all_main_grid_images_cached = False # Initialize to False
+
+            # Added attributes for pausing/loading
+            self.pause_loading = False
+            self.loading_pause_timer = None
+
+            # Added attributes for loading animation (main grid)
+            self.loading_animation_running = False
+
+
+
+
+
+            # --------------------------------------
+            # NEW: Subgrid (details window) batch loading config
+            # --------------------------------------
+            # You can adjust these two variables to change how big each batch is
+            # and how many milliseconds to wait between loading batches in the subgrid.
+            self.details_batch_size = 10 # batches of
+            self.default_batch_size = 10 # make sure these numbers stay the same, they work together to controls the details window batch size
+
+
+            self.details_batch_delay = 15 # schedule
+
+            # Flag for details "Loading..." animation
+            self.details_loading_animation_running = False
+
+            self.scroll_animation_duration = 600  # milliseconds for scroll animation
+            self.scroll_animation_steps = 30      # Number of animation steps
+            self.scroll_target_yview = None       # Target yview for smooth scrolling
+            self.scroll_current_yview = None      # Starting yview for animation
+            self.scroll_animation_timer = None     # Timer ID for animation
+            self.scroll_delta_units = 0           # Store scroll delta in units instead of pixels
+
+            self.auto_reopen_details_after_change = False # Initialize flag for auto-reopen (this doesn't work properly right now)
+
+            # --- NEW: Dynamic Batch Sizes ---
+            self.main_grid_batch_sizes = [30, 10, 10, 10]  # Initial 30, then 3x 10
+            #self.details_grid_batch_sizes = [30, 10, 10, 10] # You can customize these separately THIS IS NOT USED 
+
+
+            self.current_main_batch_index_in_sequence = 0
+            self.current_details_batch_index_in_sequence = 0
+
+
+            self.scroll_animation_id = None
+            self.scroll_target_y = 0
+            self.scroll_start_y = 0
+            self.scroll_duration = 200  # milliseconds for scroll animation (adjust as needed)
+            self.scroll_start_time = 0
+
+
+            ################### - details sidebar scrolling
+            
+            # --- NEW: State variables for sidebar text smooth scroll ---
+            self.sidebar_text_scroll_animation_id = None
+            self.sidebar_text_scroll_target_y = 0.0
+            self.sidebar_text_scroll_start_y = 0.0
+            self.sidebar_text_scroll_start_time = 0
+
+            # --- NEW: State variables for sidebar text CUSTOM scrollbar ---
+            self.custom_scrollbar_canvas_sidebar_text = None # Canvas for the scrollbar itself
+            self.scrollbar_thumb_sidebar_text = None       # The rectangle (thumb)
+            self.scrollbar_thumb_dragging_sidebar_text = False
+            self.scrollbar_thumb_start_y_sidebar_text = 0
+            self.scrollbar_mouse_start_y_sidebar_text = 0
+            ####################
+
+
+
+            # --- NEW: Highlight Pause Debounce Timer ---
+            self.highlight_pause_debounce_timer = None
+
+            # --- NEW: Skipped UI Update Queues ---
+            self.main_grid_skipped_updates_queue = []
+            self.details_grid_skipped_updates_queue = []
+
+            # --- NEW: Printing Control ---  <----------------------  INSERT HERE
+            self.original_print = builtins.print # Store the original print function
+            self.disable_printing = False # Flag to control printing
+
+            # --- NEW: Scroll Pause for Hover Effects ---
+            self.is_scrolling_main_grid = False # Initialize to False (not scrolling initially)
+            self.scroll_debounce_delay = 600 # milliseconds for debounce delay (600ms after scroll stop)
+            self.scroll_debounce_timer_id = None # To keep track of the debounce timer
+
+ 
+
+            self.matches_config_data = self.load_matches_config_data()
+
+            self.details_pause_counter = 0
+
+            # --- Favorites Functionality ---
+            self.filter_state = 0
+            self.favorites_file_path = os.path.join(script_dir, "data/favorites.txt")
+            self.favorite_configs = self.read_favorites()
+            self.filter_options = [
+                "View All",
+                "Items with Config Preview Images [debug]",
+                "Items Without Config Preview Images [debug]",
+                "Only Mods",
+                "Vanilla",
+                "Favorites",
+                "Unpacked Mods" #custom configurations are grouped into their relative zip file folders. this could be re-used for fully unpacked mods
+            ]
+
+
+            self.current_details_item_tooltip_window = None
+            self.tooltip_debounce_timer = None  # For debouncing tooltip display
+            self.tooltip_autodestroy_timer = None # For auto-destroying tooltip
+            
+            self.spawn_queue_window_was_open = False 
+
+
+            self.use_disk_image_cache = False  # Set to False to disable disk image cache
+            self.use_info_file_cache = False  # Set to False to disable info file cache
+
+            self.omit_label = False  # Set to True to omit labels in the main grid
+
+            self.items_to_be_hidden = False
+            self.found_hidden_item = False
+            self.main_grid_labels = [] # Initialize a list to store label widgets
+            self.hidden_items_set = set() 
+
+
+            self.new_button_label = None
+
+
+            self.DEFAULT_SWITCH_DISPLAY_TEXT = "Ctrl+Y" 
+
+            self.DEFAULT_SWITCH_BINDING = "<Control-y>"
+
+
+            self.resizing_window = False
+            self.window_was_resized = False
+            self.window_was_resized_2 = False
+            self.rebuilding_gui = False
+            self.hide_main_grid_and_sidebar_start_passed = 0
+            self.text_to_switch_back_to = None
+            self.details_window_opened_before = False
+            self.on_resize_complete_called = 0
+            self.update_grid_layout_called_first_time = True
+            self.window_size_changed_during_search_results_window = False
+            self.details_page_before_resize = None # Variable to store page number during resize
+            self.details_window_intentionally_closed = False
+            self.window_size_changed_during_details_window = False
+            self.search_results_window_on_screen = False
+
+
+            self.master.after_idle(self._store_initial_minsize)
+            self._original_minsize = (1, 1) # Default fallback
+            self._is_size_locked_by_us = False 
+
+
+            self._last_normal_geometry = None # Stores "WxH+X+Y" string
+            # Load geometry first (applies saved settings)
+
+
+
+            self.apply_loaded_geometry()   
+            self.master.after(100, self._track_normal_geometry)
+
+
+
+            # Build GUI - CORRECTED CALL ORDER - CALL GUI SETUP **BEFORE** loading data
+            self.details_window_is_favorites_filtered = False # Initialize to False (not favorites filtered initially)
+
+
+            print("    ConfigViewerApp __init__ is calling setup_gui()")
+            self.setup_gui() 
+            #setup_gui has initialize_data_and_grid, which calls  self.grouped_data = self.format_grouped_data and then populate_initial_grid()
+            #-> popiulate_initial_grid calls perform_search, and then update grid layoutm and then  self.all_main_grid_images_cached = self.are_all_main_grid_images_cached()
+
+            self.read_favorites()
+
+
+            self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
+            self.main_grid_sidebar_debounce_timer = None
+            self.current_main_sidebar_item = None # To store the currently selected item in main grid sidebar
+
+
+
+
+            # State for dynamic binding
+            self.current_emm_bindings = [] # NEW: Store a list of active bindings
+            #self.default_emm_binding = "<Control-y>" 
+
+            self.binding_update_queue = queue.Queue()
+            self.watchdog_observer = None
+            self.watchdog_thread = None
+            self._after_id_binding_check = None # To potentially cancel the after loop
+
+
+            # Start the monitoring process
+            self._start_keyboard_diff_monitoring()
+
+            # Start the monitoring process for switch back
+            self.switcher_observer = None # To hold the watchdog observer instance
+
+            self.switcher_observer = None
+            self.switcher_callback_queue = queue.Queue() # <<< ADD QUEUE
+            self._after_id_switcher_check = None # <<< To cancel the after loop
+
+
+            self._start_switcher_monitoring()
+
+
+
+            # debugging shortcuts
+            self.enable_debug_shortcuts = False
+
+
+            self.is_config_viewer_focused = True # NEW: Track focus state - Start with Config Viewer focused
+            
+
+            self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
+            self.current_main_sidebar_item = None # To store the currently selected item in main grid sidebar
+
+            print(f"config_pics_custom_folder: {self.config_pics_custom_folder}")  # Debugging print
+
+            self.search_mode = "General"
+
+
+
+            self.master.deiconify()
+
+            # --------------------------------------------------------------------------------
+            # HIDDEN WINDOW INITIALIZATION
+            # -------------------------------------------------------------------------------
+
+            # --- Hidden Vehicles Window Variables
+            self.hidden_window = None  # Initialize hidden_window as None
+            self.original_hidden_lines = []
+            self.all_vehicles_data = self.load_hidden_vehicles_once() # Load all data ONCE in init
+            self.hidden_vehicles_data = list(self.all_vehicles_data) # Initially display all
+            self.hidden_window_search_after_id = None # For debouncing search
+            self.vehicle_frames = [] # Initialize vehicle_frames
+            self.hidden_window_search_DEBOUNCE_DELAY_MS = 300  # Debounce delay in milliseconds
+
+            # Scrollbar variables - HIDDEN WINDOW
+            self.hidden_window_custom_scrollbar_canvas_hidden = None # Will be created in create_widgets_hidden_window
+            self.hidden_window_scrollbar_thumb_hidden = None # Will be created in create_widgets_hidden_window
+            self.hidden_window_scrollbar_thumb_dragging_hidden = False
+            self.hidden_window_scrollbar_thumb_start_y_hidden = 0
+            self.hidden_window_scrollbar_mouse_start_y_hidden = 0
+            self.hidden_window_scroll_animation_timer_hidden = None
+            self.hidden_window_scroll_animation_id_hidden = None
+            self.hidden_window_scroll_target_yview_hidden = 0.0
+            self.hidden_window_scroll_start_y_hidden = 0.0
+            self.hidden_window_scroll_start_time_hidden = 0
+            self.hidden_window_scroll_duration = 200  # ms for smooth scroll animation - can be global if needed
+
+
+            self.hidden_window_hidden_window_restart_button_active_fg_color = "white"
+            self.hidden_window_warning_color_hidden_window_restart_button = "#ffa1a1"
+            self._hidden_window_fade_animation_running_restart = False
+            self.hidden_window_default_restart_color = "#ffffff"
+            self.unhide_was_toggled_in_hidden_window = False
+
+        # --------------------------------------------------------------------------------
+        # HIDDEN WINDOW INITIALIZATION END 
+        # -------------------------------------------------------------------------------
+
+        self.scanning_window = scanning_win  # Initialize scanning_window attribute
+
+        self.trigger_refresh_scanning_win = None
+
+        # --------------------------------------------------------------------------------
+        # --- Delete the stale backup folder that - final step
+        # -------------------------------------------------------------------------------
+
+        self.delete_backup_folder_on_startup()
+        print("--- DEBUG PRINTS in ConfigViewerApp.__init__() EXIT ---\n") # Debug Exit
+
+
+    def setup_zip_base_names(self):
 
         main_script_directory = os.path.dirname(os.path.abspath(sys.argv[0])) # Get the directory of the MAIN script
         txt_file_path = os.path.join(main_script_directory, "data/beamng_VANILLA_vehicles_folder.txt")
@@ -846,451 +1699,6 @@ class ConfigViewerApp:
         except Exception as e: # Catch other potential errors during file reading or directory access
             print(f"An error occurred while processing '{txt_file_path}': {e}")
             print("ZIP_BASE_NAMES will remain empty.")
-
-
-
-
-        scanning_win = None  # Initialize scanning_win
-
-        #scanning_win = self.show_scanning_window(text="Loading Mod Manager...")
-            
-            
-        self.SPAWN_QUEUE_FILE = "data/spawn_queue.lua"
-        self.SPAWN_QUEUE_TRANSIENT_FILE = "data/Spawn_Queue_Transient.lua"
-
-
-        self.repo_folder = repo_folder
-        self.vehicles_content_folder = vehicles_content_folder
-        self.user_folder = user_folder
-        self.config_pics_custom_folder = config_pics_custom_folder
-
-        self.data_subset_file = "data/data_subset.txt" # Initialize data_subset_file path
-        self.data_subset_favorites_file = "data/data_subset_favorites.txt"
-        
-
-        self.matches_txt = "data/matches.txt"
-
-        self.button_style_args = {
-            "relief": tk.FLAT, # Flat buttons
-            "borderwidth": 0,
-            "bg": "#555555", # Default button background color (dark grey)
-            "fg": "white",    # Default text color
-            "activebackground": "white", # Clicked background - will be set dynamically
-            "activeforeground": "black", # Clicked text color - will be set dynamically
-            "highlightthickness": 0 # Remove highlight
-        }
-
-        self.restart_button_active_fg_color = "white"
-
-        self.warning_color_sidebar = "#ff4747" # Store the warning colors
-        self.warning_color_restart_button = "#ffa1a1"
-
-        self._fade_animation_running_sidebar = False # Flags to track if animation is running
-        self._fade_animation_running_restart = False
-
-        self.default_sidebar_color = "#ffffff"  # Changed to hex code for white
-        self.default_restart_color = "#ffffff"
-
-
-        self.pause_loading = False  # Initialize the pause_loading flag
-
-        self.category_hidden_states = {} # Initialize category hidden states in __init__
-
-        self.debounce_timer = None  # Initialize debounce timer attribute
-        self.is_debouncing = False
-        self.details_debounce_timer = None
-
-        # Define resampling filter
-        try:
-            self.RESAMPLE_FILTER = Image.Resampling.LANCZOS  # For Pillow >= 10
-        except AttributeError:
-            self.RESAMPLE_FILTER = Image.LANCZOS
-
-
-        self.main_grid_widget_cache = {}  # NEW: Cache for main grid item widgets - State-Aware Cache
-        self.image_cache = {}
-        self.image_cache_pil = {}  # Cache to store PIL Images
-        self.individual_info_cache = {}  # NEW: In-memory cache for individual info JSON data  <--- INSERT HERE
-        self.full_data_cache = {} # NEW: Cache for full_data from load_data
-        self.data_cache = [] 
-        self.config_info_cache = {}
-        self._view_all_data_cache = {} # NEW: Initialize cache for "View All" data
-
-        
-               
-
-        
-
-        self.highlight_images = {}  # Dictionary to store highlight images per widget
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=18)
-        self.lock = threading.Lock()
-
-        # Initialize image counts per category
-        self.image_counts = {}
-
-
-        # --- NEW: Disk Image Cache Directory --- # <---- INSERT HERE
-        self.disk_image_cache_dir = os.path.join(self.script_dir, "data/image_cache_disk")
-        if not os.path.exists(self.disk_image_cache_dir):
-            os.makedirs(self.disk_image_cache_dir) # Create directory if it doesn't exist
-        #disabling cache
-
-        # Details Window state
-        self.details_window_closed = True
-        self.details_window = None
-        self.details_scrollable_frame = None
-        self.details_canvas_sub = None
-        self.details_pagination_bar = None  # For details pagination
-
-        self.details_window_should_open_in_favorites_mode = False
-
-        self.no_configs_messagebox_condition = False
-
-        details_widget_count = 0
-
-        # Global Filters
-        self.filters_window = None
-        self.current_tooltip_global_filter_window = None
-        self.tooltip_global_filter_original_bg_color = None
-        self.on_off_buttons_list = []
-        self.numeric_criteria = ["Top Speed (km/h)", "Power", "0-100 km/h", "Off-Road Score", "Braking G"]
-        self.filter_settings_file = "data/global_filter_settings.txt"
-        self.configinfo_folder = "data/configinfo" # Define configinfo folder
-        self.filter_output_file = "data/filter_results.txt" # Define output file for filter results
-        self.data_subset_file = "data/data_subset.txt"
-        
-        self.search_results_window = None
-
-
-        self.is_search_results_window_active = False
-        
-        self.is_search_results_window_closing = False
-        
-        
-        
-        self.is_constraints_results_window_active = False 
-        
-        
-        
-
-        self.search_results_data = []          # Initialize data for search results window
-        self.search_results_filtered_data = [] # Initialize filtered data for search results
-        self.search_results_grouped_data = {}   # Initialize grouped data for search results
-        
-        
-
-        # For pagination & searching in details
-        self.details_data = []
-        self.details_filtered_data = []
-        self.details_page = 0
-        self.items_per_page = 50  # (Still used in some fallback pagination logic)
-
-        self.columns = None  # Initialize columns for main grid
-        self.details_columns = None  # Initialize columns for details grid
-
-        self.details_last_width = None
-        self.details_last_height = None
-        self.details_resize_timer = None
-
-        # Keep track of main window size to prevent unnecessary reloads
-        self.last_width = self.master.winfo_width()
-        self.last_height = self.master.winfo_height()
-        self.resize_timer = None
-
-        # Flags for "Deleting..." flashing
-        self.is_deleting = False
-        self.deleting_color_flag = True
-        self.deleting_label = None
-        
-
-        # Flags for details window "Deleting..."
-        self.details_is_deleting = False
-        self.details_deleting_color_flag = True
-        self.details_deleting_label = None
-
-        # Flags for "Editing Settings..."
-        self.is_editing = False
-        self.editing_color_flag = True
-        self.editing_label = None
-
-        # Categorization mode
-        self.categorization_mode = 'Type'  # Default
-
-        # Sort by install date
-        self.sort_by_install_date = False
-
-
-        self.global_highlight_color = "orange" # you can swap this out for other stuff in the future, like for eg making this a setting, but not right now
-
-        # Switcher - Initialize settings_file_path **BEFORE loading settings**
-        self.settings_file_path = os.path.join(script_dir, "data/MMSelectorSettings.txt") # <--- INITIALIZE settings_file_path HERE - CORRECT ORDER
-
-
-        self.floating_window_last_position = None # Initialize to None, will be loaded or centered
-
-
-        self.placeholder_settings = False
-        self.middle_click_settings = False
-        self.show_folder_settings = False
-
- 
- 
-        self.collapse_categories_by_default = False # Initialize to False (Off) by default
-
-        print("DEBUG-INIT: Calling load_settings() NOW (BEFORE format_grouped_data)...") # Debug - Call Order - BEFORE
-        self.load_settings() # Load settings AFTER initializations, BEFORE GUI setup - CORRECTED CALL ORDER
-        print("DEBUG-INIT: load_settings() RETURNED.") # Debug - Call Order - BEFORE
-
-
-        geometry = self.load_window_geometry()
-        if geometry:
-            width, height, x, y = geometry
-            self.master.geometry(f"{width}x{height}+{x}+{y}")
-        else:
-            # --- NEW: Center window if no saved geometry or invalid content ---
-            screen_width = root.winfo_screenwidth()
-            screen_height = root.winfo_screenheight()
-            window_width = 1348  # Default width
-            window_height = 600 # Default height
-            x = (screen_width // 2) - (window_width // 2)
-            y = (screen_height // 2) - (window_height // 2)
-            self.master.geometry(f"{window_width}x{window_height}+{x}+{y}") # Centered default geometry
-            print(f"DEBUG: No saved geometry or invalid content. Applying centered default geometry: {window_width}x{window_height}+{x}+{y}")
-            # --- NEW: Center window if no saved geometry or invalid content ---
-            
-            
-
-        # --------------------------------------------------------------------------------
-        # MODIFICATION START - Load data AFTER GUI setup for testing
-        # --------------------------------------------------------------------------------
-        # Load data ONCE during initialization - COMMENTED OUT for test
-        # self.original_data, self.original_full_data = self.load_data() # Store the ORIGINAL loaded data
-
-        #if scanning_win:
-        #    scanning_win.destroy()
-
- 
-        scanning_win = None
-
-        self.scanning_win = self.show_scanning_window(text="Populating Caches...")
-
-
-
-        self.load_all_info_data_on_startup() # <--- LOAD ALL DATA ON STARTUP HERE
-
-        self.original_data, self.original_full_data = [], {} # Initialize as empty lists/dicts
-        self.data = list(self.original_data) # Create a COPY for filtering/sorting (important!)
-        self.full_data = dict(self.original_full_data) # Create a COPY for filtering/sorting (important!)
-        print("DEBUG-INIT: Calling format_grouped_data() AFTER load_settings()") # Debug - Call Order - AFTER
-        self.grouped_data = self.format_grouped_data(self.data) # Group the initial data
-        
-        self.main_grid_item_widgets = {} # Initialize dictionary to store widgets for main grid items
-
-        
-        
-        print("DEBUG-INIT: format_grouped_data() RETURNED - AFTER load_settings()") # Debug - Call Order - AFTER
-        # --------------------------------------------------------------------------------
-        # MODIFICATION END - Load data AFTER GUI setup for testing
-        # -------------------------------------------------------------------------------
-
-        # --- NEW: Flag to track if all main grid images are cached ---
-        self.all_main_grid_images_cached = False # Initialize to False
-
-        # Added attributes for pausing/loading
-        self.pause_loading = False
-        self.loading_pause_timer = None
-
-        # Added attributes for loading animation (main grid)
-        self.loading_animation_running = False
-
-
-
-
-
-        # --------------------------------------
-        # NEW: Subgrid (details window) batch loading config
-        # --------------------------------------
-        # You can adjust these two variables to change how big each batch is
-        # and how many milliseconds to wait between loading batches in the subgrid.
-        self.details_batch_size = 10 # batches of
-        self.details_batch_delay = 15 # schedule
-
-        # Flag for details "Loading..." animation
-        self.details_loading_animation_running = False
-
-        self.scroll_animation_duration = 600  # milliseconds for scroll animation
-        self.scroll_animation_steps = 30      # Number of animation steps
-        self.scroll_target_yview = None       # Target yview for smooth scrolling
-        self.scroll_current_yview = None      # Starting yview for animation
-        self.scroll_animation_timer = None     # Timer ID for animation
-        self.scroll_delta_units = 0           # Store scroll delta in units instead of pixels
-
-        self.auto_reopen_details_after_change = False # Initialize flag for auto-reopen (this doesn't work properly right now)
-
-        # --- NEW: Dynamic Batch Sizes ---
-        self.main_grid_batch_sizes = [30, 10, 10, 10]  # Initial 30, then 3x 10
-        self.details_grid_batch_sizes = [30, 10, 10, 10] # You can customize these separately
-        self.default_batch_size = 10 # Default batch size after sequence ends
-
-        self.current_main_batch_index_in_sequence = 0
-        self.current_details_batch_index_in_sequence = 0
-
-
-        self.scroll_animation_id = None
-        self.scroll_target_y = 0
-        self.scroll_start_y = 0
-        self.scroll_duration = 200  # milliseconds for scroll animation (adjust as needed)
-        self.scroll_start_time = 0
-
-        # --- NEW: Highlight Pause Debounce Timer ---
-        self.highlight_pause_debounce_timer = None
-
-        # --- NEW: Skipped UI Update Queues ---
-        self.main_grid_skipped_updates_queue = []
-        self.details_grid_skipped_updates_queue = []
-
-        # --- NEW: Printing Control ---  <----------------------  INSERT HERE
-        self.original_print = builtins.print # Store the original print function
-        self.disable_printing = False # Flag to control printing
-
-        # --- NEW: Scroll Pause for Hover Effects ---
-        self.is_scrolling_main_grid = False # Initialize to False (not scrolling initially)
-        self.scroll_debounce_delay = 600 # milliseconds for debounce delay (600ms after scroll stop)
-        self.scroll_debounce_timer_id = None # To keep track of the debounce timer
-
-        self.matches_config_data = self.load_matches_config_data() 
-        self.details_pause_counter = 0
-
-        # --- Favorites Functionality ---
-        self.filter_state = 0
-        self.favorites_file_path = os.path.join(script_dir, "data/favorites.txt")
-        self.favorite_configs = self.read_favorites()
-        self.filter_options = [
-            "View All",
-            "Items with Config Preview Images [debug]",
-            "Items Without Config Preview Images [debug]",
-            "Only Mods",
-            "Vanilla",
-            "Favorites",
-            "Unpacked Mods" #custom configurations are grouped into their relative zip file folders. this could be re-used for fully unpacked mods
-        ]
-
-
-        self.current_details_item_tooltip_window = None
-        self.tooltip_debounce_timer = None  # For debouncing tooltip display
-        self.tooltip_autodestroy_timer = None # For auto-destroying tooltip
-        
-        self.spawn_queue_window_was_open = False 
-
-
-        self.use_disk_image_cache = False  # Set to False to disable disk image cache
-        self.use_info_file_cache = False  # Set to False to disable info file cache
-
-        self.omit_label = False  # Set to True to omit labels in the main grid
-
-        self.items_to_be_hidden = False
-        self.found_hidden_item = False
-        self.main_grid_labels = [] # Initialize a list to store label widgets
-        self.hidden_items_set = set() 
-
-
-        # Build GUI - CORRECTED CALL ORDER - CALL GUI SETUP **BEFORE** loading data
-        self.details_window_is_favorites_filtered = False
-        self.setup_gui() # <---------------------------------- GUI SETUP NOW CALLED HERE - BEFORE DATA LOAD
-        self.read_favorites()
-        self.populate_initial_grid()
-        self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
-        self.main_grid_sidebar_debounce_timer = None
-        self.current_main_sidebar_item = None # To store the currently selected item in main grid sidebar
-
-
-        # Switcher
-        self.settings_file_path = os.path.join(script_dir, "data/MMSelectorSettings.txt")
-        self.floating_window_last_position = None # Initialize to None, will be loaded or centered
-
-        # debugging shortcuts
-        self.enable_debug_shortcuts = False
-
-
-        
-
-
-        self.is_config_viewer_focused = True # NEW: Track focus state - Start with Config Viewer focused
-
-        self.grouped_data = self.format_grouped_data(self.data)
-        self.populate_initial_grid()
-        self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
-        self.current_main_sidebar_item = None # To store the currently selected item in main grid sidebar
-
-        print(f"config_pics_custom_folder: {self.config_pics_custom_folder}")  # Debugging print
-
-        self.search_mode = "General"
-
-        self.load_data_after_gui() # Call load_data AFTER GUI is setup  <----- Data load called AFTER GUI setup
-        self.master.deiconify()
-
-        # --------------------------------------------------------------------------------
-        # HIDDEN WINDOW INITIALIZATION
-        # -------------------------------------------------------------------------------
-
-        # --- Hidden Vehicles Window Variables
-        self.hidden_window = None  # Initialize hidden_window as None
-        self.original_hidden_lines = []
-        self.all_vehicles_data = self.load_hidden_vehicles_once() # Load all data ONCE in init
-        self.hidden_vehicles_data = list(self.all_vehicles_data) # Initially display all
-        self.hidden_window_search_after_id = None # For debouncing search
-        self.vehicle_frames = [] # Initialize vehicle_frames
-        self.hidden_window_search_DEBOUNCE_DELAY_MS = 300  # Debounce delay in milliseconds
-
-        # Scrollbar variables - HIDDEN WINDOW
-        self.hidden_window_custom_scrollbar_canvas_hidden = None # Will be created in create_widgets_hidden_window
-        self.hidden_window_scrollbar_thumb_hidden = None # Will be created in create_widgets_hidden_window
-        self.hidden_window_scrollbar_thumb_dragging_hidden = False
-        self.hidden_window_scrollbar_thumb_start_y_hidden = 0
-        self.hidden_window_scrollbar_mouse_start_y_hidden = 0
-        self.hidden_window_scroll_animation_timer_hidden = None
-        self.hidden_window_scroll_animation_id_hidden = None
-        self.hidden_window_scroll_target_yview_hidden = 0.0
-        self.hidden_window_scroll_start_y_hidden = 0.0
-        self.hidden_window_scroll_start_time_hidden = 0
-        self.hidden_window_scroll_duration = 200  # ms for smooth scroll animation - can be global if needed
-
-
-        self.hidden_window_hidden_window_restart_button_active_fg_color = "white"
-        self.hidden_window_warning_color_hidden_window_restart_button = "#ffa1a1"
-        self._hidden_window_fade_animation_running_restart = False
-        self.hidden_window_default_restart_color = "#ffffff"
-
-        # --------------------------------------------------------------------------------
-        # HIDDEN WINDOW INITIALIZATION END 
-        # -------------------------------------------------------------------------------
-
-        self.scanning_window = scanning_win  # Initialize scanning_window attribute
-
-        print("--- DEBUG PRINTS in ConfigViewerApp.__init__() EXIT ---\n") # Debug Exit
-
-
-
-        self.image_cache_capacity = 50 # Example capacity - adjust as needed
-        self.image_cache = OrderedDict() # Using OrderedDict for LRU
-
-        # --- NEW: Eviction Batching ---
-        self.eviction_count = 0
-        self.eviction_batch_delay_ms = 4000 # Print summary every 4 seconds
-        self.eviction_timer_running = False
-
-
-
-
-
-    def load_data_after_gui(self):
-        self.original_data, self.original_full_data = self.load_data() # Load data NOW
-        self.data = list(self.original_data)
-        self.full_data = dict(self.original_full_data)
-        self.grouped_data = self.format_grouped_data(self.data)
-        self.update_grid_layout() # Update the grid AFTER data is loaded
-        self.perform_search() # Re-apply search to the newly loaded data
-        self.canvas.yview_moveto(0) # Reset scroll position
 
 
 
@@ -1422,14 +1830,9 @@ class ConfigViewerApp:
         # --- NEW: Close details window if it's open (as before) ---
         if self.details_window and not self.details_window_closed:
 
-            #messagebox.showinfo(
-            #    "Configs Changed",
-            #    "Config(s) Removed or Added!\nPlease re-open custom config set to see updates.",
-            #    parent=self.master # Set parent to main window to keep messagebox on top
-            #)
-            
 
             print("Closing Details Window before refresh...")
+            self.details_window_intentionally_closed = True
             self.on_details_window_close()
             print("Details Window Closed.")
 
@@ -1442,13 +1845,22 @@ class ConfigViewerApp:
             # Reload data
             print("Calling self.refresh_data_from_files() ...") # Debug - Before Data Refresh
             self.refresh_data_from_files()
-            self.rebuild_main_grid()
+
             print("self.refresh_data_from_files() RETURNED.") # Debug - After Data Refresh
             
 
             # Refresh the UI
             print("Calling self.perform_search() ...") # Debug - Before Perform Search
+            print("    trigger_custom_config_scan_and_refresh is calling self.perform_search() - and clearing the search bar")
+
+
+
+            self.search_var.set("")
+            time.sleep(1)
             self.perform_search()
+
+            print("    trigger_custom_config_scan_and_refresh is calling self.update_grid_layout()")
+            self.update_grid_layout()
             print("self.perform_search() RETURNED.") # Debug - After Perform Search
         except Exception as e:
             messagebox.showerror("Error", f"Error during scanning: {e}")
@@ -1456,19 +1868,82 @@ class ConfigViewerApp:
             scanning_win.destroy()
             print("--- ConfigViewerApp.trigger_custom_config_scan_and_refresh() EXIT ---\n") # Debug - Exit Point
 
-    def rebuild_main_grid(self):
-        """Destroys and rebuilds the main grid layout."""
-        # 1. Clear existing widgets from the scrollable frame
+
+
+
+    def hide_main_grid_and_sidebar(self):
+        """Callback for when the window resize is complete, now with first-call return logic."""
+        if self.hide_main_grid_and_sidebar_start_passed == 1: # Check the number of times
+            print("DEBUG: hide_main_grid_and_sidebar - First call detected. Returning immediately.")
+
+            return  # Exit function on first call
+
+        print("DEBUG: throttled_resize - Unpacking (hiding) widgets in scrollable_frame during resize...")
         for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-
-        # 2. Repopulate the grid layout by calling update_grid_layout
-        self.update_grid_layout()
-
-        # 3. Reset scroll position to the top (optional, but often desired)
-        self.canvas.yview_moveto(0)
+            widget.pack_forget()  # Use pack_forget to hide widgets
+        print("DEBUG: throttled_resize - Main grid widgets unpacked (hidden).")
 
 
+        print("DEBUG: throttled_resize - Unpacking (hiding) sidebar_frame during resize...")
+        if self.sidebar_frame and self.sidebar_frame.winfo_ismapped(): # Check if it's packed before forgetting
+            self.sidebar_frame.pack_forget()
+        print("DEBUG: throttled_resize - sidebar_frame unpacked (hidden).")
+
+
+    def show_main_grid_and_sidebar(self):
+        """
+        Makes the main vehicle grid (within scrollable_frame) and the sidebar_frame visible
+        by repacking the sidebar and triggering a grid layout update.
+        """
+        print("--- DEBUG: ENTERING show_main_grid_and_sidebar ---")
+
+        # 1. Show the Sidebar Frame
+        # Check if sidebar_frame exists and is managed by pack
+        try:
+            if hasattr(self, 'sidebar_frame') and self.sidebar_frame:
+                # Only pack it if it's not currently visible (mapped)
+                if not self.sidebar_frame.winfo_ismapped():
+                    print("DEBUG: show_main_grid_and_sidebar - Packing sidebar_frame...")
+                    # Use the original pack options from setup_sidebar_frame
+                    self.sidebar_frame.pack(side="right", fill="y", padx=(10, 0), pady=10,  expand=False)
+                    # Re-apply pack_propagate setting just in case
+                    self.sidebar_frame.pack_propagate(False)
+                    print("DEBUG: show_main_grid_and_sidebar - sidebar_frame packed.")
+                else:
+                    print("DEBUG: show_main_grid_and_sidebar - sidebar_frame already visible.")
+            else:
+                print("DEBUG: show_main_grid_and_sidebar - self.sidebar_frame does not exist, cannot pack.")
+        except Exception as e:
+             print(f"ERROR packing sidebar in show_main_grid_and_sidebar: {e}")
+
+
+        # 2. Show the Main Grid Content
+        # We don't repack individual children here. Instead, we call update_grid_layout,
+        # which is responsible for destroying old grid items and drawing the new ones
+        # inside self.scrollable_frame based on current data/filters.
+        try:
+            print("DEBUG: show_main_grid_and_sidebar - Calling update_grid_layout to repopulate main grid...")
+            # Ensure the scrollable_frame itself is visible. Usually it's packed in the main_frame
+            # and doesn't get hidden, but check just in case. Assuming it's managed by pack.
+            if hasattr(self, 'scrollable_frame') and self.scrollable_frame and self.scrollable_frame.winfo_manager() == 'pack':
+                 if not self.scrollable_frame.winfo_ismapped():
+                     # You'll need the original pack options for scrollable_frame here
+                     # Example: self.scrollable_frame.pack(side="left", fill="both", expand=True)
+                     print("WARNING: show_main_grid_and_sidebar - scrollable_frame was hidden, repacking. CHECK PACK OPTIONS.")
+                     # Add the correct pack call for scrollable_frame if it can be hidden
+
+                 # Now update its contents
+                 self.update_grid_layout()
+                 print("DEBUG: show_main_grid_and_sidebar - update_grid_layout called.")
+            else:
+                 print("DEBUG: show_main_grid_and_sidebar - self.scrollable_frame not found or not packed, skipping grid update call.")
+
+        except Exception as e:
+            print(f"ERROR calling update_grid_layout in show_main_grid_and_sidebar: {e}")
+
+        print("--- DEBUG: EXITING show_main_grid_and_sidebar ---")
+
+    
     # ----------------------------------------------------------------
     # NEW: For auto-removal in ConfigPicsCustom if user folder file is deleted
     # ----------------------------------------------------------------
@@ -1509,55 +1984,6 @@ class ConfigViewerApp:
 
 
         
-    # ----------------------------------------------------------------
-    # NEW: Smooth fade-in method for frames
-    # ----------------------------------------------------------------
-    def smooth_fade_in_frame(self, frame, start_color="#FFFFFF", end_color="#D3D3D3", steps=10, delay=30, exclude_widgets=[tk.Entry]):
-        """
-        Smoothly fades the background color of 'frame' from 'start_color' to 'end_color'.
-        Widgets specified in 'exclude_widgets' will not have their background colors altered.
-
-        :param frame: The Tkinter frame to apply the fade effect.
-        :param start_color: The starting color in hex format (e.g., "#FFFFFF").
-        :param end_color: The ending color in hex format (e.g., "#D3D3D3").
-        :param steps: Number of steps in the fade transition.
-        :param delay: Delay in milliseconds between each step.
-        :param exclude_widgets: A list of widget classes to exclude from background changes.
-        """
-        if exclude_widgets is None:
-            exclude_widgets = []
-
-        def hex_to_rgb(hex_color):
-            hex_color = hex_color.lstrip('#')
-            return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-
-        def rgb_to_hex(rgb):
-            return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-
-        start_rgb = hex_to_rgb(start_color)
-        end_rgb = hex_to_rgb(end_color)
-
-        color_steps = []
-        for i in range(steps + 1):
-            factor = i / steps
-            r = int(start_rgb[0] + factor * (end_rgb[0] - start_rgb[0]))
-            g = int(start_rgb[1] + factor * (end_rgb[1] - start_rgb[1]))
-            b = int(start_rgb[2] + factor * (end_rgb[2] - start_rgb[2]))
-            color_steps.append(rgb_to_hex((r, g, b)))
-
-        def animate_fade(step=0):
-            if not frame.winfo_exists():
-                return
-            frame.config(bg=color_steps[step])
-            for child in frame.winfo_children():
-                # Check if the child's class is in the exclude list
-                if isinstance(child, tuple(exclude_widgets)):
-                    continue  # Skip altering this widget's background
-                child.config(bg=color_steps[step])
-            if step < len(color_steps) - 1:
-                frame.after(delay, lambda: animate_fade(step + 1))
-
-        animate_fade(0)
 
 
 
@@ -1600,6 +2026,9 @@ class ConfigViewerApp:
         Runs the main function from mod_command_line_config_gen, 
         making it behave as if it's running from guitest.py's directory.
         """
+
+
+
         module_name = "mod_command_line_config_gen"
         module_path = os.path.join(self.script_dir, "modules", f"{module_name}.py")
 
@@ -1629,9 +2058,26 @@ class ConfigViewerApp:
             os.chdir(original_working_directory)  # 4. Restore original working directory
             print(f"DEBUG: Restored working directory to: {os.getcwd()}") # Debug - Verify directory restoration
 
-            self.rebuild_main_grid()
-            self.perform_search()
-            self.canvas.yview_moveto(0)  # Reset scroll position to the top
+            if self.final_instantiation:
+
+
+                print("    run_ahk_scripts_mods is calling self.perform_search()")
+                self.perform_search()
+                self.canvas.yview_moveto(0)  # Reset scroll position to the top
+
+                print("    run_ahk_scripts_mods is calling self.update_grid_layout()")          
+                self.update_grid_layout()
+
+                if hasattr(self, 'trigger_refresh_scanning_win') and self.trigger_refresh_scanning_win is not None:
+                    try:
+                        # Attempt to destroy it
+                        self.trigger_refresh_scanning_win.destroy()
+                    except tk.TclError as e:
+                        # Handle cases where destroy might fail even if the object exists (e.g., widget already destroyed)
+                        print(f"TclError while destroying trigger_refresh_scanning_win (might be already gone): {e}")
+                    finally:
+                        # Set the attribute to None afterwards to prevent trying to destroy it again
+                        self.trigger_refresh_scanning_win = None
 
 
 
@@ -1748,7 +2194,7 @@ class ConfigViewerApp:
         return extracted_info
         
     # ------------------------------------------------------------
-    # Find Fallback Info
+    # Find Fallback Info - THIS IS USED BY PROCESS LINES
     # ------------------------------------------------------------
     def find_fallback_info(self, picture_filename):
         lower_filename = picture_filename.lower()
@@ -1768,107 +2214,275 @@ class ConfigViewerApp:
     # Load Data
     # ------------------------------------------------------------
 
+    def _load_cache(self):
+        if os.path.exists(self.cache_file_path):
+            print(f"Attempting to load data from cache: {self.cache_file_path}")
+            try:
+                with open(self.cache_file_path, 'r') as f:
+                    cache_content = json.load(f)
+                    # Basic validation: Check if keys exist
+                    if 'data' in cache_content and 'full_data' in cache_content:
+                        print("Cache loaded successfully.")
+                        return cache_content['data'], cache_content['full_data']
+                    else:
+                        print("Cache file structure is invalid. Ignoring cache.")
+                        return None, None
+            except (json.JSONDecodeError, IOError, FileNotFoundError) as e:
+                print(f"Failed to load cache file: {e}. Processing files normally.")
+                # Optionally delete the corrupted cache file
+                # try:
+                #     os.remove(self.cache_file_path)
+                # except OSError:
+                #     pass
+                return None, None
+        else:
+            print("Cache file not found. Processing files.")
+            return None, None
 
-    #@profile  
-    def load_data(self):
-
-
-        #FUNCTION FOR SORTING WOULD BE CALLED HERE 
-
-
-
-        print("\n--- ConfigViewerApp.load_data() ENTRY ---")  # Debug - Entry Point
-        data = {}
-        full_data = {}
-        self.individual_info_files = {} # NEW: Dictionary to store individual info file paths
-        self.config_info_cache = {} # Clear cache at each load_data call to refresh <--- ADDED HERE
-
-        # Pre-populate config info cache
-        #self.populate_config_info_cache() # <--- CALL POPULATE CACHE HERE
-
-
-        # from outputGOOD.txt
+    # --- Helper method to save data to cache ---
+    def _save_cache(self, data, full_data):
+        print(f"Saving data to cache: {self.cache_file_path}")
         try:
-            if os.path.exists(self.input_file):
+            # Ensure the cache directory exists
+            cache_dir = os.path.dirname(self.cache_file_path)
+            os.makedirs(cache_dir, exist_ok=True)
 
-                print(f"Loading data from: {self.input_file}") # Debug
-
-                self.filter_outputgood() #create the new outputgood file that excludes the previews
-                #create the if branch here
-
-                hidden_folders = self.get_hidden_folders() # Get the list of hidden folders
-
-                if not self.placeholder_settings:
-                    with open(os.path.join(self.script_dir, "data/outputgood_PreviewsPresent.txt"), "r", encoding="utf-8") as file:
-                        lines = file.readlines()
-
-                        filtered_lines = [
-                            line for line in lines
-                            if not any(
-                                f"vehicles/{folder}/" in line.lower() or f"vehicles\\{folder}\\" in line.lower()
-                                for folder in hidden_folders
-                            )
-                        ]
-
-                        self.process_lines(filtered_lines, data, full_data, is_custom=False)
+            cache_content = {
+                'data': data,
+                'full_data': full_data
+            }
+            with open(self.cache_file_path, 'w') as f:
+                json.dump(cache_content, f, indent=4) # Use indent for readability
+            print(f"Cache saved successfully.")
+        except (IOError, TypeError) as e:
+            print(f"Failed to save cache file: {e}")
 
 
-                if self.placeholder_settings:
-                    with open(self.input_file, "r", encoding="utf-8") as file:
-                        lines = file.readlines()
 
-                        filtered_lines = [
-                            line for line in lines
-                            if not any(
-                                f"vehicles/{folder}/" in line.lower() or f"vehicles\\{folder}\\" in line.lower()
-                                for folder in hidden_folders
-                            )
-                        ]
-
-                        self.process_lines(filtered_lines, data, full_data, is_custom=False)
+        
 
 
+    def _finalize_data_processing(self, full_data):
+        """
+        Takes the complete full_data dictionary and generates the final 'data'
+        dictionary containing representative images for the main grid.
+        """
+        print("\n--- _finalize_data_processing() STARTING ---")
+        data = {} # Initialize the final dictionary
+        missing_custom_pic_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
+        missing_zip_pic_path = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
+
+        for folder_name, config_list in full_data.items():
+            representative_image_path = None
+
+            # Filter out any potentially invalid items first
+            valid_config_list = [item for item in config_list if isinstance(item, (list, tuple)) and len(item) == 5]
+
+            if not valid_config_list:
+                print(f"Warning: No VALID configs found for folder '{folder_name}' during finalization.")
+                # Use placeholder if no valid configs exist for this folder
+                representative_image_path = missing_zip_pic_path # Or decide based on context if possible
+                data[folder_name] = [
+                    representative_image_path,
+                    f"Missing/Invalid config for {folder_name}",
+                    "unknown",
+                    {"Name": "Unknown", "Value": 0},
+                    folder_name
+                ]
+                continue
+
+            # Determine context using the first VALID item
+            first_valid_item = valid_config_list[0]
+            item_source_zip = first_valid_item[2] # Get the source (zip name or 'user_custom_configs')
+
+            # Find the default config item within the valid list
+            default_config_item = self.find_default_config_item_details(valid_config_list, item_source_zip) # Pass source as context
+
+            if default_config_item:
+                representative_image_path = default_config_item[0]
+                # print(f"  Finalize - Folder: {folder_name} - Using DEFAULT config image: {os.path.basename(representative_image_path)}")
             else:
-                print(f"Warning: {self.input_file} not found. Skipping mod config loading.")
-        except Exception as e:
-            print(f"Error loading data from {self.input_file}: {e}")
+                # Fallback to the first valid item's image if no default found
+                representative_image_path = first_valid_item[0]
+                # print(f"  Finalize - Folder: {folder_name} - Using FIRST config image (no default): {os.path.basename(representative_image_path)}")
 
-        # from outputGOODcustom.txt
+            # Final check for representative image path validity
+            if not representative_image_path or not os.path.exists(representative_image_path):
+                    is_item_custom = item_source_zip == "user_custom_configs"
+                    representative_image_path = missing_custom_pic_path if is_item_custom else missing_zip_pic_path
+                    print(f"  Finalize - Folder: {folder_name} - Using PLACEHOLDER image (image missing/invalid): {os.path.basename(representative_image_path)}")
+
+            # Use data from the first valid config item for the main grid entry
+            _, line_clean, current_zip_file_from_config, info_data, folder_name_from_config = first_valid_item
+
+            # Ensure info_data is valid
+            if not isinstance(info_data, dict):
+                print(f"ERROR: Finalize - info_data in first_valid_item for '{folder_name}' is not a dict. Using default.")
+                info_data = {"Name": "Data Error", "Value": 0}
+            if 'Value' not in info_data or not isinstance(info_data.get('Value'), (int, float)):
+                info_data['Value'] = 0
+
+            # Populate the final 'data' dictionary
+            data[folder_name] = [
+                representative_image_path,
+                line_clean,
+                current_zip_file_from_config,
+                info_data,
+                folder_name_from_config
+            ]
+
+        print("--- _finalize_data_processing() FINISHED ---")
+        return data
+
+
+
+
+    def load_data(self):
+        """
+        Loads configuration data, utilizing a cache if available.
+        If cache is missed, processes both regular and custom configs before saving.
+        Handles placeholder settings and hidden folder filtering during processing.
+        """
+        print("\n--- ConfigViewerApp.load_data() ENTRY ---")
+
+
+
+        # 1. --- Check Cache First ---
+        # Note: self.cache_file_path should be defined in __init__
+        # e.g., self.cache_file_path = os.path.join(self.script_dir, "data", "config_processing_cache.json")
+        cached_data, cached_full_data = self._load_cache()
+        if cached_data is not None and cached_full_data is not None:
+            print("load_data - Cache HIT. Using cached data.")
+            # Update internal state directly from cache
+            self.full_data_cache = cached_full_data # Store the detailed config list cache
+            # 'cached_data' is the dictionary for the main grid (representative images)
+            # self.data_cache is expected to be a LIST of the values from that dictionary
+            data_values = list(cached_data.values())
+
+            # Apply subset filter immediately after loading from cache
+            self.data_cache = self.apply_data_subset_filter(data_values)
+
+            print(f"load_data - Loaded {len(cached_data)} main items (from cache dict), {len(self.data_cache)} after subset filter.")
+            print(f"load_data - Loaded {len(self.full_data_cache)} full data groups from cache.")
+            print("--- ConfigViewerApp.load_data() EXIT (from Cache) ---")
+            # Return the format expected by the caller
+            return list(self.data_cache), self.full_data_cache
+
+        # 2. --- Cache MISS - Process Fresh ---
+        print("load_data - Cache MISS. Processing files...")
+        combined_full_data = {} # Initialize empty dict to accumulate results
+        self.individual_info_files = {} # Reset if needed
+        self.config_info_cache = {} # Reset cache
+
+        # Define file paths
+        regular_input_file_orig = self.input_file # Store original path if needed
+        regular_input_file_processed = os.path.join(self.script_dir, "data/outputgood_PreviewsPresent.txt")
         custom_input_file = os.path.join(self.script_dir, "data/outputGOODcustom.txt")
+        hidden_folders = self.get_hidden_folders() # Get hidden folders once
+
+        # Determine which regular file to read based on settings
+        file_to_read_regular = None
+        if self.placeholder_settings:
+            # If placeholder settings is TRUE, read the original unfiltered file
+            file_to_read_regular = regular_input_file_orig
+            print("load_data - Placeholder settings ON, reading original input file.")
+        else:
+            # If placeholder settings is FALSE, run the filter and read the filtered file
+            try:
+                print("load_data - Placeholder settings OFF, filtering outputgood...")
+                self.filter_outputgood() # Assume this creates/updates outputgood_PreviewsPresent.txt
+                file_to_read_regular = regular_input_file_processed
+                print(f"load_data - Reading filtered file: {file_to_read_regular}")
+            except Exception as e:
+                print(f"ERROR: Failed during self.filter_outputgood(): {e}")
+                # Fallback to original if filtering fails? Or skip?
+                file_to_read_regular = regular_input_file_orig
+                print(f"Warning: Falling back to reading original file: {file_to_read_regular}")
+
+
+        # --- Process Regular Configs ---
+        try:
+            if file_to_read_regular and os.path.exists(file_to_read_regular):
+                print(f"Processing regular data from: {file_to_read_regular}")
+                with open(file_to_read_regular, "r", encoding="utf-8") as file:
+                    lines = file.readlines()
+
+                # Filter lines based on hidden folders
+                filtered_lines = [
+                    line for line in lines
+                    if not any(
+                        f"vehicles/{folder}/" in line.lower() or f"vehicles\\{folder}\\" in line.lower()
+                        for folder in hidden_folders
+                    )
+                ]
+                print(f"load_data - Processing {len(filtered_lines)} regular lines after hidden folder filter.")
+                # Call the CORE processor, updating the combined dictionary
+                combined_full_data = self.process_lines(filtered_lines, combined_full_data, is_custom=False)
+            else:
+                print(f"Warning: Regular input file not found or not determined: {file_to_read_regular}")
+        except Exception as e:
+            print(f"ERROR: Failed to process regular config file {file_to_read_regular}: {e}")
+
+
+        # --- Process Custom Configs ---
         try:
             if os.path.exists(custom_input_file):
-                print(f"Loading custom data from: {custom_input_file}") # Debug
+                print(f"Processing custom data from: {custom_input_file}")
                 with open(custom_input_file, "r", encoding="utf-8") as file:
                     lines = file.readlines()
 
-                    hidden_folders = self.get_hidden_folders() # Get the list of hidden folders
-
-                    filtered_lines = [
-                        line for line in lines
-                        if not any(
-                            f"vehicles/{folder}/" in line.lower() or f"vehicles\\{folder}\\" in line.lower() or f"vehicles--{folder}" in line.lower()
-                            for folder in hidden_folders
-                        )
-                    ]
-
-                    self.process_lines(filtered_lines, data, full_data, is_custom=True)
+                # Filter lines based on hidden folders
+                filtered_lines = [
+                    line for line in lines
+                    if not any(
+                        # Adapt filter logic for custom file format if necessary
+                        f"vehicles/{folder}/" in line.lower() or f"vehicles\\{folder}\\" in line.lower() or f"vehicles--{folder}" in line.lower()
+                        for folder in hidden_folders
+                    )
+                ]
+                print(f"load_data - Processing {len(filtered_lines)} custom lines after hidden folder filter.")
+                # Call the CORE processor AGAIN, updating the SAME combined dictionary
+                combined_full_data = self.process_lines(filtered_lines, combined_full_data, is_custom=True)
             else:
-                print(f"Warning: {custom_input_file} not found. Skipping custom config loading.")
+                print(f"Warning: Custom config file not found: {custom_input_file}")
         except Exception as e:
-            print(f"Error loading data from {custom_input_file}: {e}")
+            print(f"ERROR: Failed to process custom config file {custom_input_file}: {e}")
+
+
+        # --- Finalize and Save ---
+        if not combined_full_data:
+            print("ERROR: No data was processed from regular or custom files. Cannot finalize or save cache.")
+            self.original_data = {} # Or potentially self.data_cache = []
+            self.grouped_data = {} # Or potentially self.full_data_cache = {}
+            print("--- ConfigViewerApp.load_data() EXIT (No Data Processed) ---")
+            # Return empty but correctly structured data
+            return [], {}
+
+        print("load_data - Finalizing processed data...")
+        # This creates the dictionary for the main grid (representative images)
+        final_data_dict = self._finalize_data_processing(combined_full_data)
+
+        print("load_data - Saving combined data to cache...")
+        self._save_cache(final_data_dict, combined_full_data)
+
+        # Update internal state
+        self.full_data_cache = combined_full_data # Store detailed list
+        data_values = list(final_data_dict.values()) # Get list of values for main grid
+
+        # Apply subset filter AFTER processing and finalizing
+        self.data_cache = self.apply_data_subset_filter(data_values)
+
+        print(f"load_data - Processed {len(final_data_dict)} main items (before subset filter).")
+        print(f"load_data - Processed {len(self.data_cache)} main items (after subset filter).")
+        print(f"load_data - Processed {len(self.full_data_cache)} full data groups.")
+        print("--- ConfigViewerApp.load_data() EXIT (Processed Fresh) ---")
+
+
+        # Return the format expected by the caller
+        return list(self.data_cache), self.full_data_cache
 
 
 
-        self.full_data_cache = full_data # Cache full_data
-        data_values = list(data.values())
-        self.data_cache = data_values # Cache data list
-
-        # Apply data subset filter AFTER loading all data
-        self.data_cache = self.apply_data_subset_filter(data_values) # <--- APPLY DATA SUBSET FILTER HERE
-
-        print(f"load_data - Loaded {len(data)} main items, {len(full_data)} full data groups.") # Debug - Data Counts
-        print("--- ConfigViewerApp.load_data() EXIT ---\n") # Debug - Exit Point
-        return list(self.data_cache), full_data
 
     def get_hidden_folders(self):
         hidden_folders = []
@@ -2103,6 +2717,7 @@ class ConfigViewerApp:
         
         self.read_favorites()
         print("Calling self.perform_search() ...")
+        print("    refresh_data_from_files is calling self.perform_search()")
         self.perform_search()
         print("self.perform_search() RETURNED.")
         self.canvas.yview_moveto(0)
@@ -2154,44 +2769,6 @@ class ConfigViewerApp:
 
 
 
-
-            
-    # ------------------------------------------------------------
-    # Setup Main GUI
-    # ------------------------------------------------------------
-    def setup_gui(self):
-        self.setup_main_window()
-        self.setup_top_frame()
-        self.setup_bottom_frame()
-        self.setup_main_frame()
-        self.setup_canvas_and_scrollbar()
-        self.setup_scrollable_frame()
-        self.setup_sidebar_frame()
-        self.setup_sidebar_top_frame_content()
-        self.setup_sidebar_bottom_frame_content()
-        self.setup_event_bindings()
-        self.initialize_data_and_grid()
-        self.log_folder_names_on_startup() # <--- CALL THE NEW LOGGING FUNCTION HERE, AFTER GUI SETUP
-        self.log_folder_names_cache_on_startup() # <--- CALL THE NEW CACHE LOGGING FUNCTION HERE
-
-        self.periodically_update_search_results_window_position() # <--- ADD THIS LINE TO START PERIODIC CHECK
-        self.periodically_update_details_window_position() # <--- ADD THIS LINE - PERIODIC UPDATE FOR DETAILS WINDOW
-        
-        
-        # Bind hover event to top bar, sidebar, bottom bar, and scrollable canvas
-        if hasattr(self, 'top_frame'):
-            self.top_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
-        if hasattr(self, 'sidebar_frame'):
-            self.sidebar_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
-        if hasattr(self, 'bottom_frame'):
-            self.bottom_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
-        #if hasattr(self, 'canvas'):
-        #    self.canvas.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
-        if hasattr(self, 'scrollable_frame'):
-            self.scrollable_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
- 
-
-
     def log_folder_names_cache_on_startup(self):
         """
         Logs all folder names (keys) present in self.full_data_cache to 'folder_names_cache.txt' on startup.
@@ -2236,10 +2813,94 @@ class ConfigViewerApp:
         except Exception as e:
             print(f"Error writing folder names to log file: {e}")
 
+
+            
+    # ------------------------------------------------------------
+    # Setup Main GUI
+    # ------------------------------------------------------------
+    def setup_gui(self):
+        self.setup_main_window()
+        self.setup_top_frame()
+        self.setup_bottom_frame(scale_changed=False)
+        self.setup_main_frame()
+        self.setup_canvas_and_scrollbar()
+        self.setup_scrollable_frame()
+        self.setup_sidebar_frame()
+
+        
+        self.setup_sidebar_top_frame_content()
+        self.setup_sidebar_bottom_frame_content()
+        self.setup_event_bindings()
+        
+        print("    setup_gui is calling initialize_data_and_grid()")
+        self.initialize_data_and_grid()
+        self.log_folder_names_on_startup() # <--- CALL THE NEW LOGGING FUNCTION HERE, AFTER GUI SETUP
+        self.log_folder_names_cache_on_startup() # <--- CALL THE NEW CACHE LOGGING FUNCTION HERE
+
+        self.periodically_update_search_results_window_position() # <--- ADD THIS LINE TO START PERIODIC CHECK
+        self.periodically_update_details_window_position() # <--- ADD THIS LINE - PERIODIC UPDATE FOR DETAILS WINDOW
+        
+        
+        # Bind hover event to top bar, sidebar, bottom bar, and scrollable canvas
+        if hasattr(self, 'top_frame'):
+            self.top_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
+        if hasattr(self, 'sidebar_frame'):
+            self.sidebar_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
+        if hasattr(self, 'bottom_frame'):
+            self.bottom_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
+        #if hasattr(self, 'canvas'):
+        #    self.canvas.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
+        if hasattr(self, 'scrollable_frame'):
+            self.scrollable_frame.bind("<Enter>", self.lift_search_results_window_without_destroying_dropdowns)
+ 
+
+
+    def setup_top_frame(self):
+        # Creates AND assigns the top frame
+        # Ensure this frame uses self.master as its parent
+        frame = tk.Frame(self.master, bg="#333333", pady=10)
+        frame.pack(side="top", fill="x")
+        self.top_frame = frame # Assign to self.top_frame
+
+        # Now call methods to populate it, passing the created frame
+        self.create_search_bar(self.top_frame)
+        self.create_top_buttons(self.top_frame)
+        self.create_loading_label(self.top_frame)
+        # self.create_progress_bar_main(self.top_frame) # If applicable
+
+
+    def setup_bottom_frame(self, scale_changed=False):
+        # Creates AND assigns the bottom frame
+        # Ensure this frame uses self.master as its parent
+        frame = tk.Frame(self.master, bg="#333333", pady=10)
+        frame.pack(side="bottom", fill="x")
+        self.bottom_frame = frame # Assign to self.bottom_frame
+
+        # Now call methods to populate it, passing the created frame
+        self.create_filter_button(self.bottom_frame)
+        self.create_categorize_button(self.bottom_frame)
+        self.create_category_list_button(self.bottom_frame)
+        self.create_no_configs_message_label(self.bottom_frame)
+        self.create_status_labels(self.bottom_frame)
+
+        if scale_changed:
+            self.create_settings_button(self.bottom_frame, scale_changed=True)
+        else:
+            self.create_settings_button(self.bottom_frame, scale_changed=False)
+
+        self.create_resize_button(self.bottom_frame)
+        self.create_restart_button(self.bottom_frame)
+        self.create_hidden_vehicles_button(self.bottom_frame)
+        self.create_isolated_mods_button(self.bottom_frame)
+        self.create_progress_bar_main(self.bottom_frame)
+
+
+
     def setup_main_window(self):
-        self.master.title("Ellexium's Mod Manager/Vehicle Selector (ver. 0.1.8)")
+        self.master.title(self.main_window_title)
         #self.master.geometry("2920x1080")
-        self.master.resizable(False, False)
+        #self.master.resizable(False, False)
+        #self.master.attributes("-topmost", True)
 
         icon_path = self.script_dir / "data/icon.png"
 
@@ -2249,24 +2910,17 @@ class ConfigViewerApp:
         else:
             print(f"Icon file not found: {icon_path}")
 
-    def setup_top_frame(self):
-        top_frame = tk.Frame(self.master, bg="#333333", pady=10)
-        top_frame.pack(side="top", fill="x")
 
-        self.create_search_bar(top_frame)
-        self.create_top_buttons(top_frame)
-        self.create_loading_label(top_frame)
-        self.create_progress_bar_main(top_frame) # Progress bar in top frame
 
 
 		
 		
     def create_search_bar(self, top_frame):
         """Creates the search bar with updated styling to match the dark theme and light grey background."""
-        #search_label = tk.Label(top_frame, text="Search:", bg="#333333", fg="lightgrey", font=("Segoe UI", 12)) # MODIFICATION: REMOVE Search: label
+        #search_label = tk.Label(top_frame, text="Search:", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add)) # MODIFICATION: REMOVE Search: label
         #search_label.pack(side="left", padx=(10, 5)) # MODIFICATION: REMOVE Search: label
         self.search_var = tk.StringVar()
-        self.search_entry = search_entry = tk.Entry(top_frame, textvariable=self.search_var, font=("Segoe UI", 12), width=30, bg="lightgrey", fg="black", insertbackground="black") # <-- UPDATED bg to "lightgrey", fg to "black", insertbackground to "black"
+        self.search_entry = search_entry = tk.Entry(top_frame, textvariable=self.search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="lightgrey", fg="black", insertbackground="black") # <-- UPDATED bg to "lightgrey", fg to "black", insertbackground to "black"
 
         # --- COPY BUTTON STYLES FROM TOP/BOTTOM FRAME BUTTONS ---
         button_style_args = {
@@ -2277,14 +2931,14 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            #"font":("Segoe UI", 12, "bold") # NO BOLD FONT for search icon button
+            #"font":("Segoe UI", 12+self.font_size_add, "bold") # NO BOLD FONT for search icon button
         }
         # --- COPY BUTTON STYLES FROM TOP/BOTTOM FRAME BUTTONS ---
 
         search_button = tk.Button(
             top_frame,
             text="🔍",
-            font=("Segoe UI", 12), # Font for the icon, keep it non-bold
+            font=("Segoe UI", 12+self.font_size_add), # Font for the icon, keep it non-bold
             command=self.perform_search,
             **button_style_args # <--- APPLY BUTTON STYLES
         )
@@ -2313,13 +2967,41 @@ class ConfigViewerApp:
 
         #search_entry.bind("<Return>", lambda event: self.perform_search())
         
-        search_entry.bind("<KeyRelease>", lambda event: self.start_debounce_highlighting()) # <--- MODIFIED: Bind KeyRelease to start_debounce_highlighting
+        #search_entry.bind("<KeyRelease>", lambda event: self.start_debounce_highlighting()) # <--- MODIFIED: Bind KeyRelease to start_debounce_highlighting
         #search_entry.bind("<KeyRelease>", lambda event: self.lift_search_results_window())
+
+        search_entry.bind("<KeyRelease>", self._handle_main_search_key_release)
+
+        # Define the handler method within your class:
+
+
 
         def delayed_lift(event):
             self.master.after(500, self.lift_search_results_window_without_destroying_dropdowns) # Schedule lift after 2 seconds
 
         #search_entry.bind("<KeyRelease>", delayed_lift) # NEW - Delayed lift
+
+    def _handle_main_search_key_release(self, event):
+        """
+        Handles KeyRelease events for the search entry, ignoring specific keys
+        and events immediately after external focus gain.
+        """
+        # --- Add this check at the very beginning ---
+        if self._ignore_keyrelease_timer_id is not None:
+            print(f"DEBUG: Ignoring KeyRelease '{event.keysym}' during post-focus grace period.")
+            return # Stop processing this event during the ignore period
+        # --- End of added check ---
+
+        # Define the keysyms of keys to ignore (Escape, Alt, Tab)
+        ignored_keys = {'Escape', 'Alt_L', 'Alt_R', 'Tab'}
+
+        # print(f"Key released: {event.keysym}") # Optional: for debugging
+
+        # Check if the released key's keysym is NOT in the set of ignored keys
+        if event.keysym not in ignored_keys:
+            self.start_debounce_highlighting()
+        else:
+            print(f"Ignoring key release for non-trigger key: {event.keysym}")
 
 
     def start_debounce_highlighting(self):
@@ -2330,6 +3012,7 @@ class ConfigViewerApp:
             self.master.after_cancel(self.debounce_timer) # Cancel existing timer
 
         #self.debounce_timer = self.master.after(2000, self.actual_label_highlighting) # Set new timer
+        print("    start_debounce_highlighting( is calling self.perform_search() - user initiated search from typing in the search bar")
         self.debounce_timer = self.master.after(1000, self.perform_search)
         #self.lift_search_results_window()
         
@@ -2341,7 +3024,204 @@ class ConfigViewerApp:
 
             
 
+    def rebuild_gui(self, changing_scale=False):
+        """Destroys and recreates the main GUI frames (top, bottom, main content area)."""
 
+
+        
+        print("\n--- Starting GUI Rebuild ---")
+
+        scanning_win = None  # Initialize scanning_win
+
+        if changing_scale:
+            print("Called with changing_scale=True, destroying scanning, details, filters, hidden (withdrawing) and spawn queue window and changing font size")
+            if self.font_size_add == 0:
+                scanning_win = self.show_scanning_window(text=f"Rebuilding UI and setting scale to Small...")
+
+            elif self.font_size_add == 2:
+                scanning_win = self.show_scanning_window(text=f"Rebuilding UI and setting scale to Medium...")
+
+            elif self.font_size_add == 4:
+                scanning_win = self.show_scanning_window(text=f"Rebuilding UI and setting scale to Large...")
+
+
+            # --- Close/hide other windows ---
+            if hasattr(self, 'details_window') and self.details_window and not self.details_window_closed:
+                print("Closing details window before GUI rebuild...")
+                self.details_window_intentionally_closed = True
+                self.on_details_window_close()
+
+
+            if hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists():
+                print("Destroying filters window before GUI rebuild...")
+                self.filters_window.destroy()
+                self.filters_window = None
+            if hasattr(self, 'hidden_window') and self.hidden_window and self.hidden_window.winfo_exists():
+                print("Withdrawing hidden vehicles window before GUI rebuild...")
+                self.hidden_window.withdraw()
+            if hasattr(self, 'spawn_queue_window') and self.spawn_queue_window and self.spawn_queue_window.winfo_exists():
+                print("Destroying spawn queue window before GUI rebuild...")
+                self.destroy_spawn_queue_window()
+
+
+        else:
+            #scanning_win = self.show_scanning_window(text=f"Resizing window...")
+            pass
+
+
+        # --- Destroy existing frames AND reset attributes immediately ---
+        print("Destroying existing frames and resetting attributes...")
+
+        # Use try-except for safety during destruction
+        try:
+            if hasattr(self, 'top_frame') and self.top_frame and self.top_frame.winfo_exists():
+                self.top_frame.destroy()
+                print("  - Top frame destroyed.")
+        except Exception as e:
+            print(f"  - Error destroying top_frame: {e}")
+        finally:
+            self.top_frame = None # Set to None regardless of destruction success
+
+        try:
+            if hasattr(self, 'bottom_frame') and self.bottom_frame and self.bottom_frame.winfo_exists():
+                self.bottom_frame.destroy()
+                print("  - Bottom frame destroyed.")
+        except Exception as e:
+            print(f"  - Error destroying bottom_frame: {e}")
+        finally:
+            self.bottom_frame = None # Set to None regardless
+
+        try:
+            if hasattr(self, 'main_frame') and self.main_frame and self.main_frame.winfo_exists():
+                # Destroying main_frame also destroys the canvas and sidebar within it
+                self.main_frame.destroy()
+                print("  - Main frame destroyed.")
+        except Exception as e:
+            print(f"  - Error destroying main_frame: {e}")
+        finally:
+            self.main_frame = None # Set to None regardless
+            # Also reset references to widgets *inside* main_frame
+            self.canvas = None
+            self.scrollable_frame = None
+            self.sidebar_frame = None
+            self.sidebar_top_frame = None
+            self.sidebar_bottom_frame = None
+            self.sidebar_filter_buttons = {}
+            # Add any other critical widgets that were inside main_frame
+
+        # --- Let Tkinter process destroy events ---
+        self.master.update_idletasks()
+        print("  - Ran update_idletasks after destruction and reset.")
+
+        # --- Recreate GUI components by calling setup methods ---
+        print("Recreating GUI components...")
+        # The setup methods MUST correctly assign to self attributes now
+        self.setup_top_frame()           # Creates, assigns self.top_frame, packs, populates
+        self.setup_main_frame()          # Creates, assigns self.main_frame, packs BEFORE bottom
+
+        if changing_scale:
+            self.setup_bottom_frame(scale_changed=True)        # Creates, assigns self.bottom_frame, packs LAST
+
+        else:
+            self.setup_bottom_frame(scale_changed=False)        # Creates, assigns self.bottom_frame, packs LAST
+
+        # Create content *inside* the new self.main_frame
+        # Ensure these methods use self.main_frame as parent
+        self.setup_canvas_and_scrollbar()
+        self.setup_scrollable_frame()
+        self.setup_sidebar_frame()
+        self.setup_sidebar_top_frame_content()
+        self.setup_sidebar_bottom_frame_content()
+
+
+        print("DEBUG: Checking self.sidebar_bottom_frame IMMEDIATELY AFTER setup calls in rebuild_gui:")
+        if hasattr(self, 'sidebar_bottom_frame') and self.sidebar_bottom_frame and self.sidebar_bottom_frame.winfo_exists():
+            print("  SUCCESS: self.sidebar_bottom_frame seems valid immediately after setup.")
+        else:
+            print("  ERROR: self.sidebar_bottom_frame is INVALID immediately after setup!")
+
+
+        # --- Repopulate the main grid ---
+        print("Repopulating main grid using update_grid_layout()...")
+        # Ensure update_grid_layout uses self.scrollable_frame correctly
+
+        self.destroy_search_results_window()
+
+        #self.clear_all_filters_and_files()
+        #self.search_var.set("")
+        #self.perform_search()
+        
+        print("DEBUG: rebuild_gui is Calling set_filter_to_view_all_and_turn_subset_off after 200ms delay...")
+        self.master.after(200, self.set_filter_to_view_all_and_turn_subset_off)
+
+        print("DEBUG: rebuild_gui is Calling self.update_grid_layout() after 300ms delay...")
+        self.master.after(300, self.update_grid_layout)
+        # --- Re-establish event bindings ---
+        print("Re-establishing event bindings...")
+        # Ensure setup_event_bindings uses self.master, self.canvas etc. correctly
+        self.setup_event_bindings()
+
+
+
+
+        # --- Final UI update ---
+        self.master.update_idletasks()
+
+
+        #self.perform_search()
+
+
+        self.rebuild_hidden_window_gui()
+
+
+        if scanning_win:
+            scanning_win.destroy()
+
+        print("--- GUI Rebuild Complete ---\n")
+
+
+    def rebuild_hidden_window_gui(self):
+        """Destroys and recreates the widgets within the Hidden Vehicles window."""
+        print("\n--- Starting Hidden Window GUI Rebuild ---")
+
+        if not hasattr(self, 'hidden_window') or not self.hidden_window or not self.hidden_window.winfo_exists():
+            print("Hidden window does not exist or is already destroyed. Cannot rebuild.")
+            return
+
+        # --- Destroy all direct children of the Toplevel window ---
+        print("Destroying existing widgets inside hidden_window...")
+        widget_count = 0
+        for widget in self.hidden_window.winfo_children():
+            try:
+                widget.destroy()
+                widget_count += 1
+            except Exception as e:
+                print(f"  - Error destroying widget {widget}: {e}")
+        print(f"  - Destroyed {widget_count} widgets.")
+
+        # --- Clear potentially dangling references specific to the hidden window ---
+        self.hidden_window_search_entry = None
+        self.hidden_window_canvas = None
+        self.hidden_window_scrollable_frame = None
+        self.hidden_window_custom_scrollbar_canvas_hidden = None
+        self.hidden_window_restart_button = None
+        self.vehicle_frames = [] # Reset the list of item frames
+        # Add any other specific attributes if necessary
+
+        # --- Let Tkinter process destroy events ---
+        self.hidden_window.update_idletasks()
+        print("  - Ran update_idletasks after destruction.")
+
+        # --- Recreate widgets by calling the original creation function ---
+        print("Recreating hidden window widgets...")
+        # create_widgets_hidden_window expects the Toplevel window as parent
+        self.create_widgets_hidden_window(self.hidden_window)
+        # This call will also trigger update_vehicle_display to repopulate the list
+
+        # --- Final UI update ---
+        self.hidden_window.update_idletasks()
+        print("--- Hidden Window GUI Rebuild Complete ---\n")
+        
         
         
     def create_top_buttons(self, top_frame):
@@ -2364,6 +3244,7 @@ class ConfigViewerApp:
 
         #self._create_resize_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
         self._create_show_switcher_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
+        self._create_switch_to_beamng_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
 
         self.create_loading_label(top_frame) # Keep loading label creation here, assuming it's related to top frame
 
@@ -2382,6 +3263,7 @@ class ConfigViewerApp:
         self._show_dropdown_menu(self.add_vehicles_button, [
             ("Spawn Traffic/Parked Vehicles", self.on_spawn_traffic_vehicles_button_click),
             ("Spawn Queue", self.show_spawn_queue_window),
+            ("Spawn Random Vehicle", self.spawn_random_vehicle),
         ], 'add_vehicles_dropdown_window')
 
     def show_player_vehicle_dropdown(self):
@@ -2417,7 +3299,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 dropdown_window,
                 text=option_text,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda cmd=command: on_dropdown_option_click(cmd),
                 borderwidth=1,
                 relief="solid",
@@ -2470,7 +3352,7 @@ class ConfigViewerApp:
         self.player_vehicle_button.default_fg_color = self.global_highlight_color
         # --- MODIFIED: Store default text color as attribute ---
         self._bind_button_events_custom_fg(self.player_vehicle_button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg=self.global_highlight_color) # Passing default_fg
-        self.player_vehicle_button.pack(side="left", padx=(80, 10))
+        self.player_vehicle_button.pack(side="left", padx=(40, 10))
 
     def create_remove_vehicles_dropdown_button(self, top_frame):
         button_style_args = self._create_button_style()
@@ -2533,7 +3415,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font": ("Segoe UI", 12,)
+            "font": ("Segoe UI", 12+self.font_size_add,)
         }
 
     def _create_button_event_handlers(self):
@@ -2605,11 +3487,34 @@ class ConfigViewerApp:
         self.resize_button = tk.Button(
             top_frame,
             text="Change Window Size",
-            command=self.open_resize_window,
+            command=self.do_nothing,
             **button_style_args
         )
         self._bind_button_events(self.resize_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self.resize_button.pack(side="right", padx=(0, 10))
+        #self.resize_button.pack(side="right", padx=(0, 10))
+
+
+
+    def _create_switch_to_beamng_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
+        """Creates and packs the Show Switcher button."""
+        # Initialize with default text
+
+        if not self.new_button_label:
+            initial_text = f"Switch to BeamNG ({self.DEFAULT_SWITCH_DISPLAY_TEXT})"
+        else:
+            initial_text = self.new_button_label
+
+        self.switch_to_beamng_button = tk.Button(
+            top_frame,
+            text=initial_text, # Use default text initially
+            command=self.focus_beamng_window,
+            **button_style_args
+        )
+        self._bind_button_events(self.switch_to_beamng_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
+        self.switch_to_beamng_button.pack(side="right", padx=(0, 10))
+
+
+
 
     def _create_show_switcher_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
         """Creates and packs the Show Switcher button."""
@@ -2648,7 +3553,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12)
+            "font":("Segoe UI", 12+self.font_size_add)
         }
         disabled_button_style_args = button_style_args.copy()  # Copy base style
         disabled_button_style_args["fg"] = "grey" # Grey text for disabled state
@@ -2700,12 +3605,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot change Categorization mode while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
         button = self.categorize_button
         button_x = button.winfo_rootx()
@@ -2715,7 +3622,7 @@ class ConfigViewerApp:
         self.categorize_dropdown_window = tk.Toplevel(self.master)
         self.categorize_dropdown_window.overrideredirect(True)  # Remove window border
         self.categorize_dropdown_window.tk.call('tk', 'scaling', 1.25)  # Set to 100% scaling
-        self.categorize_dropdown_window.geometry(f"+{button_x}+{button_y - 115}") # Position above button - adjust offset as needed
+        #self.categorize_dropdown_window.geometry(f"+{button_x}+{button_y - 115}") # Position above button - adjust offset as needed
         self.categorize_dropdown_window.config(bg="#555555") # Dark grey background for dropdown
         self.categorize_dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
 
@@ -2725,8 +3632,10 @@ class ConfigViewerApp:
             self.categorization_mode = option
             self.categorize_button.config(text=f"Categorize by: {self.categorization_mode}")
             self.grouped_data = self.format_grouped_data(self.data) # Re-group data
+            print("    on_categorize_option_click is calling self.update_grid_layout() - inner function of show_categorize_dropdown")
             self.update_grid_layout() # Re-layout grid
             self.canvas.yview_moveto(0) # Reset scroll
+            print("    on_categorize_option_click is calling self.perform_search() - inner function of show_categorize_dropdown")
             self.perform_search() # Re-apply search
             self.categorize_dropdown_window.destroy()
             self.categorize_dropdown_window = None
@@ -2742,7 +3651,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 self.categorize_dropdown_window,
                 text=f"Categorize by: {option}", # Display "Categorize by: " prefix in dropdown
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option: on_categorize_option_click(opt),
                 borderwidth=1,
                 relief="solid",
@@ -2755,6 +3664,15 @@ class ConfigViewerApp:
             dropdown_button.pack(fill="x")
             dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
             dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+
+        # Force update to calculate window size based on content
+        self.categorize_dropdown_window.update_idletasks()
+        # Get the actual height of the dropdown window
+        window_height = self.categorize_dropdown_window.winfo_height()
+        # Calculate the target Y position (top edge of button minus window height)
+        target_y = button_y - window_height
+        # Set the final position
+        self.categorize_dropdown_window.geometry(f"+{button_x}+{target_y}")
 
         self.categorize_dropdown_window.bind("<FocusOut>", lambda event: self.destroy_categorize_dropdown())
 
@@ -2782,31 +3700,13 @@ class ConfigViewerApp:
             top_frame,
             text="Loading...",
             bg="lightgrey",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 12+self.font_size_add, "bold"),
             fg="blue"
         )
         #self.loading_label.pack(side="left", padx=(0, 10))  # Place it next to the Search button
         self.loading_label.pack_forget()  # Initially hidden
 
-    def setup_bottom_frame(self):
-        bottom_frame = tk.Frame(self.master, bg="#333333", pady=10)
-        bottom_frame.pack(side="bottom", fill="x")
-        # self.smooth_fade_in_frame(bottom_frame, start_color="#FFFFFF", end_color="#D3D3D3", steps=15, delay=30, exclude_widgets=[tk.Entry]) # Comment out or delete this line
 
-        self.create_filter_button(bottom_frame)
-        self.create_categorize_button(bottom_frame)
-        self.create_category_list_button(bottom_frame) # <-- ADDED THIS LINE
-        self.create_no_configs_message_label(bottom_frame)
-        self.create_status_labels(bottom_frame)
-        
-        self.create_isolated_mods_button(bottom_frame)
-        self.create_hidden_vehicles_button(bottom_frame)
-        self.create_restart_button(bottom_frame)
-        self.create_resize_button(bottom_frame)
-        self.create_settings_button(bottom_frame)
-
-
-        #self.create_item_count_label(bottom_frame) # Item count label in bottom frame
 
 
     def create_category_list_button(self, bottom_frame):
@@ -2818,7 +3718,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12)
+            "font":("Segoe UI", 12+self.font_size_add)
         }
         disabled_button_style_args = button_style_args.copy()  # Copy base style
         disabled_button_style_args["fg"] = "grey" # Grey text for disabled state
@@ -2968,7 +3868,7 @@ class ConfigViewerApp:
         self.current_tooltip_global_filter_window.tk.call('tk', 'scaling', 1.25)
         self.current_tooltip_global_filter_window.attributes("-topmost", True)
 
-        tooltip_global_filter_label = tk.Label(self.current_tooltip_global_filter_window, text=tip_text, font=("Segoe UI", 10, "bold", "italic"), fg="lightgrey", bg=tooltip_color, padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Use tooltip_color
+        tooltip_global_filter_label = tk.Label(self.current_tooltip_global_filter_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="lightgrey", bg=tooltip_color, padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Use tooltip_color
         tooltip_global_filter_label.pack(padx=1, pady=1)
         self.tooltip_global_filter_original_bg_color = tooltip_color # Set original color
 
@@ -3038,6 +3938,8 @@ class ConfigViewerApp:
     def clear_all_filters_and_files(self, entry_widgets, on_off_button_style_args):
         self.clear_filters_and_reset_buttons(entry_widgets, on_off_button_style_args) # Clear filters and reset buttons first
 
+
+        
         # Delete filter settings file if it exists
         if os.path.exists(self.filter_settings_file):
             os.remove(self.filter_settings_file)
@@ -3061,20 +3963,16 @@ class ConfigViewerApp:
         self.is_data_subset_active = False # <--- ALWAYS TURN SUBSET DATA OFF when "Clear Filters" is clicked
         self.subset_data_button.config(text="Off") # Update button text
         self.reset_button_color(self.subset_data_button, self.button_style_args)
+
+        self.is_search_results_window_active_bypass_flag = True
+
+        print("    clear_all_filters_and_files is calling self.perform_search()")
         self.perform_search()
 
-        # --- MODIFICATION START: Conditionally close Search Results window on Clear ---
-        if not self.search_var.get().strip() and self.filter_state == 0: # Check for empty search bar AND "View All" filter
-            if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
-                self.destroy_search_results_window()
-                self.search_results_window = None
-                self.is_search_results_window_active = False
-                print("DEBUG: clear_all_filters_and_files - Search Results window DESTROYED (Clear button - Empty Search Bar AND View All Filter).")
-            else:
-                print("DEBUG: clear_all_filters_and_files - Search Results window NOT open, no need to destroy.") # DEBUG - Window Not Open
-        else:
-            print("DEBUG: clear_all_filters_and_files - Search Results window KEPT OPEN (Clear button - Search Bar NOT empty OR Filter NOT View All).") # DEBUG - Window Kept Open
-        # --- MODIFICATION END: Conditionally close Search Results window on Clear ---
+        #print("    clear_all_filters_and_files is calling self.update_grid_layout() - after 100ms") this isn't necessary anymore. everything that leads to this function being called updates the layout already
+        #self.master.after(100, self.update_grid_layout)
+
+
 
         print("Data Subset Mode: OFF (Set by Clear Filters)") # Debug print
         
@@ -3244,10 +4142,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot use filters while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-            return # EXIT if in Configs search mode
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
 
@@ -3260,10 +4162,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot use filters in Config Search mode.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-            return # EXIT if in Configs search mode
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
 
         if hasattr(self, 'spawn_queue_window') and self.spawn_queue_window and self.spawn_queue_window.winfo_exists():
@@ -3317,7 +4223,23 @@ class ConfigViewerApp:
 
         self.filters_window = filters_window = tk.Toplevel(self.master)
         filters_window.title("Filters")
-        filters_window.geometry("655x528")
+
+
+        if self.font_size_add == 0:
+            filters_window.geometry("655x528")
+
+        elif self.font_size_add == 2:
+            filters_window.geometry("700x578")
+
+        elif self.font_size_add == 4:
+            filters_window.geometry("755x670")
+
+
+
+
+
+
+
         #filters_window.attributes("-topmost", True)
         #filters_window.transient(self.master) #dont uncomment this line or remove it
         filters_window.resizable(False, False)
@@ -3343,12 +4265,12 @@ class ConfigViewerApp:
 
         style = ttk.Style()
         style.theme_use('clam')
-        label_font = ("Segoe UI", 12, "bold")
-        entry_font = ("Segoe UI", 11)
+        label_font = ("Segoe UI", 12+self.font_size_add, "bold")
+        entry_font = ("Segoe UI", 11+self.font_size_add)
 
         style.configure("DarkTheme.TLabel", background="#333333", foreground="white", font=label_font)
         style.configure("DarkTheme.TEntry", fieldbackground="lightgrey", foreground="black", lightcolor="lightgrey", borderwidth=1, relief="solid", font=entry_font)
-        style.configure("Title.DarkTheme.TLabel", background="#333333", foreground="white", font=("Segoe UI", 14, "bold"))
+        style.configure("Title.DarkTheme.TLabel", background="#333333", foreground="white", font=("Segoe UI", 14+self.font_size_add, "bold"))
 
         bottom_button_style_args = {
             "bg": "#555555",
@@ -3358,7 +4280,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12),
+            "font":("Segoe UI", 12+self.font_size_add),
         }
 
         on_off_button_style_args = {
@@ -3369,7 +4291,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 10),
+            "font":("Segoe UI", 10+self.font_size_add),
         }
 
         equal_width = 5
@@ -3581,13 +4503,14 @@ class ConfigViewerApp:
             self.filter_config_files(filters_variable)
             self.is_data_subset_active = True
             self.subset_data_button.config(text="On")
+            print("    apply_filters_and_run_filter is calling self.perform_search()")
             self.perform_search()
             print("Data Subset Mode: ON (Set by Apply Filters)")
             self.update_search_results_window_ui()
 
             # --- MODIFICATION START: Open Search Results Window after applying filters ---
             if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
-                self.search_results_window = self._create_search_results_window(self.data) # Pass current data
+                self.search_results_window = self.show_search_results_window(self.data) # Pass current data
                 print("DEBUG: apply_filters_and_run_filter - Search Results window CREATED after applying filters.")
             self.search_results_window.lift() # Bring to front if already open
             print("DEBUG: apply_filters_and_run_filter - Search Results window LIFTED after applying filters.")
@@ -4101,6 +5024,7 @@ class ConfigViewerApp:
         else:
             self.subset_data_button.config(text="Off")
             self.reset_button_color(self.subset_data_button, self.button_style_args)
+        print("    toggle_data_subset is calling self.perform_search()")
         self.perform_search()
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
 
@@ -4121,7 +5045,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4140,7 +5064,7 @@ class ConfigViewerApp:
         self.filter_button = tk.Button(
             bottom_frame,
             text=f"{self.filter_options[self.filter_state]} [0]",
-            #font=("Segoe UI", 12), # Removed redundant font argument HERE
+            #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
             command=self.show_filter_dropdown,
             **button_style_args # Apply the button styles
         )
@@ -4161,24 +5085,33 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot change main filter mode while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
         button = self.filter_button
+        # Force update to ensure button dimensions and position are current
+        button.update_idletasks()
         button_x = button.winfo_rootx()
         button_y = button.winfo_rooty()
-        button_height = button.winfo_height()
+        # button_height = button.winfo_height() # We don't strictly need button_height for this calculation
 
-        self.filter_dropdown_window = tk.Toplevel(self.master)
+        self.filter_dropdown_window = tk.Toplevel(self.master) # Use master.root or appropriate parent
         self.filter_dropdown_window.overrideredirect(True) # Remove window border
-        self.filter_dropdown_window.geometry(f"+{button_x}+{button_y - 151}") # Position 220 pixels above
-        self.filter_dropdown_window.tk.call('tk', 'scaling', 1.25)
+        # Don't set geometry yet
+        self.filter_dropdown_window.wm_attributes("-topmost", True) # Keep on top of other windows
+
+        # Configure window appearance before adding content
+        self.filter_dropdown_window.tk.call('tk', 'scaling', 1.25) # Apply scaling early if possible
         self.filter_dropdown_window.config(bg="#333333") # Dark grey background for dropdown
         self.filter_dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+
+
 
         def on_dropdown_button_click(index):
             self.filter_state = index # <--- FIX: Correctly update filter_state
@@ -4205,13 +5138,13 @@ class ConfigViewerApp:
                 country_button.config(text="All Countries") # <--- Reset Country button to "All Countries"
             # --- NEW: Reset Brand, Name, Bodystyle, and Country filters to "All..." when main filter changes ---
 
-
+            print("    on_dropdown_button_click is calling self.perform_search() - inner function of show_filter_dropdown")
             self.perform_search() # <--- FIX: Call perform_search here to apply filter
 
             # --- MODIFICATION START: Open Search Results Window for non-"View All" filters ---
             if self.filter_state != 0: # Check if the selected filter is NOT "View All" (index 0)
                 if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
-                    self.search_results_window = self._create_search_results_window(self.data) # Pass current data
+                    self.search_results_window = self.show_search_results_window(self.data) # Pass current data
                     print("DEBUG: show_filter_dropdown - Search Results window CREATED due to filter change (non-'View All').")
                 self.search_results_window.lift() # Bring to front if already open
                 print("DEBUG: show_filter_dropdown - Search Results window LIFTED.")
@@ -4251,7 +5184,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 self.filter_dropdown_window,
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda idx=self.filter_options.index(option): on_dropdown_button_click(idx), # <--- MODIFIED: Use original index from self.filter_options
                 borderwidth=1,
                 relief="solid",
@@ -4265,6 +5198,21 @@ class ConfigViewerApp:
             dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black")) # Store original bg and fg, set fg to black on hover
             dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg)) # Revert to original bg and fg
 
+
+        # --- DYNAMIC POSITIONING ---
+        # Force Tkinter to calculate the window's required size based on its contents
+        self.filter_dropdown_window.update_idletasks()
+
+        # Get the actual calculated height of the dropdown window
+        window_height = self.filter_dropdown_window.winfo_height()
+
+        # Calculate the target Y coordinate: button's top edge minus window's height
+        target_y = button_y - window_height
+
+        # Set the final geometry
+        self.filter_dropdown_window.geometry(f"+{button_x}+{target_y}")
+
+        
         # Bind focus out to close the dropdown if clicked outside
         self.filter_dropdown_window.bind("<FocusOut>", lambda event: self.destroy_filter_dropdown())
 
@@ -4296,6 +5244,7 @@ class ConfigViewerApp:
             self.subset_data_button.config(text="Off")
             self.reset_button_color(self.subset_data_button, self.button_style_args)
 
+            print("    set_filter_to_view_all_and_turn_subset_off is calling self.perform_search() - and also clearing the search bar")
             self.search_var.set("")
             self.perform_search() 
             print("Filter set to 'View All'.")
@@ -4313,7 +5262,7 @@ class ConfigViewerApp:
  
   
     def create_status_labels(self, bottom_frame):
-        self.deleting_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12, "bold")) # Dark bg, lightgrey fg
+        self.deleting_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add, "bold")) # Dark bg, lightgrey fg
         self.deleting_label.pack(side="left", expand=True, padx=(10, 0))
 
 
@@ -4326,7 +5275,7 @@ class ConfigViewerApp:
             text="No configurations available for vehicle under filter restrictions",
             bg="#333333",
             fg=self.global_highlight_color,
-            font=("Segoe UI", 12, "bold")
+            font=("Segoe UI", 12+self.font_size_add, "bold")
         )
         self.no_configs_label.pack(side="left", padx=(10, 0))  # Pack BEFORE settings button
         self.no_configs_label.pack_forget()  # Initially hidden
@@ -4351,7 +5300,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4367,14 +5316,14 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.isolated_mods_button = tk.Button(bottom_frame, text="Isolated Mods", #font=("Segoe UI", 12), # Removed redundant font argument HERE
+        self.isolated_mods_button = tk.Button(bottom_frame, text="Isolated Mods", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
                                         command=self.open_isolated_folder_in_explorer,
                                         **button_style_args # Apply the button styles
         )
         self.isolated_mods_button.bind("<Enter>", on_bottom_button_hover_enter)
         self.isolated_mods_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
         self.isolated_mods_button.bind("<Button-1>", on_bottom_button_click)
-        self.isolated_mods_button.pack(side="left", padx=(0, 10))
+        self.isolated_mods_button.pack(side="right", padx=(0, 10))
 
 
 
@@ -4387,7 +5336,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4403,18 +5352,18 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.hidden_vehicles_button = tk.Button(bottom_frame, text="Hidden Vehicles", #font=("Segoe UI", 12), # Removed redundant font argument HERE
+        self.hidden_vehicles_button = tk.Button(bottom_frame, text="Hidden Vehicles", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
                                         command=self.show_hidden_vehicles_window,
                                         **button_style_args # Apply the button styles
         )
         self.hidden_vehicles_button.bind("<Enter>", on_bottom_button_hover_enter)
         self.hidden_vehicles_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
         self.hidden_vehicles_button.bind("<Button-1>", on_bottom_button_click)
-        self.hidden_vehicles_button.pack(side="left", padx=(0, 10))
+        self.hidden_vehicles_button.pack(side="right", padx=(0, 10))
 
 
 
-    def create_settings_button(self, bottom_frame):
+    def create_settings_button(self, bottom_frame, scale_changed=False):
         button_style_args = { # Re-define button_style_args here to remove "bold" font
             "bg": "#555555",
             "fg": "white",
@@ -4423,7 +5372,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4439,7 +5388,7 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.settings_button = tk.Button(bottom_frame, text="Settings", #font=("Segoe UI", 12), # Removed redundant font argument HERE
+        self.settings_button = tk.Button(bottom_frame, text="Settings", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
                                         command=self.show_settings_dropdown,
                                         **button_style_args # Apply the button styles
         )
@@ -4447,11 +5396,14 @@ class ConfigViewerApp:
         self.settings_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
         self.settings_button.bind("<Button-1>", on_bottom_button_click)
         self.settings_button.bind("<Button-3>", self.on_settings_button_right_click)
-        self.settings_button.pack(side="right", padx=(10, 10))
+        self.settings_button.pack(side="right", padx=(0, 10))
 
-
-
-
+        if scale_changed:
+            print("DEBUG: Font size changed this session. Scheduling settings dropdown reopen in half a second second.")
+            # Reset the flag immediately after deciding to schedule the action
+            # self.font_size_changed_this_session = False # no longer necessary
+            # Schedule the function call after 1000 milliseconds (1 second)
+            self.master.after(500, self.show_settings_dropdown)
 
 
 
@@ -4464,7 +5416,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4480,14 +5432,14 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.restart_button = tk.Button(bottom_frame, text="Restart", #font=("Segoe UI", 12), # Removed redundant font argument HERE
+        self.restart_button = tk.Button(bottom_frame, text="Restart", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
                                         command=self.restart_script_and_save_settings,
                                         **button_style_args # Apply the button styles
         )
         self.restart_button.bind("<Enter>", on_bottom_button_hover_enter)
         self.restart_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
         self.restart_button.bind("<Button-1>", on_bottom_button_click)
-        self.restart_button.pack(side="left", padx=(0, 10))
+        self.restart_button.pack(side="right", padx=(0, 10))
 
 
 
@@ -4501,7 +5453,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font":("Segoe UI", 12) # REMOVE BOLD FONT - for bottom frame buttons
+            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
         }
 
         def on_bottom_button_hover_enter(event):
@@ -4517,80 +5469,188 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
 
 
-        self.settings_button = tk.Button(bottom_frame, text="Change Window Size", #font=("Segoe UI", 12), # Removed redundant font argument HERE
-                                        command=self.open_resize_window,
-                                        **button_style_args # Apply the button styles
+        # VVV CHANGE THIS LINE VVV
+        self.resize_button = tk.Button(bottom_frame, text="Change Window Size",
+                                        command=self.do_nothing,
+                                        **button_style_args
         )
-        self.settings_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.settings_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.settings_button.bind("<Button-1>", on_bottom_button_click)
-        self.settings_button.pack(side="left", padx=(0, 0))
+        # VVV And update these lines VVV
+        self.resize_button.bind("<Enter>", on_bottom_button_hover_enter)
+        self.resize_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
+        self.resize_button.bind("<Button-1>", on_bottom_button_click)
+        #self.resize_button.pack(side="right", padx=(0, 10)) # Added some padding like others for consistency
+
+
+
+
+
 
 
     def show_settings_dropdown(self):
+        # --- Check if the button still exists ---
+        if not hasattr(self, 'settings_button') or not self.settings_button.winfo_exists():
+             print("Error: Settings button does not exist.")
+             return
+
+        trigger_button = self.settings_button # Use a local variable for clarity
+
+        # --- Toggle check: Destroy existing dropdown if present ---
         if hasattr(self, 'settings_dropdown_window') and self.settings_dropdown_window and self.settings_dropdown_window.winfo_exists():
-            self.settings_dropdown_window.destroy()
-            return
+            print("Dropdown exists, destroying it.")
+            self.destroy_settings_dropdown() # Use the dedicated destroy method
+            return # Exit after destroying
 
-        button = self.settings_button
-        button_x = button.winfo_rootx()
-        button_y = button.winfo_rooty()
-        button_height = button.winfo_height()
+        print("Creating new dropdown.")
 
+        # --- Create the Toplevel window ---
         self.settings_dropdown_window = tk.Toplevel(self.master)
         self.settings_dropdown_window.overrideredirect(True)
-        self.settings_dropdown_window.tk.call('tk', 'scaling', 1.25)
-        self.settings_dropdown_window.geometry(f"+{button_x - 190}+{button_y - 260}") # Increased offset for new option
+        # Basic styling - do this early
         self.settings_dropdown_window.config(bg="#333333")
         self.settings_dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
 
-        def on_settings_option_click(command):
+
+        try:
+            # Apply scaling *before* adding content if you need it per-window
+            self.settings_dropdown_window.tk.call('tk', 'scaling', 1.25)
+            print("Applied tk scaling (1.25x) to dropdown.")
+        except tk.TclError:
+            print("Warning: Failed to set tk scaling for dropdown (might not be supported).")
+
+
+        # --- Define the click handler nested function ---
+        def on_settings_option_click(command, is_toggle_action):
+            # Execute the primary action
+
+            is_font_toggle = (command == self.toggle_font_size)
+
             command()
-            self.settings_dropdown_window.destroy()
-            self.settings_dropdown_window = None
-            self.update_settings_dropdown_button_text()
 
+            if is_font_toggle:
+                print("Font size toggled, marking for restart note.")
+                self.font_size_changed_this_session = True
+                self.destroy_settings_dropdown()
+                
+
+            should_reopen = is_toggle_action
+            current_window = getattr(self, 'settings_dropdown_window', None) # Get current ref
+
+            # Safely destroy the current dropdown window *before* potentially reopening
+            if current_window and current_window.winfo_exists():
+                 # Don't destroy here if reopening, destroy happens in the main toggle check
+                 if not should_reopen:
+                      print("Non-toggle action, destroying dropdown from click handler.")
+                      self.destroy_settings_dropdown() # Use dedicated method
+                 # If reopening, the destroy/recreate is handled by the 'after' call below
+            # else:
+                 # self.settings_dropdown_window = None # Ensure ref is clear if window didn't exist
+
+            # Update any UI elements that depend on the setting
+            self.update_settings_dropdown_button_text() # Call your update method
+
+
+
+            if should_reopen:
+                print("Toggle action detected, scheduling dropdown reopen...")
+                # Check if the trigger button still exists before scheduling reopen
+                if trigger_button.winfo_exists():
+                    # Use master.after to allow the event loop to process destruction/updates
+                    # before attempting recreation. This prevents issues.
+                    # We need to destroy the *current* one *before* calling show_settings_dropdown again
+                    if current_window and current_window.winfo_exists():
+                         current_window.destroy()
+                         self.settings_dropdown_window = None # Clear ref *immediately* after destroy
+
+                    # Schedule the reopening
+                    self.master.after(10, self.show_settings_dropdown)
+                else:
+                    print("Warning: Original settings button gone, cannot reopen dropdown.")
+                    self.settings_dropdown_window = None # Ensure ref is cleared
+            # No else needed for non-toggle, destruction was handled above or dropdown remains closed
+
+
+        font_option_text = f"⚙️ UI Font Size and Scale: {self._get_font_size_name()}"
+        #if self.font_size_changed_this_session:
+            #font_option_text += " (Restart needed for this change to take full effect)"
+
+
+        # --- Define settings options ---
         settings_options = [
-            #("Add Mod(s)", self.add_mods_action),
-
-            #("Choose new User Vehicles Folder", self.choose_new_user_folder),
-
-            ("Rescan All Mods & Configs", self.on_rescan_all_button_click),
-
-            ("Attempt to Sort By Install Date: " + ("On" if self.sort_by_install_date else "Off"), self.toggle_sort_by_install_date),
-
-            ("Show Switcher On Startup: " + ("On" if self.show_switcher_on_startup else "Off"), self.toggle_show_switcher_on_startup),
-
-            ("Collapse Categories By Default: " + ("On" if self.collapse_categories_by_default else "Off"), self.toggle_collapse_categories_by_default), # NEW OPTION
-
-            ("Show Configs Without Images: " + ("On" if self.placeholder_settings else "Off"), self.toggle_placeholder_settings), # NEW OPTION
-
-            ("Double Click to Spawn: " + ("On" if self.middle_click_settings else "Off"), self.toggle_middle_click_settings),
-
-            ("Display Vehicle Folder Names: " + ("On" if self.show_folder_settings else "Off"), self.toggle_show_folder_settings)
-
+            # Format: (Text, Command, Is_Toggle_Flag)
+            ("🔄 Rescan All Mods, Configurations and Refresh UI", self.on_rescan_all_button_click_handler, False), # 🔄 = Refresh/Rescan
+            ("✨ Attempt to Show the Latest Installed Mods In The List First: " + ("On" if self.sort_by_install_date else "Off"), self.toggle_sort_by_install_date, True), # 📅 = Date/Time (for latest)
+            ("🚀 Show Transparent Switcher Window On Application Launch: " + ("On" if self.show_switcher_on_startup else "Off"), self.toggle_show_switcher_on_startup, True), # 🚀 = Launch/Startup
+            ("➖ Hide All Type and Country Categories On Application Launch: " + ("On" if self.collapse_categories_by_default else "Off"), self.toggle_collapse_categories_by_default, True), # ➖ = Collapse/Hide
+            ("❓ Show Configs Without Vehicle Preview Images: " + ("On" if self.placeholder_settings else "Off"), self.toggle_placeholder_settings, True), # 🖼️ = Images (related to preview images) - changed from ⬜ to be more direct about images being the subject
+            ("👆 Double Clicking On a Vehicle Preview should: " + ("Replace the Current Vehicle" if self.middle_click_settings else "Add it to the Spawn Queue"), self.toggle_middle_click_settings, True), # 🖱️ = Mouse Click Action
+            ("📁 Display Vehicle Folder Names Under Previews: " + ("On" if self.show_folder_settings else "Off"), self.toggle_show_folder_settings, False), # 📁 = Folder
+            ("↕️ 'Jump to page' Button Placement in Configuration List: " + ("Bottom" if self.jump_to_page_button_should_be_bottom else "Top"), self.toggle_jump_to_page_button_should_be_bottom, True), # ↕️ = Vertical Placement
+            (font_option_text, self.toggle_font_size, True),
+            #("🔧 Rebuild GUI (Experimental)", self.rebuild_gui, False), # <-- ADD THIS LINE
+            ("❌ Close Settings Menu", self.do_nothing, False), # ❌ = Close/Exit
         ]
 
-        for option_text, command in settings_options:
+        # --- Create and Pack the Content (Setting Buttons) ---
+        # This determines the required size of the dropdown window
+        for option_text, command, is_toggle in settings_options:
             dropdown_button = tk.Button(
                 self.settings_dropdown_window,
                 text=option_text,
-                font=("Segoe UI", 10, "bold"),
-                command=lambda cmd=command: on_settings_option_click(cmd),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
+                command=lambda cmd=command, toggle=is_toggle: on_settings_option_click(cmd, toggle),
                 borderwidth=1,
                 relief="solid",
-                anchor="w",
+                anchor="w", # Align text to the West (left)
                 padx=10,
                 pady=5,
                 bg="#555555",
-                fg="white"
+                fg="white",
+                activebackground="lightgrey", # Set hover colors directly
+                activeforeground="black"
             )
-            dropdown_button.pack(fill="x")
+            dropdown_button.pack(fill="x", padx=2, pady=(1,0)) # Add a little padding
+
+            # Simplified hover using activebackground/activeforeground (Button handles this)
             dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button: btn.config(bg="lightgrey", fg="black"))
             dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button: btn.config(bg="#555555", fg="white"))
 
 
-        self.settings_dropdown_window.bind("<FocusOut>", lambda event: self.destroy_settings_dropdown())
+        # --- DYNAMIC POSITIONING - AFTER content is packed ---
+
+        # 1. Force Tkinter to calculate the window size needed for the content
+        self.settings_dropdown_window.update_idletasks()
+
+        # 2. Get the actual required width and height of the dropdown
+        dropdown_width = self.settings_dropdown_window.winfo_width()
+        dropdown_height = self.settings_dropdown_window.winfo_height()
+
+        # 3. Get the trigger button's screen position and width
+        button_x = trigger_button.winfo_rootx()
+        button_y = trigger_button.winfo_rooty()
+        button_width = trigger_button.winfo_width()
+        # button_height = trigger_button.winfo_height() # Still not needed for this alignment
+
+        # 4. Calculate the top-left (x, y) for the dropdown window
+        # Align right edge: dropdown_x + dropdown_width = button_x + button_width
+        dropdown_x = button_x + button_width - dropdown_width
+        # Align dropdown bottom to button top: dropdown_y + dropdown_height = button_y
+        dropdown_y = button_y - dropdown_height
+
+        # 5. Apply the calculated geometry
+        print(f"Calculated Geometry: {dropdown_width}x{dropdown_height}+{dropdown_x}+{dropdown_y}")
+        self.settings_dropdown_window.geometry(f"{dropdown_width}x{dropdown_height}+{dropdown_x}+{dropdown_y}")
+
+
+
+
+    def do_nothing(self):
+        """
+        dummy function that does nothing
+        """
+        return
+        
+
+
 
 
     def on_settings_button_right_click(self, event):
@@ -4603,7 +5663,8 @@ class ConfigViewerApp:
 
         if self.enable_debug_shortcuts:
 
-            self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window()) # <--- ADD THIS LINE
+
+            #self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window()) # <--- ADD THIS LINE
             self.master.bind_all("<Control-j>", lambda event: self.show_hidden_vehicles_window()) #debug
             self.master.bind_all("<Control-k>", lambda event: self.set_filter_to_view_all_and_turn_subset_off()) #debug
             self.master.bind_all("<Control-l>", lambda event: self.open_isolated_folder_in_explorer()) #debug
@@ -4611,6 +5672,92 @@ class ConfigViewerApp:
             self.master.bind_all("<Control-g>", lambda event: self.color_picker1()) #debug
             self.master.bind_all("<Control-d>", lambda event: self.manual_gc_collect()) # Bind Ctrl+G to manual GC
             self.master.bind_all("<Control-a>", lambda event: self.update_grid_layout()) #debug
+            self.master.bind_all("<Control-q>", lambda event: self.perform_search()) #debug      
+            self.master.bind_all("<Control-P>", lambda event: self.destroy_search_results_window()) #debug     
+
+
+        
+    def handle_escape_globally(self):
+        """
+        Handles the Escape key press globally.
+        Prioritizes closing/clearing windows in a specific order:
+        1. Spawn Queue
+        2. Filters
+        3. Hidden Window (clear search or withdraw)
+        4. Details Window (destroy sub-window, clear search, or close)
+        5. Main Search Bar (clear)
+        Uses winfo_ismapped() to check for actual visibility.
+        """
+        print("DEBUG: handle_escape_globally called")
+
+        # 1. Check Spawn Queue Window
+        # Use winfo_ismapped() to check if it's actually visible
+        if hasattr(self, 'spawn_queue_window') and self.spawn_queue_window and self.spawn_queue_window.winfo_exists() and self.spawn_queue_window.winfo_ismapped():
+            print("DEBUG: Closing Spawn Queue Window")
+            self.spawn_queue_window.destroy()
+            return
+
+        # 2. Check Filters Window
+        # Use winfo_ismapped()
+        if hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and self.filters_window.winfo_ismapped():
+            print("DEBUG: Closing Filters Window")
+            self.filters_window.destroy()
+            return
+
+        # 3. Check Hidden Window
+        # Use winfo_ismapped()
+        if hasattr(self, 'hidden_window') and self.hidden_window and self.hidden_window.winfo_exists() and self.hidden_window.winfo_ismapped():
+            hidden_search_content = self.hidden_window_search_var.get()
+            # Check if search bar has actual text (not empty and not placeholder)
+            if hidden_search_content and hidden_search_content != self.placeholder_text:
+                print("DEBUG: Clearing Hidden Window search")
+                self.hidden_window_search_var.set("")
+                self.filter_vehicles()
+                # self.on_search_focus_in(event=None) # Call if needed after clearing
+            else:
+                # Withdraw if search is empty or just placeholder
+                print("DEBUG: Withdrawing Hidden Window")
+                self.hidden_window.withdraw()
+            return # Return after handling hidden window
+
+        # 4. Check Details Window
+        # Use winfo_ismapped() instead of relying on self.details_window_closed
+        if hasattr(self, 'details_window') and self.details_window and self.details_window.winfo_exists() and self.details_window.winfo_ismapped():
+            print("DEBUG: Handling Details Window")
+
+            # 4a. Prioritize closing a specific sub-window if it exists and is mapped
+            if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists() and self.current_detail_window.winfo_ismapped():
+                print("DEBUG: Destroying current_detail_window")
+                self.current_detail_window.destroy()
+                self.current_detail_window = None
+                # Decide: should pressing Esc again close the main details window?
+                # If yes, DON'T return here. If no (one Esc = one action), DO return.
+                # Let's assume one action per press for now.
+                return
+
+            # 4b. If no active sub-window, check the details search bar
+            if self.details_search_var.get():
+                print("DEBUG: Clearing details search.")
+                self.details_search_var.set("")
+                self.perform_details_search()
+            else:
+                # 4c. If search is empty, close/hide the main details window
+                print("DEBUG: Closing/Hiding details window via on_details_window_close()")
+                # Ensure on_details_window_close correctly hides or destroys the window
+                self.details_window_intentionally_closed = True
+                self.on_details_window_close()
+            return # Return after handling details window
+
+        # 5. If none of the above windows were active, clear the main search bar (if not empty)
+        print("DEBUG: No specific window active.")
+        if self.search_var.get():
+             print("    handle_escape_globally is calling self.perform_search() - and clearing the search bar")
+             print("DEBUG: Clearing main search bar.")
+             self.search_var.set("")
+             self.perform_search()
+        else:
+             print("DEBUG: Main search bar already empty.")
+        # No return needed here, it's the last step.
 
 
     def toggle_middle_click_settings(self):
@@ -4624,25 +5771,84 @@ class ConfigViewerApp:
     def toggle_show_folder_settings(self):
         """Toggles the 'Include Without Preview Images' setting and updates dropdown text."""
 
+        #if self.search_results_window:
+        #    scanning_win = self.show_scanning_window(text="Cannot adjust this setting while search or filtering is active.")
+        #    time.sleep(3.125)
+        #    if scanning_win:
+        #        scanning_win.destroy()
+        #        self.lift_search_results_window()
+        #    return 
+        
+
         if self.items_to_be_hidden:
             print("--- self.items_to_be_hidden = True ---\n")
 
             scanning_win = None  # Initialize scanning_win
 
-            scanning_win = self.show_scanning_window(text="Cannot perform this action while there are pending hidden vehicles.")
-            time.sleep(3.125)
+            scanning_win = self.show_scanning_window(text="Cannot adjust this setting while there are pending hidden vehicles.")
+
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
-        
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
+
+
+
         self.show_folder_settings = not self.show_folder_settings
+
+        if self.search_results_window_on_screen:
+            print("  DEBUG: toggle_show_folder_settings ran while Search results window should be on the screen, destroying and recreating it...")
+            self.destroy_search_results_window()
+                
+            print("  DEBUG: creating new search results window.")
+            self.search_results_window = self.show_search_results_window(self.data)
+
+            
+            print("  DEBUG: setting self.search_results_window_on_screen to True ")
+            print(" DEBUG: setting this to true so we can update the grid layout when the search results window closes properly after changing the show folder settings")
+            self.window_size_changed_during_search_results_window = True 
+
+        else:
+            print("search results window on screen evaluated to false, running update grid layout")
+
+
+            #self.grouped_data = self.format_grouped_data(self.data) # Re-group and re-sort // why? 
+
+
+            #self.canvas.yview_moveto(0)
+            #print("    toggle_show_folder_settings is calling self.perform_search()")
+            #self.perform_search()
+
+            print("    toggle_show_folder_settings is calling self.update_grid_layout()")
+            self.update_grid_layout()
+
+
+        self.canvas.yview_moveto(0)
+
+        #self._update_filters_label_status()
+
+
+
+        #self.update_settings_dropdown_button_text() # Call function to update button text
+        self.master.after(600, self.show_settings_dropdown)
+
+        self.save_settings() # Save setting to file - ADDED
+
+
+
+    def toggle_jump_to_page_button_should_be_bottom(self):
+        """Toggles the 'Jump to page button location' setting and updates dropdown text."""
+
+        self.jump_to_page_button_should_be_bottom = not self.jump_to_page_button_should_be_bottom
         self.update_settings_dropdown_button_text()
         self.save_settings()
-        self.on_rescan_all_button_click()
-        time.sleep(1)
-        self.on_rescan_all_button_click()
+
+
 
 
     def toggle_placeholder_settings(self):
@@ -4654,21 +5860,92 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot perform this action while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
+
+            
+
+
+        if os.path.exists(self.cache_file_path):
+            try:
+                print("deleting config_processing_cache.json")
+                os.remove(self.cache_file_path) #
+            except OSError as e:
+                print(f"Warning: Failed to delete cache file {self.cache_file_path}: {e}")
+
+
         self.placeholder_settings = not self.placeholder_settings
         self.update_settings_dropdown_button_text()
         self.save_settings()
-        self.on_rescan_all_button_click()
-        time.sleep(1)
+
+        time.sleep(0.1)
         self.on_rescan_all_button_click()
 
 
+
+    def _get_font_size_name(self):
+            """Returns the string name for the current font size setting."""
+            if self.font_size_add == 4:
+                return "Large"
+            elif self.font_size_add == 2:
+                return "Medium"
+            else: # Default to "Default" if 0 or any unexpected value
+                return "Small"
+
+    def toggle_font_size(self):
+        """Cycles through font size settings: Default -> Medium -> Large -> Default."""
+
+        '''
+        if self.search_results_window:
+            scanning_win = self.show_scanning_window(text="Cannot adjust this setting while search or filtering is active.")
+            time.sleep(3.125)
+            if scanning_win:
+                scanning_win.destroy()
+                self.lift_search_results_window()
+            return 
+            '''
+
+        if self.items_to_be_hidden:
+            print("--- self.items_to_be_hidden = True ---\n")
+
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text="Cannot adjust this setting while there are pending hidden vehicles.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+        
+
+        print(f"Toggling font size. Current add value: {self.font_size_add}")
+        if self.font_size_add == 0: # Was Default
+            self.font_size_add = 2   # Set to Medium
+            print("  Set to Medium (2)")
+        elif self.font_size_add == 2: # Was Medium
+            self.font_size_add = 4   # Set to Large
+            print("  Set to Large (4)")
+        else: # Was Large (or unexpected), loop back
+            self.font_size_add = 0   # Set to Default
+            print("  Set to Default (0)")
+
+        self.save_settings() # Save the new setting immediately
+        # No need to directly update UI here, the dropdown refresh handles it
+        # Returning True signals the click handler to refresh the dropdown
+        self.rebuild_gui(changing_scale=True)
+
+
+        return True # Indicate it was a toggle action that needs refresh
 
 
     def load_settings(self):
@@ -4691,6 +5968,13 @@ class ConfigViewerApp:
         default_show_folder_settings = False
         self.show_folder_settings = default_show_folder_settings
 
+        default_jump_to_page_button_should_be_bottom = True
+        self.jump_to_page_button_should_be_bottom = default_jump_to_page_button_should_be_bottom
+
+
+        default_font_size_add = 0
+        self.font_size_add = default_font_size_add
+
         # --- NEW: Default for placeholder_settings setting ---
 
 
@@ -4701,7 +5985,8 @@ class ConfigViewerApp:
         print(f"DEBUG: Initial self.placeholder_settings: {self.placeholder_settings}") # Debug initial value - placeholder_settings
         print(f"DEBUG: Initial self.middle_click_settings: {self.middle_click_settings}")
         print(f"DEBUG: Initial self.show_folder_settings: {self.show_folder_settings}")
-
+        print(f"DEBUG: Initial self.jump_to_page_button_should_be_bottom: {self.jump_to_page_button_should_be_bottom}")
+        print(f"DEBUG: Initial self.font_size_add: {self.font_size_add}")
 
         try:
             if os.path.exists(self.settings_file_path):
@@ -4719,7 +6004,6 @@ class ConfigViewerApp:
                                 print(f"Loaded floating window position from file: {self.floating_window_last_position}") # Debug
                             except ValueError:
                                 print("Warning: Invalid SwitcherPosition format in settings file.")
-                                break # Stop processing after invalid line
                         elif line.startswith("ShowSwitcherOnStartup:"):
                             value_str = line[len("ShowSwitcherOnStartup:"):].strip().lower()
                             print(f"DEBUG: ShowSwitcherOnStartup line found, value_str: '{value_str}'") # Debug - value_str
@@ -4781,9 +6065,34 @@ class ConfigViewerApp:
                             else:
                                 print(f"Warning: Invalid show_folder_settings value: '{value_str}'. Using default.")
 
+                        elif line.startswith("jump_to_page_button_should_be_bottom:"):
+                            value_str = line[len("jump_to_page_button_should_be_bottom:"):].strip().lower()
+                            print(f"DEBUG: jump_to_page_button_should_be_bottom, value_str: '{value_str}'") # Debug - value_str for placeholder_settings
+                            if value_str == "on":
+                                self.jump_to_page_button_should_be_bottom = True
+                            elif value_str == "off":
+                                self.jump_to_page_button_should_be_bottom = False
+                            else:
+                                print(f"Warning: Invalid jump_to_page_button_should_be_bottom value: '{value_str}'. Using default.")
+
+                        elif line.startswith("FontSizeAdd:"): 
+                            value_str = line[len("FontSizeAdd:"):].strip() # Added: Extract the value part
+                            print(f"DEBUG: FontSizeAdd line found, value_str: '{value_str}'") # Optional: Add debug print here too
+                            try:
+                                loaded_size = int(value_str)
+
+                                if loaded_size in [0, 2, 4]: # Your original check
+                                    self.font_size_add = loaded_size
+                                    print(f"  Loaded font size add value: {self.font_size_add}")
+                                else:
+                                    print(f"  Warning: Invalid FontSizeAdd value: '{value_str}'. Using default ({default_font_size_add}).")
+                                    self.font_size_add = default_font_size_add # Use the defined default
+                            except ValueError:
+                                print(f"  Warning: Invalid FontSizeAdd format: '{value_str}'. Using default ({default_font_size_add}).")
+                                self.font_size_add = default_font_size_add # Use the defined default
 
                         else:
-                            pass
+                            pass # Keep this for lines that don't match any setting
             else:
                 print(f"DEBUG: Settings file DOES NOT exist: {self.settings_file_path}") # Debug - file does not exist
 
@@ -4795,29 +6104,45 @@ class ConfigViewerApp:
         print(f"DEBUG: Final self.collapse_categories_by_default value: {self.collapse_categories_by_default}") # Debug - final collapse categories value
         print(f"DEBUG: Final self.placeholder_settings value: {self.placeholder_settings}") # Debug - final placeholder_settings value
         print(f"DEBUG: Final self.middle_click_settings value: {self.middle_click_settings}") 
-        print(f"DEBUG: Final self.show_folder_settings value: {self.show_folder_settings}") 
-
+        print(f"DEBUG: Final self.show_folder_settings value: {self.show_folder_settings}")
+        print(f"DEBUG: Final self.jump_to_page_button_should_be_bottom value: {self.jump_to_page_button_should_be_bottom}") 
+        print(f"DEBUG: Final self.font_size_add value: {self.font_size_add}") 
       
         
 
     def save_settings(self):
         """Saves settings to settings file, including collapse categories by default."""
-        if self.floating_window_last_position:
-            try:
-                with open(self.settings_file_path, "w", encoding="utf-8") as f:
-                    f.write(f"SwitcherPosition: {self.floating_window_last_position}\n")
-                    f.write(f"ShowSwitcherOnStartup: {'on' if self.show_switcher_on_startup else 'off'}\n")
-                    f.write(f"SortByInstallDate: {'on' if self.sort_by_install_date else 'off'}\n")
-                    f.write(f"CollapseCategoriesByDefault: {'on' if self.collapse_categories_by_default else 'off'}\n")
-                    # --- NEW: Save Include No Preview Images Setting ---
-                    f.write(f"PlaceholderSetting: {'on' if self.placeholder_settings else 'off'}\n")
-                    # --- NEW: Save Include No Preview Images Setting ---
-                    f.write(f"middle_click_settings: {'on' if self.middle_click_settings else 'off'}\n")
-                    f.write(f"show_folder_settings: {'on' if self.show_folder_settings else 'off'}\n")
-            except Exception as e:
-                print(f"Error saving floating window position and settings: {e}")
-        else:
-            print("Warning: No floating window position to save.")
+
+        try:
+            with open(self.settings_file_path, "w", encoding="utf-8") as f:
+                f.write(f"SwitcherPosition: {self.floating_window_last_position}\n")
+                f.write(f"ShowSwitcherOnStartup: {'on' if self.show_switcher_on_startup else 'off'}\n")
+                f.write(f"SortByInstallDate: {'on' if self.sort_by_install_date else 'off'}\n")
+                f.write(f"CollapseCategoriesByDefault: {'on' if self.collapse_categories_by_default else 'off'}\n")
+                # --- NEW: Save Include No Preview Images Setting ---
+                f.write(f"PlaceholderSetting: {'on' if self.placeholder_settings else 'off'}\n")
+                # --- NEW: Save Include No Preview Images Setting ---
+                f.write(f"middle_click_settings: {'on' if self.middle_click_settings else 'off'}\n")
+                f.write(f"show_folder_settings: {'on' if self.show_folder_settings else 'off'}\n")
+                f.write(f"jump_to_page_button_should_be_bottom: {'on' if self.jump_to_page_button_should_be_bottom else 'off'}\n")
+
+                f.write(f"FontSizeAdd: {self.font_size_add}\n")
+
+                if self.items_to_be_hidden or self.unhide_was_toggled_in_hidden_window:
+                    print("--- self.items_to_be_hidden or self.unhide_was_toggled_in_hidden_window are True, deleting config_processing_cache.json---\n")
+
+
+
+                    if os.path.exists(self.cache_file_path):
+                        try:
+                            os.remove(self.cache_file_path) #
+                        except OSError as e:
+                            print(f"Warning: Failed to delete cache file {self.cache_file_path}: {e}")
+
+
+        except Exception as e:
+            print(f"Error saving floating window position and settings: {e}")
+
 
 
 
@@ -4842,13 +6167,17 @@ class ConfigViewerApp:
 
 
     def create_item_count_label(self, bottom_frame):
-        self.item_count_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12)) # Dark bg, lightgrey fg
+        self.item_count_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add)) # Dark bg, lightgrey fg
         self.item_count_label.pack(side="right", padx=(10, 10))
 
     def setup_main_frame(self):
-        main_frame = tk.Frame(self.master, bg="#333333") # <--- CHANGED bg to "#222222" - try setting main_frame background
-        main_frame.pack(fill="both", expand=True)
-        self.main_frame = main_frame # Store main_frame if needed elsewhere
+        # Creates AND assigns the main frame
+        # Ensure this frame uses self.master as its parent
+        frame = tk.Frame(self.master, bg="#333333")
+        frame.pack(fill="both", expand=True)
+        self.main_frame = frame # Assign to self.main_frame
+        # NOTE: The content (canvas, sidebar) is created by subsequent setup calls
+        # which should use self.main_frame as their parent
 
     def setup_canvas_and_scrollbar(self):
         # Main grid Canvas
@@ -4888,17 +6217,19 @@ class ConfigViewerApp:
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
 
 
-    def setup_sidebar_bottom_frame_content(self):
-        sidebar_padding = 10
-        self.sidebar_filters_label = tk.Label(self.sidebar_bottom_frame, text="Constraints", font=("Segoe UI", 14, "bold"), bg="#333333", fg="white", justify="center") # Dark grey bg for Constraints section - CHANGED to "#333333" - MATCH TOP HALF
-        self.sidebar_filters_label.pack(in_=self.sidebar_bottom_frame, side="top", fill="x", pady=(sidebar_padding*2, sidebar_padding), padx=sidebar_padding)
 
-        self.create_sidebar_filter_dropdowns(self.sidebar_bottom_frame, sidebar_padding)
-        
         
     def setup_sidebar_frame(self):
+        print("--- DEBUG: ENTERING setup_sidebar_frame ---")
+
         # Sidebar Frame (Main Grid) - CONTAINER FRAME - NO BG COLOR
+
+        #if self.hide_main_grid_and_sidebar_start_passed == 1: # Set the flag for subsequent calls - if startup has not passed  (false) 
+        #    return  # Exit function early on first call
+        
         self.sidebar_frame = tk.Frame(self.main_frame, width=300, highlightthickness=1, highlightbackground="#333333", bg="#333333") # Changed sidebar_frame bg to "#333333" - MATCH TOP HALF - CHANGED BACK TO "#333333"
+        print(f"DEBUG: Created self.sidebar_frame. Parent is: {self.sidebar_frame.master}") # ADD THIS
+
         self.sidebar_frame.pack(side="right", fill="y", padx=(10, 0), pady=10,  expand=False,  )
         self.sidebar_frame.pack_propagate(False) # Prevent sidebar from resizing to content
 
@@ -4910,11 +6241,17 @@ class ConfigViewerApp:
         self.sidebar_bottom_frame.pack(side="top", fill="x", expand=False, padx=0, pady=0) #  sidebar_bottom_frame (Constraints) packed FIRST at the TOP
         self.sidebar_top_frame.pack(side="bottom", fill="both", expand=True, padx=0, pady=0) # sidebar_top_frame (Car Info) packed SECOND below it, side=BOTTOM
         # --- MODIFIED PACKING ORDER ---
-   
+        print("--- DEBUG: EXITING setup_sidebar_frame ---") 
 
     def setup_sidebar_top_frame_content(self):
+
+
+        #if self.hide_main_grid_and_sidebar_start_passed == 1: # Set the flag for subsequent calls - if startup has not passed  (false) 
+        #    return  # Exit function early on first call
+
+
         sidebar_padding = 10
-        self.sidebar_car_name_label = tk.Label(self.sidebar_top_frame, text="", font=("Segoe UI", 14, "bold"), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
+        self.sidebar_car_name_label = tk.Label(self.sidebar_top_frame, text="", font=("Segoe UI", 14+self.font_size_add, "bold"), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
         self.sidebar_car_name_label.pack(in_=self.sidebar_top_frame, pady=(sidebar_padding*2, sidebar_padding), padx=sidebar_padding)
 
         # Placeholder image for sidebar - CHANGED placeholder to MATCH sidebar_top_frame BG COLOR - "#333333"
@@ -4925,7 +6262,7 @@ class ConfigViewerApp:
         self.sidebar_image_label.pack(in_=self.sidebar_top_frame, pady=(0, sidebar_padding), padx=sidebar_padding)
 
         # Sidebar Loading Label
-        self.sidebar_loading_label = tk.Label(self.sidebar_top_frame, text="Loading...", font=("Segoe UI", 10, "italic"), fg=self.global_highlight_color, bg="#333333") # Dark bg, orange fg
+        self.sidebar_loading_label = tk.Label(self.sidebar_top_frame, text="Loading...", font=("Segoe UI", 10+self.font_size_add, "italic"), fg=self.global_highlight_color, bg="#333333") # Dark bg, orange fg
         self.sidebar_loading_label.pack(in_=self.sidebar_top_frame, pady=(0, sidebar_padding), padx=sidebar_padding)
         self.sidebar_loading_label.pack_forget()
 
@@ -4933,9 +6270,43 @@ class ConfigViewerApp:
         self.create_sidebar_zip_name_label(self.sidebar_top_frame, sidebar_padding)
 
 
+    def setup_sidebar_bottom_frame_content(self):
+
+        #if self.hide_main_grid_and_sidebar_start_passed == 1: # Set the flag for subsequent calls - if startup has not passed  (false) 
+        #    return  # Exit function early on first call
+
+        sidebar_padding = 10
+        # Calculate the maximum width for the text itself, considering padding
+        # Assuming the sidebar_bottom_frame is roughly 300px wide from its definition
+        # or slightly less due to the main sidebar frame's padding/border.
+        # Let's target slightly less than 300 to be safe, e.g., 280px for the text width.
+        max_text_width = 280 # Adjust this value as needed
+
+        self.sidebar_filters_label = tk.Label(
+            self.sidebar_bottom_frame,
+            text="Constraints",
+            font=("Segoe UI", 14+self.font_size_add, "bold"),
+            bg="#333333",
+            fg="white",
+            justify="center", 
+            wraplength=max_text_width # Set maximum line length in pixels
+        )
+        self.sidebar_filters_label.pack(
+            in_=self.sidebar_bottom_frame,
+            side="top",
+            fill="x", # Still fill horizontally to use available space
+            pady=(sidebar_padding*2, sidebar_padding),
+            padx=sidebar_padding
+        )
+
+        self.create_sidebar_filter_dropdowns(self.sidebar_bottom_frame, sidebar_padding)
+        
+
+
+
     def create_sidebar_info_labels(self, sidebar_top_frame, sidebar_padding): # Modified to include Author labels
-        info_font = ("Segoe UI", 11, "italic") # Smaller font for info labels
-        category_font = ("Segoe UI", 11, "bold") # Smaller font for category labels
+        info_font = ("Segoe UI", 11+self.font_size_add, "italic") # Smaller font for info labels
+        category_font = ("Segoe UI", 11+self.font_size_add, "bold") # Smaller font for category labels
 
         self.sidebar_brand_label = tk.Label(sidebar_top_frame, text="", font=category_font, bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
         self.sidebar_brand_label.pack(in_=sidebar_top_frame, fill="x", padx=sidebar_padding, pady=(sidebar_padding, 0))
@@ -4977,7 +6348,7 @@ class ConfigViewerApp:
 
     def create_sidebar_zip_name_label(self, sidebar_top_frame, sidebar_padding):
         # Sidebar Zip Name Label (at the bottom of top frame)
-        self.sidebar_zip_name_label = tk.Label(sidebar_top_frame, text="", font=("Segoe UI", 10), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
+        self.sidebar_zip_name_label = tk.Label(sidebar_top_frame, text="", font=("Segoe UI", 10+self.font_size_add), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
         self.sidebar_zip_name_label.config(text="") # Set to "" initially - ENSURE IT IS ""
         self.sidebar_zip_name_label.pack(in_=sidebar_top_frame, side="bottom", pady=sidebar_padding, padx=sidebar_padding)
 
@@ -5004,7 +6375,7 @@ class ConfigViewerApp:
         Otherwise, it reverts to the default style.
         MODIFIED to disable sidebar filter buttons under certain conditions. <----- ADDED
         """
-        all_filters_all = True  # Assume all filters are "All..." initially
+        self.all_filters_all = True  # Assume all filters are "All..." initially
         filter_buttons = self.sidebar_filter_buttons
 
         # --- MODIFIED: Check conditions to disable sidebar filter buttons ---
@@ -5028,15 +6399,15 @@ class ConfigViewerApp:
 
 
         if filter_buttons["Brand"].cget("text") != "All Brands":
-            all_filters_all = False
+            self.all_filters_all = False
         if filter_buttons["Name"].cget("text") != "All Names":
-            all_filters_all = False
+            self.all_filters_all = False
         if filter_buttons["Country"].cget("text") != "All Countries":
-            all_filters_all = False
+            self.all_filters_all = False
         if filter_buttons["Bodystyle"].cget("text") != "All BodyStyles":
-            all_filters_all = False
+            self.all_filters_all = False
 
-        if all_filters_all:
+        if self.all_filters_all:
             self.sidebar_filters_label.config(fg="white", text="Constraints") # Default color and text
 
             # --- MODIFICATION START: Conditionally close Search Results window when Constraints become inactive ---
@@ -5045,6 +6416,10 @@ class ConfigViewerApp:
                     self.destroy_search_results_window()
                     self.search_results_window = None
                     self.is_search_results_window_active = False
+
+                    #if self.window_was_resized_2:
+                    #    self.master.after(5000, self.update_grid_layout)
+                    #    self.window_was_resized_2 = False
                     print("DEBUG: _update_filters_label_status - Search Results window DESTROYED because Constraints are inactive AND View All + Empty Search + No Global Filters.")
                 else:
                     print("DEBUG: _update_filters_label_status - Search Results window NOT open, no need to destroy (Constraints inactive AND View All + Empty Search + No Global Filters).") # Debug - Window Not Open
@@ -5054,7 +6429,7 @@ class ConfigViewerApp:
         else:
             # --- MODIFICATION START: Open Search Results Window before setting label to "(Active)" ---
             if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
-                self.search_results_window = self._create_search_results_window(self.data) # Pass current data
+                self.search_results_window = self.show_search_results_window(self.data) # Pass current data
                 print("DEBUG: _update_filters_label_status - Search Results window CREATED because Constraints are becoming active.")
             self.search_results_window.lift() # Ensure it's visible
             self.is_search_results_window_active = True
@@ -5104,14 +6479,14 @@ class ConfigViewerApp:
 
 
         for filter_name, options in filter_options_data.items():
-            label = tk.Label(dropdown_frame, text=f"{filter_name}:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="lightgrey", anchor="w") # Dark grey bg for labels - CHANGED to "#333333" - MATCH TOP HALF
+            label = tk.Label(dropdown_frame, text=f"{filter_name}:", font=("Segoe UI", 11+self.font_size_add, "bold"), bg="#333333", fg="lightgrey", anchor="w") # Dark grey bg for labels - CHANGED to "#333333" - MATCH TOP HALF
             label.grid(row=dropdown_row, column=dropdown_col, sticky="w", padx=(0, 5), pady=(2, 5))  # Right padding for label, sticky='w' for left align
 
             # --- Replace OptionMenu with Button ---
             button = tk.Button(
                 dropdown_frame,
                 text=options[0],  # Initial text is the first option ("All...")
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 10+self.font_size_add),
                 command=lambda fn=filter_name.lower(): getattr(self, f"show_sidebar_{fn}_dropdown")(),  # Dynamic command
                 width=12, # Fixed width for buttons (adjust as needed)
                 **button_style_args_constraints # <--- APPLY BUTTON STYLES HERE
@@ -5196,7 +6571,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option, fname="name": self._on_name_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window),
                 borderwidth=1,
                 relief="solid",
@@ -5322,7 +6697,7 @@ class ConfigViewerApp:
 
         self.data = filtered_data
         self.grouped_data = self.format_grouped_data(self.data)
-        self.update_grid_layout()
+        #self.update_grid_layout()
         self.canvas.yview_moveto(0)
         
 
@@ -5384,8 +6759,9 @@ class ConfigViewerApp:
         self.data = filtered_data
 
         self.grouped_data = self.format_grouped_data(self.data)
-        self.update_grid_layout()
+        #self.update_grid_layout()
         self.canvas.yview_moveto(0)
+        self._update_filters_label_status()
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
 
       
@@ -5437,8 +6813,9 @@ class ConfigViewerApp:
 
         self.data = filtered_data
         self.grouped_data = self.format_grouped_data(self.data)
-        self.update_grid_layout()
+        #self.update_grid_layout()
         self.canvas.yview_moveto(0)
+        self._update_filters_label_status()
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
 
 
@@ -5460,7 +6837,7 @@ class ConfigViewerApp:
                     filtered_data.append(item)
             self.data = filtered_data
 
-
+            self._update_filters_label_status()
             self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
             
             
@@ -5490,6 +6867,7 @@ class ConfigViewerApp:
             if name_condition and brand_condition:
                 filtered_data.append(item)
         self.data = filtered_data
+        self._update_filters_label_status()
         self.update_search_results_window_ui() 
         
 
@@ -5507,10 +6885,11 @@ class ConfigViewerApp:
 
     def _update_ui_elements(self, fdropdown_window):
         """Updates the UI elements after data filtering, added search window update."""
-        self.update_grid_layout()
+        #self.update_grid_layout()
         self.canvas.yview_moveto(0)
         fdropdown_window.destroy()
         setattr(self, f"sidebar_name_dropdown_window", None)
+        self._update_filters_label_status()
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
 
 
@@ -5541,7 +6920,19 @@ class ConfigViewerApp:
         dropdown_window.config(bg="#333333")
         dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
 
-        canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=180, height=410) # dropdown width other dropdowns
+
+
+        if self.font_size_add == 0:
+            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=180, height=410) # dropdown width other dropdowns
+
+        elif self.font_size_add == 2:
+            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=170, height=410)
+
+        elif self.font_size_add == 4:
+            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=160, height=410)
+
+
+
         scrollbar = tk.Scrollbar(dropdown_window, orient="vertical", command=canvas.yview)
         scrollable_frame = tk.Frame(canvas, bg="#333333") # modify width and height here for dropdown
 
@@ -5571,7 +6962,7 @@ class ConfigViewerApp:
     def _create_name_dropdown_content(self, scrollable_frame, dynamic_name_options, button, dropdown_window, canvas):
         """Creates the content of the name dropdown: search entry and options."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -5613,12 +7004,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot adjust constraints while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
         dropdown_attr_name = f"sidebar_name_dropdown_window"
@@ -5650,12 +7043,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot adjust constraints while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
 
@@ -5697,7 +7092,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option, fname="country": self._on_country_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window), # Call _on_country_dropdown_button_click
                 borderwidth=1,
                 relief="solid",
@@ -5732,7 +7127,7 @@ class ConfigViewerApp:
     def _create_country_dropdown_content(self, scrollable_frame, dynamic_country_options, button, dropdown_window, canvas):
         """Creates the content of the country dropdown: search entry and options."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -5777,12 +7172,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot adjust constraints while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
 
@@ -5873,7 +7270,7 @@ class ConfigViewerApp:
     def _create_search_bar(self, scrollable_frame, search_var):
         """Creates the search bar entry in the scrollable frame."""
         search_bar_width = 18
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10), bg="white", fg="black", width=search_bar_width)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=search_bar_width)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
 
@@ -5906,7 +7303,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option: on_dropdown_button_click(opt),
                 borderwidth=1,
                 relief="solid",
@@ -5953,7 +7350,7 @@ class ConfigViewerApp:
                 # --- MODIFIED: Filter based on filtered_original_data_for_brands instead of original_data ---
 
             self.grouped_data = self.format_grouped_data(self.data)
-            self.update_grid_layout()
+            #self.update_grid_layout()
             self.canvas.yview_moveto(0)
 
             name_button = self.sidebar_filter_buttons.get("Name") # Get the Name button widget
@@ -6025,12 +7422,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot adjust constraints while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
         
@@ -6039,7 +7438,19 @@ class ConfigViewerApp:
 
         button_x, button_y = self._calculate_dropdown_position(button_widget)
         dropdown_window = self._create_dropdown_window(self.master, button_x, button_y)
-        canvas, scrollable_frame = self._create_scrollable_canvas(dropdown_window, 180, 410) # dropdown width Brands
+
+
+
+        if self.font_size_add == 0:
+            canvas, scrollable_frame = self._create_scrollable_canvas(dropdown_window, 180, 410) # dropdown width FOR BRANDS 
+
+        elif self.font_size_add == 2:
+            canvas, scrollable_frame = self._create_scrollable_canvas(dropdown_window, 170, 410)
+
+        elif self.font_size_add == 4:
+            canvas, scrollable_frame = self._create_scrollable_canvas(dropdown_window, 160, 410)
+
+
 
         search_var = tk.StringVar()
         search_entry = self._create_search_bar(scrollable_frame, search_var)
@@ -6147,19 +7558,570 @@ class ConfigViewerApp:
             setattr(self, dropdown_attr_name, None) # Clear dropdown window attribute
 
     def setup_event_bindings(self):
+        """Sets up main window and canvas event bindings."""
         self.master.bind("<Configure>", self.combined_configure_handler)
         self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self.on_mousewheel_main))
         self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
-        self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window())
+        self.master.bind_all("<Escape>", lambda event: self.handle_escape_globally())
 
-        self.master.bind("<Button-1>", self.on_main_window_click) # <--- ADD THIS LINE
-        self.master.bind("<FocusIn>", self.lift_search_results_window) # <--- ADDED THIS LINE
+        # --- Focus Related Bindings ---
+        # Use add='+' to avoid replacing other potential bindings on these events
+        self.master.bind("<FocusIn>", self.on_master_focus_in, add='+')
+        self.master.bind("<FocusOut>", self.on_master_focus_out, add='+')
+        # --- End Focus Bindings ---
 
+        # Binding for other clicks (kept from your example)
+        self.master.bind("<Button-1>", self.on_main_window_click)
+
+        self.master.bind_all('<KeyPress-Alt_L>', self.prevent_alt_freeze)
+        self.master.bind_all('<KeyPress-Alt_R>', self.prevent_alt_freeze)
+
+
+        self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window()) # <--- ADD THIS LINE
+        self.master.bind_all("<Control-Y>", lambda event: self.focus_beamng_window()) 
+
+
+
+        # Storing previous geometry (kept from your example)
         self.prev_master_x = self.master.winfo_x()
         self.prev_master_y = self.master.winfo_y()
         self.prev_master_width = self.master.winfo_width()
         self.prev_master_height = self.master.winfo_height()
+
+
+    def prevent_alt_freeze(self, event):
+        """Prevents the default Alt key behavior that can freeze Tkinter."""
+        print(f"Alt key pressed ({event.keysym}), preventing default action.")
+        # Returning "break" stops Tkinter from processing the event further,
+        # effectively preventing the default menu activation behavior.
+        return "break"
+
+
+    def on_master_focus_in(self, event=None):
+        """Handles the main window gaining OS focus."""
+        # Ensure the event is actually for the master window itself
+        if event is not None and event.widget == self.master:
+            print("--- Window <FocusIn> detected ---")
+            self.window_has_os_focus = True
+            # Call the central update function to recalculate the main flag
+            self.update_main_focus_flag()
+            # Keep your original action
+            self.lift_search_results_window() # Or whatever this method does
+        # Handle case where focus_force might trigger this without an event object
+        elif event is None:
+            print("--- Window <FocusIn> likely triggered programmatically ---")
+            self.window_has_os_focus = True
+            self.update_main_focus_flag()
+            self.lift_search_results_window()
+
+
+    def on_master_focus_out(self, event=None):
+        """Handles the main window losing OS focus."""
+        # Ensure the event is actually for the master window itself
+        if event is not None and event.widget == self.master:
+            print("--- Window <FocusOut> detected ---")
+            self.window_has_os_focus = False
+            # *** As requested: Directly set the main flag to False when window loses focus ***
+            self.main_search_entry_widget_focused_but_window_not_focus = False
+            print(f"Window lost focus. Flag forced to FALSE.")
+            # Optionally, you could call update_main_focus_flag() here too,
+            # but the direct set fulfills the request. If you called the update
+            # function, it would also result in False because window_has_os_focus is False.
+        elif event is None:
+            print("--- Window <FocusOut> likely triggered programmatically ---")
+            self.window_has_os_focus = False
+            self.main_search_entry_widget_focused_but_window_not_focus = False
+            print(f"Window lost focus (programmatic). Flag forced to FALSE.")
+
+
+    def update_main_focus_flag(self):
+        """
+        Central function to update the state of
+        'main_search_entry_widget_focused_but_window_not_focus'
+        based on current internal focus and window focus state.
+        """
+        internal_focus_on_search = False
+        try:
+            # Check if search_entry exists and has internal focus
+            if hasattr(self, 'search_entry') and self.search_entry.winfo_exists():
+                current_focus = self.master.focus_get()
+                internal_focus_on_search = (self.search_entry == current_focus)
+                # print(f"Debug update_main_focus_flag: Current internal focus: {current_focus}, Is it search_entry? {internal_focus_on_search}")
+            else:
+                # print("Debug update_main_focus_flag: search_entry doesn't exist.")
+                pass # internal_focus_on_search remains False
+
+        except Exception as e:
+            print(f"Error checking internal focus in update_main_focus_flag: {e}")
+            internal_focus_on_search = False # Assume no focus on error
+
+        # --- The Core Logic ---
+        # The flag should be True only if:
+        # 1. Internal focus IS on the search entry AND
+        # 2. The window does NOT have OS focus
+        previous_flag_state = self.main_search_entry_widget_focused_but_window_not_focus
+        self.main_search_entry_widget_focused_but_window_not_focus = \
+            internal_focus_on_search and (not self.window_has_os_focus)
+        # --- End Core Logic ---
+
+        if previous_flag_state != self.main_search_entry_widget_focused_but_window_not_focus:
+            print(f"update_main_focus_flag: InternalFocus={internal_focus_on_search}, "
+                f"WindowHasFocus={self.window_has_os_focus} -> Flag changed to: "
+                f"{self.main_search_entry_widget_focused_but_window_not_focus}")
+        # else:
+            # print(f"update_main_focus_flag: InternalFocus={internal_focus_on_search}, WindowHasFocus={self.window_has_os_focus} -> Flag remains: {self.main_search_entry_widget_focused_but_window_not_focus}")
+
+    def _start_switcher_monitoring(self):
+        """Starts the watchdog observer for the switcher confirmation file."""
+        if self.switcher_observer is not None:
+            print("Switcher confirmation file observer already running.")
+            return
+
+        watch_directory = self.switcher_confirmation_path.parent
+        try:
+            print(f"Ensuring watch directory exists: {watch_directory}")
+            watch_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+             print(f"ERROR: Could not create directory for monitoring: {watch_directory} - {e}")
+             return
+
+        print(f"Starting switcher confirmation file monitoring for: {self.switcher_confirmation_path}")
+
+        # Create handler, passing the QUEUE, not master or callback directly
+        event_handler = SwitcherConfirmationHandler(
+            self.switcher_confirmation_path,
+            self.switcher_callback_queue # <<< PASS THE QUEUE
+        )
+        self.switcher_observer = Observer()
+        try:
+            self.switcher_observer.schedule(event_handler, str(watch_directory), recursive=False)
+            self.switcher_observer.start()
+            print(f"Switcher observer started monitoring directory: {watch_directory}")
+            # Start the periodic queue check in Tkinter thread
+            self._check_switcher_queue() # <<< START QUEUE CHECKING
+        except Exception as e:
+            print(f"Error starting switcher observer: {e}")
+            self.switcher_observer = None
+
+    def _check_switcher_queue(self):
+        """Checks the queue for callbacks requested by the switcher handler."""
+        try:
+            # Get message from queue (non-blocking)
+            callback_request = self.switcher_callback_queue.get_nowait()
+            if callback_request == "run_focus": # Check for specific message
+                print("DEBUG Switcher Queue Check: Received 'run_focus' request.")
+                self.focus_config_viewer_from_floating_button() # Call the actual function
+                self.skip_perform_search = True
+        except queue.Empty:
+            pass # No request in the queue
+        except Exception as e:
+            print(f"ERROR checking switcher queue: {e}")
+        finally:
+            # Reschedule the check
+            self._after_id_switcher_check = self.master.after(100, self._check_switcher_queue) # Check every 100ms
+
+
+    # --- Modify _stop_switcher_monitoring to cancel the after loop ---
+    def _stop_switcher_monitoring(self):
+        """Stops the switcher confirmation file observer."""
+        # <<< Cancel the after loop FIRST >>>
+        if self._after_id_switcher_check:
+            self.master.after_cancel(self._after_id_switcher_check)
+            self._after_id_switcher_check = None
+
+        if self.switcher_observer:
+            # ... (rest of observer stopping logic remains the same) ...
+            observer_was_running = self.switcher_observer.is_alive()
+            print("Stopping switcher confirmation file monitoring...")
+            try:
+                self.switcher_observer.stop()
+                self.switcher_observer.join(timeout=0.5)
+                if self.switcher_observer.is_alive():
+                    print("Warning: Switcher observer thread did not stop gracefully.")
+            except Exception as e:
+                print(f"Error stopping switcher observer: {e}")
+            finally:
+                 self.switcher_observer = None
+                 if observer_was_running:
+                     print("Switcher monitoring stopped.")
+
+
+
+
+    def _parse_keyboard_diff(self, filepath):
+        """
+        Parses the keyboard.diff file to find ALL EMM command bindings.
+        Returns a list of valid Tkinter binding strings.
+        """
+        print(f"--- DEBUG PARSING START: {filepath} ---")
+        bindings_found = [] # Initialize list to store results
+        try:
+            if not os.path.exists(filepath):
+                print("DEBUG PARSE: File does not exist.")
+                return [] # Return empty list if file doesn't exist
+
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                # print(f"DEBUG PARSE: File content read:\n>>>\n{content}\n<<<") # Keep for debugging if needed
+
+            # Find all potential blocks containing the action
+            # This regex is broad - finds { ... "action":"runEmmCommandBinding" ... }
+            # It assumes somewhat well-formed blocks but allows other keys
+            block_pattern = re.compile(r'\{\s*[^\{\}]*?"action"\s*:\s*"runEmmCommandBinding"[^\{\}]*?\}', re.DOTALL)
+            # Regex to find the control within a block
+            control_pattern = re.compile(r'"control"\s*:\s*"ctrl\s+([a-z0-9]|numpad[0-9])"')
+
+            for block_match in block_pattern.finditer(content):
+                block_content = block_match.group(0)
+                # print(f"DEBUG PARSE: Examining block:\n{block_content}") # Debug found blocks
+                control_match = control_pattern.search(block_content)
+
+                if control_match:
+                    key = control_match.group(1).lower()
+                    # print(f"DEBUG PARSE: Found potential key in block: '{key}'")
+
+                    # Format for Tkinter
+                    binding_string = None
+                    if key.startswith("numpad"):
+                        digit = key[6:]
+                        if digit.isdigit():
+                            binding_string = f"<Control-KP_{digit}>"
+                        else:
+                            print(f"WARN PARSE: Invalid numpad format in block: {key}")
+                    elif len(key) == 1 and (key.isalnum()):
+                        binding_string = f"<Control-{key}>"
+                    else:
+                        print(f"WARN PARSE: Invalid key format in block: {key}")
+
+                    if binding_string:
+                        # Avoid adding duplicates from the file itself
+                        if binding_string not in bindings_found:
+                            bindings_found.append(binding_string)
+                            # print(f"DEBUG PARSE: Added binding: {binding_string}")
+                        # else:
+                            # print(f"DEBUG PARSE: Duplicate binding found in file, skipping: {binding_string}")
+
+
+                # else:
+                    # print("DEBUG PARSE: 'control: ctrl ...' pattern not found in this block.")
+
+            print(f"DEBUG PARSE: Final list of bindings found: {bindings_found}")
+            return bindings_found # Return the list (could be empty)
+
+        except IOError as e:
+            print(f"Error reading keyboard.diff: {e}")
+            return [] # Return empty list on error
+        except Exception as e:
+            print(f"Error parsing keyboard.diff: {e}")
+            return [] # Return empty list on error
+        finally:
+            print(f"--- DEBUG PARSING END ---")
+
+    def _start_keyboard_diff_monitoring(self):
+        """Starts the watchdog observer to monitor the keyboard.diff file."""
+        print("Starting keyboard.diff monitoring...")
+        if self.watchdog_observer is not None:
+            print("Watchdog observer already running.")
+            return
+
+        # ... (directory checking logic) ...
+        directory_to_watch = os.path.dirname(self.keyboard_diff_path)
+        if not os.path.exists(directory_to_watch):
+            print(f"Warning: Directory to watch does not exist: {directory_to_watch}")
+
+
+        # --- Initial check ---
+        initial_binding = self._parse_keyboard_diff(self.keyboard_diff_path)
+        print(f"Initial parse result: {initial_binding}")
+        self.binding_update_queue.put(initial_binding)
+        self._check_binding_queue(initial_call=True)
+        # --- End Initial check ---
+
+        # Setup watchdog
+        # Pass 'self' if parse_func needs it, or make parse_func standalone
+        event_handler = KeyboardDiffHandler(self.keyboard_diff_path, self.binding_update_queue, self._parse_keyboard_diff)
+        # Store a reference to the handler if needed for cleanup
+        self._watchdog_handler_ref = event_handler
+
+        self.watchdog_observer = Observer()
+        try:
+            self.watchdog_observer.schedule(event_handler, directory_to_watch, recursive=False)
+            self.watchdog_observer.start()
+            print(f"Watchdog started monitoring directory: {directory_to_watch}")
+        except Exception as e:
+            print(f"Error starting watchdog observer: {e}")
+            self.watchdog_observer = None
+            return
+
+        self._check_binding_queue()
+
+    def _stop_keyboard_diff_monitoring(self):
+        """Stops the watchdog observer and cleans up."""
+        print("Stopping keyboard.diff monitoring...")
+        # ... (timer cancellation, observer stop/join) ...
+
+        # Unbind all currently active bindings
+        if self.current_emm_bindings: # Check if list is not empty
+            print(f"Unbinding final keys: {self.current_emm_bindings}")
+            bindings_to_clear = list(self.current_emm_bindings) # Copy list
+            for binding in bindings_to_clear:
+                upper_binding_to_unbind = None
+                match_ctrl_lower = re.match(r"<Control-([a-z])>$", binding)
+                if match_ctrl_lower:
+                    lower_key = match_ctrl_lower.group(1)
+                    upper_key = lower_key.upper()
+                    upper_binding_to_unbind = f"<Control-{upper_key}>"
+
+                # Unbind base
+                print(f"  Unbinding final: {binding}")
+                try:
+                    self.master.unbind_all(binding)
+                except Exception as e:
+                    print(f"  Error during final unbind of {binding}: {e}")
+
+                # Unbind upper if needed
+                if upper_binding_to_unbind:
+                    print(f"  Unbinding final uppercase: {upper_binding_to_unbind}")
+                    try:
+                        self.master.unbind_all(upper_binding_to_unbind)
+                    except Exception as e:
+                        print(f"  Error during final unbind of {upper_binding_to_unbind}: {e}")
+
+            self.current_emm_bindings = [] # Clear the state list
+        print("Keyboard.diff monitoring stopped.")
+
+
+    # --- Tkinter Integration ---
+
+    def _check_binding_queue(self, initial_call=False):
+        """Checks the queue for binding updates from the watchdog thread."""
+        try:
+            # Use get_nowait to avoid blocking the Tkinter thread
+            new_binding = self.binding_update_queue.get_nowait()
+            print(f"DEBUG QUEUE: Got item from queue: {new_binding} (Type: {type(new_binding)})") # ADD THIS
+
+            self._update_emm_binding(new_binding)
+        except queue.Empty:
+            pass # No update needed
+        except Exception as e:
+            print(f"Error processing binding queue: {e}")
+
+        # Reschedule unless it was just the initial call to process immediately
+        if not initial_call:
+             # Schedule the next check (e.g., every 250ms)
+             self._after_id_binding_check = self.master.after(250, self._check_binding_queue)
+
+
+    def _format_binding_for_display(self, binding_str):
+        """Converts Tkinter binding string to a more user-friendly format."""
+        if not binding_str or not isinstance(binding_str, str):
+            return ""
+
+        # 1. Clean up brackets and KeyPress
+        binding_str = binding_str.strip('<>')
+        binding_str = binding_str.replace("KeyPress-", "") # Remove KeyPress if present
+
+        # 2. Split based on the hyphen separator used by Tkinter
+        #    Handles cases like Control-Shift-c correctly
+        parts = binding_str.split('-')
+
+        formatted_parts = []
+        known_keys_lower = { # Use lowercase for easier comparison
+            "control": "Ctrl",
+            "alt": "Alt",
+            "shift": "Shift",
+            "tab": "Tab",
+            "return": "Return", # Tk uses Return for Enter
+            "space": "Space",   # Tk uses space
+            "escape": "Escape", # Tk uses Escape
+            "prior": "PageUp",  # Tk uses Prior/Next
+            "next": "PageDown",
+            "backspace": "Backspace",
+            "delete": "Delete",
+            "up": "Up",
+            "down": "Down",
+            "left": "Left",
+            "right": "Right",
+            # Add more function keys, numpad keys, etc. as needed
+            "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
+            "f5": "F5", "f6": "F6", "f7": "F7", "f8": "F8",
+            "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
+        }
+
+        for part in parts:
+            part_lower = part.lower()
+            if part_lower in known_keys_lower:
+                formatted_parts.append(known_keys_lower[part_lower])
+            elif len(part) == 1 and part.isalpha():
+                formatted_parts.append(part.upper())
+            elif len(part) > 1 :
+                # Capitalize only the first letter for unknown multi-char keys
+                formatted_parts.append(part.capitalize())
+            else:
+                # Keep numbers/symbols as is (e.g., 1, plus, minus)
+                # Tk uses 'plus', 'minus' for '+' '-' keys
+                if part_lower == 'plus':
+                    formatted_parts.append('+')
+                elif part_lower == 'minus':
+                    formatted_parts.append('-')
+                else:
+                    formatted_parts.append(part)
+
+
+        # 3. Join the parts with "+"
+        return "+".join(formatted_parts)
+
+
+
+    def _update_emm_binding(self, new_bindings_list):
+        """
+        Updates bindings based on the new list provided.
+        Filters out incompatible bindings (<Control-letter> required).
+        If the list is empty after validation, uses the default binding.
+        Compares with current bindings, unbinds removed ones, binds added ones.
+        Handles binding both lowercase and uppercase for Control + letter combos.
+        **Also updates the 'Switch to BeamNG' button label.**
+        """
+        # --- Input Type Validation ---
+        if not isinstance(new_bindings_list, list):
+            print(f"ERROR: _update_emm_binding received non-list: {new_bindings_list}. Using empty list.")
+            new_bindings_list = [] # Corrected this line from original code comment
+
+        # --- Binding Format Validation ---
+        valid_bindings_list = []
+        # Regex to match '<Control-' followed by a single letter (case-insensitive) and '>'
+        valid_pattern = re.compile(r"^<Control-([a-zA-Z])>$")
+        for binding in new_bindings_list:
+            if isinstance(binding, str) and valid_pattern.match(binding):
+                # Ensure we store the canonical lowercase version if needed,
+                # or just keep the original valid one. Let's keep the original
+                # format as the binding/unbinding logic handles case.
+                 match = valid_pattern.match(binding)
+                 lower_case_binding = f"<Control-{match.group(1).lower()}>"
+                 if lower_case_binding not in valid_bindings_list: # Avoid duplicates after lowercasing
+                     valid_bindings_list.append(lower_case_binding)
+
+            else:
+                print(f"Incompatible binding detected: '{binding}'. Only <Control-letter> bindings are supported. Skipping.")
+        # --- Use the validated list from now on ---
+        print(f"Validated bindings list: {valid_bindings_list}")
+
+
+        # --- Calculate Differences ---
+        current_bindings_set = set(self.current_emm_bindings)
+        # Use the *validated* list to determine the new set
+        new_bindings_set = set(valid_bindings_list)
+
+        bindings_to_remove = current_bindings_set - new_bindings_set
+        bindings_to_add = new_bindings_set - current_bindings_set
+
+        # --- Unbind Removed ---
+        if bindings_to_remove:
+            print(f"Bindings to remove: {bindings_to_remove}")
+            for binding in bindings_to_remove:
+                # Unbinding logic already handles finding the uppercase variant
+                # based on the lowercase stored version.
+                upper_binding_to_unbind = None
+                match_ctrl_lower = re.match(r"<Control-([a-z])>$", binding) # Match should work as we store lowercase
+                if match_ctrl_lower:
+                    lower_key = match_ctrl_lower.group(1)
+                    upper_key = lower_key.upper()
+                    upper_binding_to_unbind = f"<Control-{upper_key}>"
+                else:
+                     print(f"Warning: Could not parse binding to unbind for uppercase: {binding}")
+
+
+                print(f"Unbinding: {binding}")
+                try:
+                    self.master.unbind_all(binding)
+                except Exception as e:
+                    print(f"Error unbinding {binding}: {e}")
+
+                if upper_binding_to_unbind:
+                    print(f"Unbinding uppercase: {upper_binding_to_unbind}")
+                    try:
+                        self.master.unbind_all(upper_binding_to_unbind)
+                    except Exception as e:
+                        print(f"Error unbinding {upper_binding_to_unbind}: {e}")
+
+        # --- Bind Added ---
+        if bindings_to_add:
+            print(f"Bindings to add: {bindings_to_add}")
+            for binding in bindings_to_add:
+                # Binding logic already handles binding uppercase variant too
+                upper_binding_to_bind = None
+                match_ctrl_lower = re.match(r"<Control-([a-z])>$", binding) # Match should work as we store lowercase
+                if match_ctrl_lower:
+                    lower_key = match_ctrl_lower.group(1)
+                    upper_key = lower_key.upper()
+                    upper_binding_to_bind = f"<Control-{upper_key}>"
+                else:
+                     print(f"Warning: Could not parse binding to bind for uppercase: {binding}")
+
+                print(f"Binding: {binding}")
+                try:
+                    self.master.bind_all(binding, self._emm_binding_callback)
+                except Exception as e:
+                    print(f"Error binding {binding}: {e}")
+
+                if upper_binding_to_bind:
+                    print(f"Binding uppercase: {upper_binding_to_bind}")
+                    try:
+                        self.master.bind_all(upper_binding_to_bind, self._emm_binding_callback)
+                    except Exception as e:
+                        print(f"Error binding {upper_binding_to_bind}: {e}")
+
+        # --- Update State ---
+        if bindings_to_remove or bindings_to_add:
+             # Store the *validated* and processed list (which is now canonical lowercase)
+            self.current_emm_bindings = list(valid_bindings_list)
+            print(f"Current active EMM bindings updated to: {self.current_emm_bindings}")
+
+        # --- Update Switch Button Label ---
+        # This logic updates the button label based on the *contents* of self.current_emm_bindings
+        display_binding_text = self.DEFAULT_SWITCH_DISPLAY_TEXT # Start with default
+
+        if not self.current_emm_bindings:
+            # List is empty (after validation), use default text
+            display_binding_text = self.DEFAULT_SWITCH_DISPLAY_TEXT
+        else:
+            # List is not empty, check for default binding and others
+            # Note: self.current_emm_bindings now contains only lowercase valid bindings
+            other_bindings = [b for b in self.current_emm_bindings if b != self.DEFAULT_SWITCH_BINDING] # Find bindings *not* Ctrl+y
+
+            if self.DEFAULT_SWITCH_BINDING in self.current_emm_bindings:
+                # Default binding (<Control-y>) IS in the list
+                if other_bindings:
+                    # Use the first *other* binding found
+                    display_binding_text = self._format_binding_for_display(other_bindings[0])
+                else:
+                    # Only the default binding is in the list, use its display text
+                    display_binding_text = self.DEFAULT_SWITCH_DISPLAY_TEXT
+            elif other_bindings:
+                # Default binding is NOT in the list, but others are. Use the first one.
+                 display_binding_text = self._format_binding_for_display(other_bindings[0])
+            # else: Default binding not present and no other bindings (list was empty, handled above)
+
+        # Ensure the button exists before trying to configure it
+        if self.switch_to_beamng_button:
+            self.new_button_label = f"Switch to BeamNG ({display_binding_text})"
+            print(f"Updating button label to: {self.new_button_label}")
+            self.switch_to_beamng_button.config(text=self.new_button_label)
+        else:
+            print("Warning: switch_to_beamng_button not created yet, cannot update label.")
+
+
+        # --- Permanent Bindings (kept as requested) ---
+        # These ensure Ctrl+Y always works, regardless of the list passed to _update_emm_binding
+        self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window())
+        self.master.bind_all("<Control-Y>", lambda event: self.focus_beamng_window())
+
+    def _emm_binding_callback(self, event=None):
+        """Wrapper callback function called by the dynamic binding."""
+        # This ensures 'self' is correctly referenced
+        print(f"focus_beamng_window SHOULD BE GETTING RAN RIGHT NOW")
+        self.focus_beamng_window()
 
 
 
@@ -6388,10 +8350,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot switch Search Mode while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
         
 
         button = self.search_mode_button
@@ -6422,7 +8388,7 @@ class ConfigViewerApp:
             elif mode == "Configs":
                 tip_text = "Search for Config Name, Config File Name"
 
-            tooltip_label = tk.Label(self.current_tooltip_window, text=tip_text, font=("Segoe UI", 10, "bold", "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Darker bg for tooltip
+            tooltip_label = tk.Label(self.current_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Darker bg for tooltip
             tooltip_label.pack(padx=1, pady=1) # Padding inside tooltip
 
             # Position tooltip to the right of the button
@@ -6464,6 +8430,7 @@ class ConfigViewerApp:
             self.search_var.set("") # Clear the search bar text
             self.search_mode = mode
             self.search_mode_button.config(text=f"Search Mode: {self.search_mode}")
+            print("    on_search_mode_option_click is calling self.perform_search() and clearing the search bar - inner function of show_search_mode_options_dropdown")
             self.perform_search() # Perform search after mode change # <--- ADDED perform_search() HERE
             self.destroy_search_mode_options_dropdown_menu()
             destroy_search_mode_option_tooltip() # Destroy tooltip when option is clicked
@@ -6504,7 +8471,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 self.search_mode_options_dropdown_window,
                 text=f"{mode}",
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda m=mode: on_search_mode_option_click(m),
                 borderwidth=1,
                 relief="solid",
@@ -6557,6 +8524,7 @@ class ConfigViewerApp:
 
     def initialize_data_and_grid(self):
         self.grouped_data = self.format_grouped_data(self.data)
+        print("    initialize_data_and_grid is calling self.populate_initial_grid()")
         self.populate_initial_grid()
         self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
         self.current_main_sidebar_item = None # To store the currently selected item in main grid sidebar
@@ -6605,6 +8573,7 @@ class ConfigViewerApp:
             window_height = 140 # Smaller height
 
 
+
         # Set background color of the window
         scanning_window.configure(bg="#333333")  # Set background color
 
@@ -6637,11 +8606,27 @@ class ConfigViewerApp:
             scanning_window.overrideredirect(True)  # Remove window border
             scanning_window.config(highlightthickness=5, highlightbackground="#555555") # Add border here
             # Schedule destroy_lingering_scanning_windows after 7 seconds
-            scanning_window.after(7000, lambda window=scanning_window: window.destroy())
+
+            if not "scanning and refreshing data" in text.lower(): # Convert text to lowercase for case-insensitive check
+                scanning_window.after(7000, lambda window=scanning_window: window.destroy())
+
+        # --- START: Added code to save position ---
+        try:
+            data_folder = self.script_dir / "data"
+            position_file_path = data_folder / "scanning_window_position.txt"
+
+            with open(position_file_path, 'w') as f:
+                f.write(f"{pos_x},{pos_y}") # Save as comma-separated x,y
+            print(f"Saved scanning window position ({pos_x},{pos_y}) to {position_file_path}") # Optional confirmation
+
+        except Exception as e:
+            print(f"Error saving scanning window position: {e}")
+
 
 
         # Set the geometry of the scanning window
         scanning_window.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+
 
         lbl = tk.Label(
             scanning_window,
@@ -6654,28 +8639,6 @@ class ConfigViewerApp:
 
         scanning_window.update()
 
-        # --- Fade-in animation (rest of your code remains unchanged) ---
-        start_color_rgb = (1.0, 1.0, 1.0)  # White in RGB (normalized 0.0-1.0)
-        end_color_rgb = (1.0, 0.65, 0.0)  # Orange in RGB (normalized 0.0-1.0, roughly)
-        duration_ms = 1000  # 1 second
-        steps = 50  # Number of steps in the animation
-        delay_ms = duration_ms // steps
-
-        '''
-        def fade_text_color(step):
-            if step <= steps:
-                # Interpolate RGB values
-                r = start_color_rgb[0] + (end_color_rgb[0] - start_color_rgb[0]) * step / steps
-                g = start_color_rgb[1] + (end_color_rgb[1] - start_color_rgb[1]) * step / steps
-                b = start_color_rgb[2] + (end_color_rgb[2] - start_color_rgb[2]) * step / steps
-
-                # Convert RGB (0.0-1.0) to hex color string
-                hex_color = "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
-                lbl.config(fg=hex_color)
-                scanning_window.after(delay_ms, fade_text_color, step + 1) # Call next step
-
-        fade_text_color(0) # Start the fade animation
-        '''
         return scanning_window
 
     def destroy_scanning_window(self):
@@ -6760,14 +8723,50 @@ class ConfigViewerApp:
         # --- MODIFIED: Try-except block with retry for EnumWindows ---
 
         if beamng_window_handle:
-            if win32gui.IsIconic(beamng_window_handle): # Check if minimized
-                print("BeamNG.drive window is minimized.") # Optional print for console
-                return False # Stop focusing and return False
-            else:
-                win32gui.ShowWindow(beamng_window_handle, 5) # SW_RESTORE
+            
+
+            #if win32gui.IsIconic(beamng_window_handle): # Check if minimized
+            #    print("BeamNG.drive window is minimized.") # Optional print for console
+            #    return False # Stop focusing and return False
+            #else:
+            #    win32gui.ShowWindow(beamng_window_handle, 5) # SW_RESTORE
+            #    win32gui.SetForegroundWindow(beamng_window_handle)
+            #    self.on_details_window_close()
+            #    return True
+
+            is_minimized = win32gui.IsIconic(beamng_window_handle) # Check if minimized
+
+            if is_minimized:
+                print("BeamNG.drive window is minimized. Restoring...") # Optional print for console
+                # Restore the window from minimized state.
+                # SW_RESTORE activates and displays the window. If the window is minimized
+                # or maximized, the system restores it to its original size and position.
+                win32gui.ShowWindow(beamng_window_handle, win32con.SW_RESTORE)
+
+            # Now, whether it was minimized or just inactive,
+            # bring the window to the foreground.
+            # Note: SW_RESTORE might already bring it somewhat forward, but
+            # SetForegroundWindow is more forceful/explicit about giving it focus.
+            try:
+                # Sometimes SetForegroundWindow needs the window to be shown first,
+                # which SW_RESTORE does.
                 win32gui.SetForegroundWindow(beamng_window_handle)
-                self.on_details_window_close()
-                return True
+            except Exception as e:
+                # SetForegroundWindow can sometimes fail due to OS restrictions
+                # (e.g., another app forcefully holding focus).
+                # If it fails, the window should still be restored (if it was minimized)
+                # or remain visible (if it was just in the background).
+                print(f"Warning: Could not set foreground window: {e}")
+                # As a fallback, ensure it's at least shown/activated if it wasn't minimized
+                if not is_minimized:
+                    win32gui.ShowWindow(beamng_window_handle, win32con.SW_SHOW) # SW_SHOW (5) activates
+
+            self.details_window_intentionally_closed = True
+            self.on_details_window_close() # Call your function regardless
+            return True
+
+
+            
         else:
             print("BeamNG.drive window not found.") # Keep this print
             return False
@@ -6784,6 +8783,246 @@ class ConfigViewerApp:
         return False
     
 
+
+
+    def focus_config_viewer_from_floating_button_layer_2(self):
+        """
+        Attempts to restore/show the main selflication window (self.master),
+        bring it to the foreground, and give it keyboard input focus.
+
+        Args:
+            self: The selflication instance ('self').
+
+        Returns:
+            True if focus attempt was likely successful, False otherwise.
+        """
+
+
+        try:
+            # Ensure the master window actually exists
+            if not self.master.winfo_exists():
+                print("Error: Main window (self.master) does not exist.")
+                return False
+
+            hwnd = self.master.winfo_id()
+            print(f"Debug: Targeting HWND: {hwnd} for window '{self.master.title()}'")
+
+            # --- Update Tkinter's state *before* Win32 checks ---
+            # This might help sync the states if Tkinter hid the window itself
+            self.master.update_idletasks()
+
+        except Exception as e:
+            print(f"Error getting main window HWND or checking existence: {e}")
+            return False
+
+        try:
+            # --- Step 1: Determine State and Restore/Show if Necessary ---
+            needs_showing = False
+            is_minimized = False
+            show_command = win32con.SW_SHOWNORMAL # Default command if not minimized but hidden
+
+            try:
+                placement = win32gui.GetWindowPlacement(hwnd)
+                current_state = placement[1] # showCmd value
+                print(f"Debug: Current window placement state (showCmd): {current_state}")
+
+                if current_state in [win32con.SW_SHOWMINIMIZED, win32con.SW_MINIMIZE, win32con.SW_SHOWMINNOACTIVE]:
+                    print(f"Main window (HWND: {hwnd}) detected as minimized.")
+                    is_minimized = True
+                    needs_showing = True
+                    show_command = win32con.SW_RESTORE # Use RESTORE for minimized windows
+                elif not win32gui.IsWindowVisible(hwnd):
+                    # It's not minimized, but it's not visible either (e.g., withdrawn)
+                    print(f"Main window (HWND: {hwnd}) detected as not visible (but not minimized).")
+                    needs_showing = True
+                    # Keep default show_command = SW_SHOWNORMAL (or try SW_SHOW)
+                    show_command = win32con.SW_SHOW # SW_SHOW might be slightly better here
+                else:
+                    print(f"Main window (HWND: {hwnd}) is already visible and not minimized.")
+                    needs_showing = False
+
+            except pywintypes.error as e_place:
+                print(f"Warning: Could not get window placement for HWND {hwnd}: {e_place}. Falling back to IsIconic/IsWindowVisible.")
+                try:
+                    if win32gui.IsIconic(hwnd):
+                        print(f"Main window (HWND: {hwnd}) detected as minimized (IsIconic fallback).")
+                        is_minimized = True
+                        needs_showing = True
+                        show_command = win32con.SW_RESTORE
+                    elif not win32gui.IsWindowVisible(hwnd):
+                        print(f"Main window (HWND: {hwnd}) detected as not visible (IsWindowVisible fallback).")
+                        needs_showing = True
+                        show_command = win32con.SW_SHOW # Use SHOW if just invisible
+                    else:
+                        print(f"Main window (HWND: {hwnd}) selfears visible (fallback check).")
+                        needs_showing = False
+                except pywintypes.error as e_fallback:
+                    print(f"Error: Could not determine visibility state via fallbacks for HWND {hwnd}: {e_fallback}")
+                    # Proceed with caution, assume needs showing? Or return False? Let's try showing.
+                    needs_showing = True
+                    show_command = win32con.SW_SHOW
+
+            # If determined it needs showing/restoring:
+            if needs_showing:
+                print(f"Attempting ShowWindow(hwnd, {show_command}) for HWND: {hwnd}...")
+                try:
+                    # BringWindowToTop *before* ShowWindow might sometimes help prepare it
+                    # win32gui.BringWindowToTop(hwnd)
+                    # time.sleep(0.05)
+
+                    win32gui.ShowWindow(hwnd, show_command)
+                    print(f"Debug: Called ShowWindow with command {show_command}.")
+                    # Give window manager time & update Tkinter
+                    time.sleep(0.15) # Keep slightly longer delay
+                    self.master.update_idletasks()
+                    print(f"Debug: Called update_idletasks after ShowWindow.")
+
+                    # --- Verification ---
+                    visible_after = win32gui.IsWindowVisible(hwnd)
+                    placement_after = win32gui.GetWindowPlacement(hwnd)
+                    state_after = placement_after[1]
+                    print(f"Debug: State after ShowWindow: Visible={visible_after}, Placement={state_after}")
+
+                    if not visible_after or state_after in [win32con.SW_SHOWMINIMIZED, win32con.SW_MINIMIZE, win32con.SW_SHOWMINNOACTIVE]:
+                        print(f"Warning: Window HWND {hwnd} still not visible or is minimized after ShowWindow command {show_command}. Trying BringWindowToTop/SetForeground anyway.")
+                        # Try BringWindowToTop as a last resort visibility attempt before focus
+                        try:
+                            win32gui.BringWindowToTop(hwnd)
+                            time.sleep(0.05)
+                            print("Debug: Called BringWindowToTop as extra measure.")
+                        except Exception as e_bring:
+                            print(f"Debug: BringWindowToTop failed: {e_bring}")
+                    else:
+                        print("Debug: Window selfears successfully restored/shown.")
+
+                except pywintypes.error as e_show:
+                    print(f"Error during ShowWindow command {show_command} for HWND {hwnd}: {e_show}")
+                    # If showing fails, focus likely won't work, but we can still try
+                except Exception as e_show_general:
+                    print(f"Unexpected error during window showing: {e_show_general}")
+
+            # --- Step 2 & 3: Attempt Focus (Keep previous logic) ---
+            focus_success = False
+            try:
+                # --- Attempt Direct Focus ---
+                print(f"Attempting SetForegroundWindow for HWND: {hwnd}")
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.05)
+                if win32gui.GetForegroundWindow() == hwnd:
+                    print("SetForegroundWindow succeeded and confirmed foreground.")
+                    self.master.focus_force()
+                    self.master.update_idletasks()
+                    focus_success = True
+                    # Optional: self.on_details_window_close()
+                else:
+                    print("SetForegroundWindow called, but window did not become foreground. Proceeding to hack.")
+                    # Fall through
+
+            except pywintypes.error as e_fg:
+                print(f"SetForegroundWindow failed initially (Error: {e_fg.winerror} - {e_fg}). Attempting workaround...")
+                # Fall through
+            except Exception as e_fg_general:
+                print(f"Unexpected error during initial SetForegroundWindow: {e_fg_general}. Attempting workaround...")
+                # Fall through
+
+            # --- Focus Hack Attempt (only if direct focus failed) ---
+            if not focus_success:
+                current_thread_id = win32api.GetCurrentThreadId()
+                # Need to re-get target_thread_id in case window was recreated? Unlikely but safe.
+                target_thread_id, _ = win32process.GetWindowThreadProcessId(hwnd)
+                attached = False
+
+                try:
+                    if current_thread_id != target_thread_id:
+                        # Check if already attached from a previous attempt (shouldn't hselfen with finally block, but safe)
+                        # Note: Checking attachment state directly is complex. Assume not attached.
+                        print(f"Attaching input thread {current_thread_id} to {target_thread_id}")
+                        win32process.AttachThreadInput(current_thread_id, target_thread_id, True)
+                        attached = True
+
+                    print("Simulating ALT key press/release...")
+                    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+                    time.sleep(0.02)
+                    win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.05)
+
+                    print(f"Retrying SetForegroundWindow for HWND: {hwnd} after workaround...")
+                    win32gui.SetForegroundWindow(hwnd)
+                    time.sleep(0.05)
+
+                    if win32gui.GetForegroundWindow() == hwnd:
+                        print("SetForegroundWindow succeeded after workaround and confirmed foreground.")
+                        focus_success = True
+                    else:
+                        print("SetForegroundWindow hack did not result in foreground. Trying BringWindowToTop.")
+                        win32gui.BringWindowToTop(hwnd)
+                        time.sleep(0.05)
+                        if win32gui.GetForegroundWindow() == hwnd:
+                            print("BringWindowToTop selfears to have brought it to foreground.")
+                            focus_success = True # Consider this success
+                        else:
+                            print("Focus could not be guaranteed even after workarounds.")
+                            focus_success = False
+
+                    if focus_success:
+                        self.master.focus_force()
+                        self.master.update_idletasks()
+
+                except pywintypes.error as e_hack:
+                    print(f"Error during focus hack (Error: {e_hack.winerror} - {e_hack}).")
+                    focus_success = False # Ensure it's false on error
+                except Exception as e_hack_general:
+                    print(f"Unexpected error during focus hack: {e_hack_general}")
+                    focus_success = False # Ensure it's false on error
+                finally:
+                    if attached:
+                        try:
+                            print(f"Detaching input thread {current_thread_id} from {target_thread_id}")
+                            win32process.AttachThreadInput(current_thread_id, target_thread_id, False)
+                        except Exception as e_detach:
+                            print(f"Warning: Error detaching thread input: {e_detach}")
+
+
+            # --- Optional: Close details window ---
+            # if focus_success:
+                # self.on_details_window_close()
+
+            self.lift_search_results_window()
+
+            self.search_entry.focus_set()
+
+            self.skip_perform_search = False
+            print("skip_perform_search reset to FALSE")
+
+            return focus_success
+
+        except Exception as e_main:
+            print(f"General error during main window focus attempt: {e_main}")
+            return False
+
+
+    def _clear_ignore_state(self):
+        """Called by the timer to end the ignore period and re-enable input."""
+        print("DEBUG: KeyRelease ignore period ended.")
+
+        # --- Re-enable the search entry ---
+        try:
+            # Check if it's currently disabled *before* enabling,
+            # although enabling a normal entry is harmless.
+            if self.search_entry.cget('state') == tk.DISABLED:
+                print("DEBUG: Re-enabling search entry.")
+                self.search_entry.config(state=tk.NORMAL)
+            else:
+                 print("DEBUG: Search entry was already enabled when ignore period ended.")
+        except AttributeError:
+             print("ERROR: self.search_entry does not exist when trying to re-enable.")
+             # Handle error
+        except tk.TclError as e:
+             print(f"WARN: Error re-enabling search entry (maybe destroyed?): {e}")
+
+        # --- Clear the timer ID ---
+        self._ignore_keyrelease_timer_id = None
+
     def send_escape(self, event=None):
 
         if not self.is_beamng_running():
@@ -6795,7 +9034,7 @@ class ConfigViewerApp:
             if scanning_win:
                 scanning_win.destroy()
             return False # Indicate failure
-
+        self.details_window_intentionally_closed = True
         self.on_details_window_close()
         print("BeamNG.drive is running.") # Added print
         #time.sleep(0.125) # Reduced time.sleep to quarter
@@ -6837,7 +9076,7 @@ class ConfigViewerApp:
             if scanning_win:
                 scanning_win.destroy()
             return False # Indicate failure
-
+        self.details_window_intentionally_closed = True
         self.on_details_window_close()
         print("BeamNG.drive is running.") # Added print
         #time.sleep(0.125) # Reduced time.sleep to quarter
@@ -6956,6 +9195,7 @@ class ConfigViewerApp:
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
 
+        self.details_window_intentionally_closed = True
         self.on_details_window_close()
 
         if scanning_window:
@@ -7060,10 +9300,9 @@ class ConfigViewerApp:
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
 
-        self.on_details_window_close()
+        self.details_window_intentionally_closed = True        
 
-
-
+        self.master.after(2000, self.on_details_window_close)  # Go to the page before resize
         
 
         print(f"Transient Spawn Queue actions completed. ATTEMPT {attempt_number}") # Updated message
@@ -7104,7 +9343,178 @@ class ConfigViewerApp:
                 return self.run_spawn_queue_transient(retry=True, attempt_number=attempt_number + 1) # Recursive call, incrementing attempt_number
 
 
+    def spawn_random_vehicle(self, event=None):
+        """
+        Selects a random vehicle configuration from a whitelisted set of types
+        (car, truck, bus, van, aircraft), displays more informative feedback,
+        and attempts to spawn it using the transient spawn queue mechanism.
+        """
+        print("\n--- spawn_random_vehicle() ENTRY (Whitelisted + Better Info) ---")
 
+        allowed_types = {'car', 'truck', 'bus', 'van', 'aircraft'}
+        print(f"  Whitelisted types: {allowed_types}")
+
+        # 1. Gather potential candidates (tuples) for allowed types
+        #    Store: (spawn_cmd, info_data, folder_name, zip_file)
+        filtered_candidates = []
+        if not hasattr(self, 'original_full_data') or not self.original_full_data:
+            print("Error: Vehicle data (original_full_data) not loaded.")
+            messagebox.showerror("Error", "Vehicle data not loaded. Cannot spawn random vehicle.")
+            return
+
+        print("  Gathering and filtering potential candidates by type...")
+        total_configs_checked = 0
+        allowed_configs_found = 0
+
+        for folder_name, config_list_or_dict in self.original_full_data.items():
+            actual_configs = []
+            if isinstance(config_list_or_dict, list):
+                actual_configs = config_list_or_dict
+            elif isinstance(config_list_or_dict, dict) and 'configs' in config_list_or_dict and isinstance(config_list_or_dict['configs'], list):
+                actual_configs = config_list_or_dict['configs']
+
+            for config_tuple in actual_configs:
+                total_configs_checked += 1
+                if isinstance(config_tuple, (list, tuple)) and len(config_tuple) >= 5:
+                    pic_path, spawn_cmd, zip_file, info_data, f_name = config_tuple
+
+                    vehicle_type = ""
+                    if info_data and isinstance(info_data, dict):
+                        vehicle_type = info_data.get("Type", "").strip().lower()
+                    else:
+                        continue # Skip if no valid info_data
+
+                    if vehicle_type in allowed_types:
+                        if spawn_cmd:
+                            # Store the necessary tuple for later info retrieval
+                            filtered_candidates.append((spawn_cmd, info_data, folder_name, zip_file))
+                            allowed_configs_found += 1
+                # else: # Optional debug for structure issues
+                    # print(f"    Skipping config due to unexpected structure: {config_tuple}")
+
+
+        print(f"  Checked {total_configs_checked} total configurations.")
+        print(f"  Found {len(filtered_candidates)} candidates matching allowed types.")
+
+        if not filtered_candidates:
+            print("Error: No valid candidates found for the allowed vehicle types.")
+            messagebox.showerror("Error", "No vehicles of the allowed types (Car, Truck, Bus, Van, Aircraft) found.")
+            return
+
+        # 2. Choose a random candidate tuple
+        try:
+            chosen_candidate = random.choice(filtered_candidates)
+            # Unpack the chosen candidate
+            chosen_spawn_cmd, chosen_info_data, chosen_folder_name, chosen_zip_file = chosen_candidate
+        except IndexError:
+            print("Error: Could not select a random candidate (filtered list empty unexpectedly).")
+            messagebox.showerror("Error", "Could not select a random vehicle from the allowed types.")
+            return
+        except Exception as e:
+            print(f"Error during random choice: {e}")
+            messagebox.showerror("Error", f"An error occurred selecting a random vehicle: {e}")
+            return
+
+        # 3. Determine the BEST display name for the message
+        brand_display = chosen_info_data.get("Brand", "").strip()
+        pc_filename_base = self.extract_name_from_spawn_command(chosen_spawn_cmd) or "UnknownPC"
+        config_display_name = pc_filename_base # Default to PC name
+
+        # Try to get friendly configuration name from individual info file
+        try:
+            zip_file_base_name = os.path.splitext(chosen_zip_file)[0] if chosen_zip_file else ""
+            individual_info_path = self.find_individual_info_file(
+                chosen_folder_name, zip_file_base_name, pc_filename_base
+            )
+            if individual_info_path:
+                individual_data, _ = self._load_individual_info(individual_info_path) # Ignore file content here
+                friendly_name = individual_data.get("Configuration", "").strip()
+                if friendly_name:
+                    config_display_name = friendly_name # Use friendly name if available
+                    print(f"  Using friendly config name: '{config_display_name}'")
+                else:
+                    print(f"  Friendly config name not found in individual JSON, using PC name: '{pc_filename_base}'")
+            else:
+                print(f"  Individual info file not found, using PC name: '{pc_filename_base}'")
+        except Exception as e:
+            print(f"  Warning: Error finding/loading individual info for display name: {e}. Using PC name: '{pc_filename_base}'")
+
+        # Construct the final message string
+        if brand_display:
+            vehicle_display_name_for_msg = f"{brand_display} - {config_display_name}"
+        else:
+            vehicle_display_name_for_msg = config_display_name # Show only config name if no brand
+
+        print(f"  Selected vehicle for spawning: {vehicle_display_name_for_msg}")
+
+
+        # 4. Prepare the spawn command (remove comments)
+        prepared_spawn_cmd = ""
+        try:
+            modified_lines = []
+            for line in chosen_spawn_cmd.splitlines():
+                use_index = line.find('-- (USE')
+                if use_index != -1:
+                    modified_lines.append(line[:use_index].strip())
+                elif line.strip().endswith(')'):
+                    use_index_alt = line.find('(USE')
+                    if use_index_alt != -1:
+                        modified_lines.append(line[:use_index_alt].strip())
+                    else:
+                        modified_lines.append(line.strip())
+                else:
+                    modified_lines.append(line.strip())
+            prepared_spawn_cmd = '\n'.join(filter(None, modified_lines))
+
+            if not prepared_spawn_cmd:
+                print("Error: Prepared spawn command is empty after modification.")
+                messagebox.showerror("Error", "Failed to prepare the spawn command.")
+                return
+            print(f"  Prepared spawn command for queue: {prepared_spawn_cmd}")
+        except Exception as e:
+            print(f"Error preparing spawn command: {e}")
+            messagebox.showerror("Error", f"Error preparing spawn command: {e}")
+            return
+
+        # 5. Show "Attempting to spawn..." message with the better name
+        scanning_window = None
+        try:
+            scanning_window = self.show_scanning_window(
+                text=f"Attempting to spawn random vehicle:\n{vehicle_display_name_for_msg}\n" # Use the new display name
+                    "Please try not to click anything until this notification disappears."
+            )
+            scanning_window.deiconify()
+            self.master.update_idletasks()
+        except Exception as e:
+            print(f"Warning: Could not show scanning window: {e}")
+
+        # 6. Write the command to the transient spawn queue file
+        try:
+            with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f:
+                f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
+                f.write(prepared_spawn_cmd + '\n')
+            print(f"  Random spawn command written to transient queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}")
+            print(f"ERROR: Failed to write spawn command: {e}")
+            if scanning_window and scanning_window.winfo_exists(): scanning_window.destroy()
+            return
+
+        # 7. Trigger the spawn action
+        print("  Triggering transient spawn queue execution...")
+        success = self.run_spawn_queue_transient(retry=False, attempt_number=1)
+
+        # 8. Handle result and close scanning window
+        if success:
+            print("  Random vehicle spawn initiated successfully (BeamNG confirmation received).")
+        else:
+            print("  Random vehicle spawn failed or timed out (BeamNG confirmation not received).")
+
+        if scanning_window and scanning_window.winfo_exists():
+            self.master.after(1000, lambda: scanning_window.destroy() if scanning_window and scanning_window.winfo_exists() else None)
+
+        print("--- spawn_random_vehicle() EXIT (Whitelisted + Better Info) ---")
+            
 
 ##################################################### SPAWNING VEHICLES 
 
@@ -7130,15 +9540,16 @@ class ConfigViewerApp:
         # --- MODIFIED: Write to transient spawn queue file instead of clipboard ---
 
 
-    def on_spawn_new_button_click(self):
+    def on_spawn_new_button_click(self, spawn_cmd, event=None):
         """Handles click on the 'Spawn New' button in the details sidebar.
         Modified to write the spawn command to the transient spawn queue file
         instead of copying to clipboard.
         """
-        spawn_cmd = None
+        #spawn_cmd = None
         info_data = None
         picture_path = None
         zip_file = None
+
 
         if self.is_details_sidebar_showing_default: # NEW: Check if sidebar is showing DEFAULT config
             print("DEBUG: Spawn New Click - Sidebar showing DEFAULT config, attempting to extract data from labels...") # Debug
@@ -7169,6 +9580,7 @@ class ConfigViewerApp:
         else:
             print("Warning: Spawn command not available for Spawn New action.")
             return # Exit if no spawn command available
+
 
         scanning_window = None # Initialize scanning_window outside try block
         if spawn_cmd: # Only proceed if spawn_cmd is successfully obtained (either from label or stored attribute)
@@ -7224,7 +9636,7 @@ class ConfigViewerApp:
         zip_file = None
 
         #if self.is_details_sidebar_showing_default: # NEW: Check if sidebar is showing DEFAULT config
-        print("DEBUG: Spawn New Click - attempting to extract data from labels...") # Debug
+        print("DEBUG: Replace Current Click - attempting to extract data from labels...") # Debug
         # --- NEW: Get FULL spawn_cmd from the LABEL's stored attribute, not label text ---
 
         if not spawn_cmd:
@@ -7614,7 +10026,7 @@ class ConfigViewerApp:
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
 
-
+        self.details_window_intentionally_closed = True
         self.on_details_window_close()
 
         print(f"Deletion completed. ATTEMPT {attempt_number}") # Updated message
@@ -7696,6 +10108,11 @@ class ConfigViewerApp:
         """Handles click on the 'Spawn Default' button.
         MODIFIED: Extracts {model} from default.pc dynamically.
         """
+
+        #self.spawn_random_vehicle()
+        #return # testing
+
+
         model_name = None  # Initialize model_name to None
 
         # 1. Construct the path to default.pc
@@ -7885,7 +10302,7 @@ class ConfigViewerApp:
 
 
         # **Spawn Queue Title**
-        title_label = tk.Label(dropdown_window, text="Spawn Queue", font=("Segoe UI", 13, "bold"), fg="white", bg="#333333") # Bold title
+        title_label = tk.Label(dropdown_window, text="Spawn Queue", font=("Segoe UI", 13+self.font_size_add, "bold"), fg="white", bg="#333333") # Bold title
         title_label.pack(pady=(10, 0)) # Add padding above the title
 
         main_frame = tk.Frame(dropdown_window, bg="#333333", padx=10, pady=10) # Main frame with padding
@@ -7931,8 +10348,8 @@ class ConfigViewerApp:
         default_button_style = self.button_style_args if hasattr(self, 'button_style_args') else {'bg': '#444444', 'fg': 'white', 'relief': tk.RAISED, 'borderwidth': 2}
         hover_button_style = {'bg': 'orange', 'fg': 'white', 'relief': tk.FLAT, 'borderwidth': 0}
 
-        spawn_button = tk.Button(button_frame, text="Spawn", font=("Segoe UI", 12), command=self.on_spawn_queue_spawn_button_click, **default_button_style)
-        clear_button = tk.Button(button_frame, text="Clear", font=("Segoe UI", 12), command=self.on_spawn_queue_clear_button_click, **default_button_style)
+        spawn_button = tk.Button(button_frame, text="Spawn", font=("Segoe UI", 12+self.font_size_add), command=self.on_spawn_queue_spawn_button_click, **default_button_style)
+        clear_button = tk.Button(button_frame, text="Clear", font=("Segoe UI", 12+self.font_size_add), command=self.on_spawn_queue_clear_button_click, **default_button_style)
 
         def on_enter(event):
             event.widget.config(**hover_button_style)
@@ -8181,7 +10598,7 @@ class ConfigViewerApp:
             image_label.image = image_photo
             image_label.pack(side="left", padx=5, pady=5)
 
-            config_label = tk.Label(item_frame, text=config_display_name, font=("Segoe UI", 10, "bold"), fg="white", bg="#444444", anchor="w", wraplength=250, justify=tk.LEFT)
+            config_label = tk.Label(item_frame, text=config_display_name, font=("Segoe UI", 10+self.font_size_add, "bold"), fg="white", bg="#444444", anchor="w", wraplength=250, justify=tk.LEFT)
             config_label.pack(side="top", fill="x", padx=5)
 
             # --- Hover Functionality for Remove Button ---
@@ -8191,7 +10608,7 @@ class ConfigViewerApp:
             def on_leave(event):
                 event.widget.config(bg=self.button_style_args["bg"], fg=self.button_style_args["fg"]) # Revert to default
 
-            remove_button = tk.Button(item_frame, text="Remove", command=lambda cmd=command_line, frame=item_frame: self.on_remove_queue_item(cmd, frame), **self.button_style_args)
+            remove_button = tk.Button(item_frame, text="Remove", font=("Segoe UI", 9+self.font_size_add), command=lambda cmd=command_line, frame=item_frame: self.on_remove_queue_item(cmd, frame), **self.button_style_args)
             remove_button.pack(side="bottom", padx=5, pady=(2, 0), anchor="w", fill="x")
 
             remove_button.bind("<Enter>", on_enter)
@@ -8388,8 +10805,8 @@ class ConfigViewerApp:
         
 
 
-    def process_lines(self, lines, data, full_data, is_custom):
-        return process_lines(self, lines, data, full_data, is_custom)
+    def process_lines(self, lines, full_data, is_custom):
+        return process_lines(self, lines, full_data, is_custom)
    
   
         
@@ -8550,6 +10967,7 @@ class ConfigViewerApp:
         self.filter_state = (self.filter_state + 1) % len(self.filter_options)
         current_filter = self.filter_options[self.filter_state]
         self.filter_button.config(text=f"{current_filter} [0]")
+        print("    cycle_filter is calling self.perform_search()")
         self.perform_search()
 
         
@@ -8839,219 +11257,179 @@ class ConfigViewerApp:
         self.scrollbar_thumb_dragging_search_results = False
   
  
-    def save_window_geometry(self, width, height, x, y):
-        """Saves the window geometry to MMSelectorSize.txt."""
+    def _track_normal_geometry(self, event=None):
+        """Stores the geometry when the window is in a 'normal' state."""
+        # Prevent acting on configure events from child widgets
+        if event and event.widget != self.master:
+            return
         try:
+            if self.master.winfo_exists():
+                current_state = self.master.wm_state()
+                if current_state == 'normal':
+                    geo = self.master.geometry()
+                    # Avoid storing initial invalid geometry like '1x1+0+0'
+                    if 'x' in geo and '+' in geo and not geo.startswith('1x1'):
+                        self._last_normal_geometry = geo
+                        # print(f"Debug: Tracked normal geometry: {self._last_normal_geometry}") # Optional
+        except tk.TclError:
+            pass # Window might be closing or not ready
+
+
+    def save_window_geometry(self):
+        """
+        Saves the current window state and appropriate geometry.
+        If maximized, saves the last known normal geometry.
+        If normal, saves the current geometry.
+        """
+        geometry_string_to_save = None
+        state_to_save = "normal" # Default
+
+        try:
+            if not self.master.winfo_exists():
+                print("Window does not exist. Cannot save geometry.")
+                return
+
+            current_state = self.master.wm_state()
+            # Determine the state string ('maximized' or 'normal')
+            # Use 'zoomed' as the indicator for maximized state
+            is_maximized = (current_state == 'zoomed')
+            state_to_save = "maximized" if is_maximized else "normal"
+
+            print(f"Current window state detected: {current_state} -> Saving as: {state_to_save}")
+
+            # Decide which geometry string to use
+            if is_maximized and self._last_normal_geometry:
+                # Use the tracked normal geometry if maximized and we have it
+                geometry_string_to_save = self._last_normal_geometry
+                print(f"Using tracked normal geometry for save: {geometry_string_to_save}")
+            else:
+                # Use current geometry if normal, or as fallback if maximized
+                geometry_string_to_save = self.master.geometry()
+                print(f"Using current geometry for save: {geometry_string_to_save}")
+                # If we are saving the current geometry and the state is normal,
+                # ensure _last_normal_geometry is up-to-date.
+                if not is_maximized:
+                    self._last_normal_geometry = geometry_string_to_save
+
+            # --- Now parse the chosen geometry string ---
+            if not geometry_string_to_save or 'x' not in geometry_string_to_save or '+' not in geometry_string_to_save:
+                 print(f"Warning: Invalid geometry string '{geometry_string_to_save}'. Aborting save.")
+                 return
+
+            # Parse WxH+X+Y (handle potential negative coordinates correctly)
+            parts = geometry_string_to_save.replace('+', ' +').replace('-', ' -').split()
+            # Expected format: ['WxH', '+X', '+Y'] or ['WxH', '-X', '-Y'] etc.
+            if len(parts) != 3:
+                print(f"Warning: Could not parse geometry string '{geometry_string_to_save}'. Aborting save.")
+                return
+
+            size_part = parts[0]
+            x_part = parts[1]
+            y_part = parts[2]
+
+            w_part, h_part = size_part.split('x')
+
+            width = int(w_part)
+            height = int(h_part)
+            x = int(x_part) # Will include sign
+            y = int(y_part) # Will include sign
+
+            # --- Perform the save ---
+            if not os.path.exists("data"):
+                os.makedirs("data")
+
             with open("data/MMSelectorSize.txt", "w") as f:
                 f.write(f"{width}\n")
                 f.write(f"{height}\n")
                 f.write(f"{x}\n")
                 f.write(f"{y}\n")
-            print(f"Window geometry saved to MMSelectorSize.txt: {width}x{height}+{x}+{y}")
-        except Exception as e:
-            print(f"Error saving window geometry: {e}")
+                f.write(f"{state_to_save}\n") # Save the determined state
+            print(f"Window geometry saved: {width}x{height}+{x}+{y}, State: {state_to_save}")
 
+        except tk.TclError as e:
+             print(f"TCL Error saving window geometry (window might be closing): {e}")
+        except ValueError as e:
+             print(f"Value Error parsing geometry '{geometry_string_to_save}': {e}")
+        except Exception as e:
+            print(f"General Error saving window geometry: {e}")
+
+
+    # --- load_window_geometry remains the same ---
     def load_window_geometry(self):
-        """Loads the window geometry from MMSelectorSize.txt if it exists and is valid.
-        Returns saved geometry or default 800x600 centered on screen if loading fails. <--- MODIFIED DOCSTRING
+        """
+        Loads the window geometry and state from MMSelectorSize.txt.
+        Returns saved geometry/state or defaults if loading fails.
+        Returns: tuple: (width, height, x, y, state)
         """
         default_width = 1366
         default_height = 700
+        default_state = "normal"
 
         try:
             if os.path.exists("data/MMSelectorSize.txt"):
                 with open("data/MMSelectorSize.txt", "r") as f:
                     lines = f.readlines()
-                    if len(lines) == 4:
+                    if len(lines) == 5:
                         width = int(lines[0].strip())
                         height = int(lines[1].strip())
                         x = int(lines[2].strip())
                         y = int(lines[3].strip())
-                        print(f"Window geometry loaded from MMSelectorSize.txt: {width}x{height}+{x}+{y}")
-                        return width, height, x, y
-        except Exception as e:
-            print(f"Error loading window geometry: {e}")
+                        state = lines[4].strip().lower()
+                        if state not in ['maximized', 'normal']:
+                             state = default_state
+                        print(f"Window geometry loaded: {width}x{height}+{x}+{y}, State: {state}")
+                        return width, height, x, y, state
+                    else: print("Warning: MMSelectorSize.txt has incorrect number of lines.")
+            else: print("MMSelectorSize.txt not found.")
+        except ValueError: print("Error: Non-integer value found in MMSelectorSize.txt.")
+        except Exception as e: print(f"Error loading window geometry: {e}")
+
+        # Defaults
+        try:
+            screen_width = self.master.winfo_screenwidth(); screen_height = self.master.winfo_screenheight()
+            x = max(0, (screen_width // 2) - (default_width // 2)); y = max(0, (screen_height // 2) - (default_height // 2))
+        except tk.TclError: x, y = 0, 0 # Fallback if screen info fails
+        print(f"Returning DEFAULT geometry/state: {default_width}x{default_height}+{x}+{y}, State: {default_state}")
+        return default_width, default_height, x, y, default_state
 
 
-        # Calculate centered position for default geometry
-        screen_width = self.master.winfo_screenwidth() # Get screen width dynamically
-        screen_height = self.master.winfo_screenheight() # Get screen height dynamically
-        x = (screen_width // 2) - (default_width // 2)
-        y = (screen_height // 2) - (default_height // 2)
-
-        print(f"No valid geometry in MMSelectorSize.txt. Returning DEFAULT CENTERED geometry: {default_width}x{default_height}+{x}+{y}") # Debug print for default geometry
-        return default_width, default_height, x, y
-
-    def open_resize_window(self):
-        """Opens the Resize window, modal and flush with master."""
-        if hasattr(self, 'resize_window') and self.resize_window and self.resize_window.winfo_exists():
-            self.resize_window.focus_set()
-            return
-
-        self.resize_window = resize_window = tk.Toplevel(self.master)
-        resize_window.title("Resize")
-        resize_window.overrideredirect(False)
-        resize_window.tk.call('tk', 'scaling', 1.25)
-        resize_window.transient(self.master)
-        resize_window.grab_set()
-
-        icon_path = self.script_dir / "data/icon.png"
+    # --- apply_loaded_geometry remains the same ---
+    def apply_loaded_geometry(self):
+        """Loads geometry and applies it to the master window."""
 
 
-        if os.path.exists(icon_path):
-            icon_image = tk.PhotoImage(file=icon_path)
-            resize_window.iconphoto(False, icon_image)
-        else:
-            print(f"Icon file not found: {icon_path}")
+        if self.hide_main_grid_and_sidebar_start_passed == 1: # Check the number of times
+            print("DEBUG: apply_loaded_geometry - First call detected. Returning immediately.")
 
-        # Geometry and position same as details window (or main if details not open)
-        if self.details_window and not self.details_window_closed:
-            geometry_str = self.details_window.geometry()
-        else:
-            geometry_str = self.master.geometry()
-        resize_window.geometry(geometry_str)
+            return  # Exit function on first call
+        
 
-        # Transparent window - adjust alpha for desired transparency (25% more transparent than 0.8)
-        resize_window.attributes('-alpha', 0.8 * 0.75) # 25% more transparent
+        try:
+            width, height, x, y, state = self.load_window_geometry()
+            # Apply normal geometry first regardless of saved state
+            self.master.geometry(f"{width}x{height}+{x}+{y}")
+            print(f"Applied base geometry: {width}x{height}+{x}+{y}")
+            # Store this as the potential last normal geometry if loading defaults
+            # or if the loaded state was normal.
+            if state == "normal":
+                 self._last_normal_geometry = f"{width}x{height}+{x}+{y}"
 
-        # Function to update resize label text
-        def update_resize_label_text():
-            width = resize_window.winfo_width()
-            height = resize_window.winfo_height()
-            self.resize_label.config(text=f"Resize to\n{width} (Width)\n{height} (Height)\n\nDrag the edges of this window to the match the desired\nheight/width of the window then click here to resize. \nClosing this window cancels resizing.\nClicking here to resize will restart the application.")
-
-        # Label in the middle, bigger font, orange hover, INITIAL TEXT with dimensions
-        initial_width = resize_window.winfo_width()
-        initial_height = resize_window.winfo_height()
-        resize_label = self.resize_label = tk.Label(resize_window, text=f"Resize to {initial_width} (Width) X {initial_height} (Height)", font=("Segoe UI", 30, "bold"), bg=resize_window.cget('bg'), cursor="hand2") # Bigger font, hand2 cursor
-        resize_label.pack(expand=True, fill='both')
-
-        # Hover effect
-        def on_resize_hover_enter(event):
-            resize_label.config(fg="black")
-
-            resize_window.update_idletasks() # Force Resize window to update
-            resize_width = resize_window.winfo_width()
-            resize_height = resize_window.winfo_height()
-            resize_x_root = resize_window.winfo_rootx()
-            resize_y_root = resize_window.winfo_rooty()
-            resize_x_local = resize_window.winfo_x()
-            resize_y_local = resize_window.winfo_y()
-
-            # --- NEW: Minimum width and height and SNAP BACK ---
-            min_width = 1348
-            min_height = 600
-            original_resize_width = resize_width  # Store original size before clamping
-            original_resize_height = resize_height
-            resize_width = max(resize_width, min_width) # Ensure width is at least min_width
-            resize_height = max(resize_height, min_height) # Ensure height is at least min_height
-
-            if original_resize_width < min_width or original_resize_height < min_height:
-                # Snap resize window back to minimum size
-                resize_window.geometry(f"{min_width}x{min_height}+{resize_x_root}+{resize_y_root}") # Snap Resize window back
-                update_resize_label_text() # Update label text to reflect snapped size
-                print("Resize window snapped back to minimum size: 1348x600") # Debug message - snap back
-
-            # --- NEW: Minimum width and height and SNAP BACK --
+            # Apply maximized state if needed, after a delay
+            if state == "maximized":
+                def set_maximized_state():
+                    try:
+                        if self.master.winfo_exists():
+                            print("Attempting to set state to 'zoomed'...")
+                            self.master.wm_state('zoomed')
+                            # Check state? self.master.update_idletasks(); print(self.master.wm_state())
+                    except tk.TclError as e: print(f"Error setting maximized state: {e}")
+                self.master.after(100, set_maximized_state) # Increased delay slightly
+        except Exception as e: print(f"Error applying loaded geometry: {e}")
 
 
-        def on_resize_hover_leave(event):
-            resize_label.config(fg="black") # Or whatever default fg is, setting to black for now
-
-        resize_label.bind("<Enter>", on_resize_hover_enter)
-        resize_label.bind("<Leave>", on_resize_hover_leave)
-
-        # Click event to resize and close
-        def on_resize_click(event):
-            resize_window.update_idletasks() # Force Resize window to update
-            resize_width = resize_window.winfo_width()
-            resize_height = resize_window.winfo_height()
-            resize_x_root = resize_window.winfo_rootx()
-            resize_y_root = resize_window.winfo_rooty()
-            resize_x_local = resize_window.winfo_x()
-            resize_y_local = resize_window.winfo_y()
-
-            # Calculate decoration offsets
-            offset_x = resize_x_root - resize_x_local
-            offset_y = resize_y_root - resize_y_local
-
-            corrected_resize_x = resize_x_root - offset_x
-            corrected_resize_y = resize_y_root - offset_y
 
 
-            # --- NEW: Minimum width and height and SNAP BACK ---
-            min_width = 1348
-            min_height = 600
-            original_resize_width = resize_width  # Store original size before clamping
-            original_resize_height = resize_height
-            resize_width = max(resize_width, min_width) # Ensure width is at least min_width
-            resize_height = max(resize_height, min_height) # Ensure height is at least min_height
 
-            if original_resize_width < min_width or original_resize_height < min_height:
-                # Snap resize window back to minimum size
-                resize_window.geometry(f"{min_width}x{min_height}+{resize_x_root}+{resize_y_root}") # Snap Resize window back
-                update_resize_label_text() # Update label text to reflect snapped size
-                print("Resize window snapped back to minimum size: 1348x600") # Debug message - snap back
-
-            # --- NEW: Minimum width and height and SNAP BACK --
-            
-
-
-            master_width_before = self.master.winfo_width() # Get master window size BEFORE geometry change
-            master_height_before = self.master.winfo_height()
-            master_x_before = self.master.winfo_rootx()    # Get master window position BEFORE
-            master_y_before = self.master.winfo_rooty()
-
-            print("--- Before Geometry Change ---") # Debugging section
-            print(f"Resize Window Geometry - Width: {resize_width}, Height: {resize_height}, Root X: {resize_x_root}, Root Y: {resize_y_root}, Local X: {resize_x_local}, Local Y: {resize_y_local}") # DEBUG PRINT
-            print(f"Offsets - Offset X: {offset_x}, Offset Y: {offset_y}") # DEBUG PRINT - Offsets
-            print(f"Corrected Resize Position - X: {corrected_resize_x}, Y: {corrected_resize_y}") # DEBUG PRINT - Corrected Position
-            print(f"Master Window Geometry (Before) - Width: {master_width_before}, Height: {master_height_before}, X: {master_x_before}, Y: {master_y_before}")
-
-            '''
-            self.master.geometry(f"{resize_width}x{resize_height}+{corrected_resize_x}+{corrected_resize_y}") # Apply size AND CORRECTED position
-
-            self.master.update_idletasks() # Process any pending tasks
-            self.master.update() # Force immediate update of master window
-            self.master.focus_set() # Ensure Master window gets focus after resize
-
-            master_width_after = self.master.winfo_width()  # Get master window size AFTER geometry change
-            master_height_after = self.master.winfo_height()
-            master_x_after = self.master.winfo_rootx()     # Get master window position AFTER
-            master_y_after = self.master.winfo_rooty()
-
-            print("--- After Geometry Change ---") # Debugging section
-            print(f"Master Window Geometry (After) - Width: {master_width_after}, Height: {master_height_after}, X: {master_x_after}, Y: {master_y_after}")
-            print("--- Geometry Change Completed ---")
-            '''
-
-            # Save geometry and restart
-            self.save_window_geometry(resize_width, resize_height, corrected_resize_x, corrected_resize_y)
-
-
-            self.save_settings()
-
-            self.restart_script() # Call restart function after saving 
-    
-
-        resize_label.bind("<Button-1>", on_resize_click)
-
-        # Bind <Configure> event to update label on resize
-        resize_window.bind("<Configure>", lambda event: update_resize_label_text())
-
-        # Store initial master window size
-        self.initial_master_width = self.master.winfo_width()
-        self.initial_master_height = self.master.winfo_height()
-
-        resize_window.protocol("WM_DELETE_WINDOW", self.on_resize_window_cancel)
-   
-    def on_resize_window_cancel(self):
-        """Handles closing the Resize window without resizing master, previously on_resize_window_close."""
-        if self.resize_window:
-            self.resize_window.destroy()
-            self.resize_window = None
-
-   
 
     def manual_gc_collect(self):
         """
@@ -9069,9 +11447,33 @@ class ConfigViewerApp:
 
     #@profile 
     def format_grouped_data(self, data_list):
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- load_image_item_search_results CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
         print("\n--- format_grouped_data() DEBUG ENTRY ---")
         print(f"DEBUG: format_grouped_data - self.sort_by_install_date: {self.sort_by_install_date}")
         print(f"DEBUG: format_grouped_data - self.collapse_categories_by_default: {self.collapse_categories_by_default}")
+
+        #scanning_win = None  # Initialize scanning_win
+
+        #scanning_win = self.show_scanning_window(text="Processing data...")
+
 
         grouped = {}
         zip_creation_times = {}
@@ -9082,6 +11484,7 @@ class ConfigViewerApp:
             for item in data_list:
                 zip_file = item[2]
                 folder_name = item[4]
+
                 if zip_file != "user_custom_configs":
                     if not zip_file.lower().endswith(".zip"):
                         zip_file_name = zip_file + ".zip"
@@ -9219,8 +11622,13 @@ class ConfigViewerApp:
             )
             grouped = {category: grouped[category] for category in sorted_categories}
 
+
+        #if scanning_win:
+        #    scanning_win.destroy()
+            
+        print("--- format_grouped_data() DEBUG EXIT ---\n")  
         return grouped
-        print("--- format_grouped_data() DEBUG EXIT ---\n")
+
  
 
 
@@ -9276,8 +11684,11 @@ class ConfigViewerApp:
             self.categorize_button.config(text="Categorize by: Type")
 
         self.grouped_data = self.format_grouped_data(self.data)
+        print("    toggle_categorization_mode is calling self.update_grid_layout()")
         self.update_grid_layout()
         self.canvas.yview_moveto(0)
+
+        print("    toggle_categorization_mode is calling self.perform_search()")
         self.perform_search()
         self.canvas.yview_moveto(0)
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
@@ -9295,12 +11706,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot adjust category visibility while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
 
         button = self.category_list_button
@@ -9311,7 +11724,7 @@ class ConfigViewerApp:
         self.category_list_dropdown_window = dropdown_window = tk.Toplevel(self.master)
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
-        dropdown_window.geometry(f"+{button_x}+{button_y - 208}")
+        #dropdown_window.geometry(f"+{button_x}+{button_y - 208}")
         dropdown_window.config(bg="#333333")
         dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
 
@@ -9402,7 +11815,7 @@ class ConfigViewerApp:
                     button_text = category_vars[category].get()
 
                     cat_button = tk.Button(scrollable_frame, textvariable=category_vars[category],
-                                           font=("Segoe UI", 10, "bold"),
+                                           font=("Segoe UI", 10+self.font_size_add, "bold"),
                                            command=lambda cat=category: toggle_category_in_dropdown(cat),
                                            bg="#555555", fg="white", relief=tk.FLAT, bd=1, anchor="w", padx=10)
 
@@ -9454,6 +11867,7 @@ class ConfigViewerApp:
                     self.category_hidden_states[category] = True
                 elif category_vars[category].get().endswith(" (Shown - Pending)"):
                     self.category_hidden_states[category] = False
+            print("    apply_category_visibility  is calling self.update_grid_layout() - inner function of apply_category_visibility()")       
             self.update_grid_layout()
             dropdown_window.destroy()
             self.category_list_dropdown_window = None
@@ -9462,16 +11876,16 @@ class ConfigViewerApp:
         button_frame.pack(fill="x", side="bottom")
 
         search_query_var = tk.StringVar()
-        search_entry = tk.Entry(button_frame, textvariable=search_query_var, font=("Segoe UI", 10), bg="white", fg="black")
+        search_entry = tk.Entry(button_frame, textvariable=search_query_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black")
         search_entry.pack(pady=2, fill="x")
 
         search_entry.bind("<KeyRelease>", lambda event: update_category_buttons(search_query_var.get()))
         search_entry.bind("<KeyRelease>", lambda event, canvas=canvas: canvas.yview_moveto(0), add='+')
 
 
-        hide_all_button = tk.Button(button_frame, text="Hide All", font=("Segoe UI", 10, "bold"), command=hide_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
-        show_all_button = tk.Button(button_frame, text="Show All", font=("Segoe UI", 10, "bold"), command=show_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
-        apply_button = tk.Button(button_frame, text="Apply", font=("Segoe UI", 10, "bold"), command=apply_category_visibility, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
+        hide_all_button = tk.Button(button_frame, text="Hide All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=hide_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
+        show_all_button = tk.Button(button_frame, text="Show All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=show_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
+        apply_button = tk.Button(button_frame, text="Apply", font=("Segoe UI", 10+self.font_size_add, "bold"), command=apply_category_visibility, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
 
         hide_all_button.pack(fill="x", pady=2, in_=button_frame)
         show_all_button.pack(fill="x", pady=2, in_=button_frame)
@@ -9479,6 +11893,16 @@ class ConfigViewerApp:
 
 
         update_category_buttons() # Call update_category_buttons initially to populate list
+
+        # Force update to calculate window size based on content
+        dropdown_window.update_idletasks()
+        # Get the actual height of the dropdown window
+        window_height = dropdown_window.winfo_height()
+        # Calculate the target Y position (top edge of button minus window height)
+        target_y = button_y - window_height
+        # Set the final position
+        dropdown_window.geometry(f"+{button_x}+{target_y}")
+
 
         dropdown_window.bind("<FocusOut>", lambda event: self.destroy_category_list_dropdown())
 
@@ -9493,19 +11917,81 @@ class ConfigViewerApp:
 
     def toggle_sort_by_install_date(self):
         """Toggles the 'Sort by Install Date' setting, updates UI, and saves setting.""" # Modified docstring
+
+
+        if self.items_to_be_hidden:
+            print("--- self.items_to_be_hidden = True ---\n")
+
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text="Cannot adjust this setting while there are pending hidden vehicles.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
+
+        if self.search_results_window:
+
+            scanning_win = self.show_scanning_window(text="This setting will take effect when search or filtering is no longer active.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+
+
+
         print(f"toggle_sort_by_install_date - BEFORE toggle: self.sort_by_install_date = {self.sort_by_install_date}") # Debugging print
         self.sort_by_install_date = not self.sort_by_install_date
         print(f"toggle_sort_by_install_date - AFTER toggle: self.sort_by_install_date = {self.sort_by_install_date}") # Debugging print
         # Removed button text update as button is no longer in top_frame
         # --- MODIFIED: Re-group and re-sort based on the *current* self.data ---
+
+
         self.grouped_data = self.format_grouped_data(self.data) # Re-group and re-sort
-        self.update_grid_layout()
-        self.canvas.yview_moveto(0)
-        self.perform_search()
-        self.canvas.yview_moveto(0)
-        self._update_filters_label_status()
+        if not self.is_search_results_window_active:
+
+            print("    toggle_sort_by_install_date is calling self.update_grid_layout()")
+            self.update_grid_layout()
+            self.canvas.yview_moveto(0)
+            print("    toggle_sort_by_install_date is calling self.perform_search()")
+            self.perform_search()
+            self.canvas.yview_moveto(0)
+            self._update_filters_label_status()
+
+        if self.is_search_results_window_active:
+            self.delayed_sort_by_install_date = True
+            print(f"toggle_sort_by_install_date - the search results window was OPEN, therefore delaying the visual refresh until the search results window is destroyed")
+            print(f" --- therefore for the flag has been set - self.delayed_sort_by_install_date = True")
+
         self.update_settings_dropdown_button_text() # Call function to update button text
         self.save_settings() # Save setting to file - ADDED
+
+
+
+    def trigger_toggle_sort_by_install_date_after_search_results_window_close(self):
+        if self.delayed_sort_by_install_date:
+            self.delayed_sort_by_install_date = False
+            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close ENTRY - self.delayed_sort_by_install_date = True")
+            print("    trigger_toggle_sort_by_install_date_after_search_results_window_close is calling self.update_grid_layout()")
+            self.update_grid_layout()
+            self.canvas.yview_moveto(0)
+
+            print("    trigger_toggle_sort_by_install_date_after_search_results_window_close is calling self.perform_search()")
+            self.perform_search()
+            self.canvas.yview_moveto(0)
+            self._update_filters_label_status()
+
+            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close EXIT - self.delayed_sort_by_install_date = False")
+        else:
+            return
 
 
 
@@ -9729,7 +12215,7 @@ class ConfigViewerApp:
 
         self.data = filtered_data
         self.grouped_data = self.format_grouped_data(self.data)
-        self.update_grid_layout()
+        #self.update_grid_layout()
         self.canvas.yview_moveto(0)
         self.update_search_results_window_ui() # <----- ADD THIS LINE HERE
 
@@ -9772,7 +12258,7 @@ class ConfigViewerApp:
     def _create_bodystyle_dropdown_content(self, scrollable_frame, dynamic_bodystyle_options, button, dropdown_window, canvas):
         """Creates the content of the bodystyle dropdown: search entry and options, ensuring 'All BodyStyles' is always first."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -9842,7 +12328,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option, fname="bodystyle": self._on_bodystyle_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window), # Call _on_bodystyle_dropdown_button_click
                 borderwidth=1,
                 relief="solid",
@@ -9951,25 +12437,62 @@ class ConfigViewerApp:
     def _reset_sidebar_filters_on_search(self):
         """Resets sidebar filters to 'All...' when a search is initiated."""
         print("    _reset_sidebar_filters_on_search()")
+
+        # 1. Repopulate FIRST to create the new buttons based on fresh data
+        #    This assumes _repopulate_sidebar_dropdowns_on_reset handles destroying
+        #    the old frame and creating the new one with buttons in self.sidebar_filter_buttons
+        print("    DEBUG: Calling _repopulate_sidebar_dropdowns_on_reset() first...")
+        self._repopulate_sidebar_dropdowns_on_reset()
+        print("    DEBUG: _repopulate_sidebar_dropdowns_on_reset() returned.")
+
+        # 2. Now configure the NEWLY created buttons
         if hasattr(self, 'sidebar_filter_buttons') and self.sidebar_filter_buttons:
-            print("    DEBUG: Search Started - Resetting Sidebar Filters to 'All...'")
-            filter_names = ["Brand", "Name", "Bodystyle", "Country", "Author", "Type"]
+            print("    DEBUG: Configuring NEW sidebar filter buttons to 'All...'")
+            filter_names = ["Brand", "Name", "Bodystyle", "Country"] # Only configure existing ones
             for filter_name in filter_names:
                 button = self.sidebar_filter_buttons.get(filter_name)
                 if button:
-                    all_text = f"All {filter_name}s" if filter_name in ["Bodystyle", "Type"] else f"All {filter_name}s" if filter_name != "Name" else "All Names"
-                    button.config(text=all_text)
-                    print(f"      DEBUG: Resetting {filter_name} filter button to '{all_text}'")
-            self._repopulate_sidebar_dropdowns_on_reset()
+                    # Determine the "All..." text based on the filter name
+                    if filter_name == "Brand": all_text = "All Brands"
+                    elif filter_name == "Name": all_text = "All Names"
+                    elif filter_name == "Bodystyle": all_text = "All BodyStyles"
+                    elif filter_name == "Country": all_text = "All Countries"
+                    else: all_text = f"All {filter_name}s" # Fallback
+
+                    # --- Check if button widget still exists before configuring ---
+                    try:
+                        if button.winfo_exists():
+                            button.config(text=all_text)
+                            print(f"      DEBUG: Configured NEW {filter_name} button to '{all_text}'")
+                        else:
+                            print(f"      WARN: NEW {filter_name} button widget does not exist after repopulate. Skipping config.")
+                    except tk.TclError as e:
+                        print(f"      ERROR: TclError configuring NEW {filter_name} button: {e}")
+
+                else:
+                    print(f"    WARN: Button for '{filter_name}' not found in self.sidebar_filter_buttons AFTER repopulate.")
         else:
-            print("    Warning: sidebar_filter_buttons not initialized yet. Skipping sidebar filter reset in perform_search.")
+            print("    Warning: sidebar_filter_buttons not initialized AFTER repopulate. Cannot configure buttons.")
 
     def _repopulate_sidebar_dropdowns_on_reset(self):
-        """Repopulates dynamic dropdown options after sidebar filter reset."""
-        print("    _repopulate_sidebar_dropdowns_on_reset()")
-        print("    DEBUG: Repopulating dynamic dropdown options after filter reset (Search Start)...")
-        self.setup_sidebar_filter_dropdowns(self.sidebar_bottom_frame, 10)
-        print("    DEBUG: Dynamic dropdown options repopulated (Search Start).")
+        print("      _repopulate_sidebar_dropdowns_on_reset()")
+        # Destroy the existing frame containing the dropdowns
+        if hasattr(self, 'sidebar_filter_dropdowns_frame') and self.sidebar_filter_dropdowns_frame and self.sidebar_filter_dropdowns_frame.winfo_exists():
+            print("        Destroying existing sidebar_filter_dropdowns_frame...")
+            self.sidebar_filter_dropdowns_frame.destroy()
+            self.sidebar_filter_dropdowns_frame = None
+            self.sidebar_filter_buttons = {} # Clear button references as they are destroyed with the frame
+        else:
+            print("        No existing sidebar_filter_dropdowns_frame found to destroy.")
+
+        # Re-create the dropdowns (this will call _add_filter_dropdown_elements again)
+        print("        Calling create_sidebar_filter_dropdowns to recreate...")
+        # Ensure sidebar_bottom_frame exists
+        if hasattr(self, 'sidebar_bottom_frame') and self.sidebar_bottom_frame and self.sidebar_bottom_frame.winfo_exists():
+            self.create_sidebar_filter_dropdowns(self.sidebar_bottom_frame, 10)
+            print("        create_sidebar_filter_dropdowns finished.")
+        else:
+            print("        ERROR: Cannot recreate dropdowns, sidebar_bottom_frame does not exist.")
 
     def _perform_item_search(self, query, item):
         """Performs the actual search logic for a single item based on search mode."""
@@ -10263,6 +12786,8 @@ class ConfigViewerApp:
         print("    Calling self.format_grouped_data() ...")
         self.grouped_data = self.format_grouped_data(self.data)
         print("    self.format_grouped_data() RETURNED.")
+
+        print("    _update_search_results_ui is calling self.update_grid_layout()")
         self.update_grid_layout()
         self.canvas.yview_moveto(0)
         item_count = len(final_list)
@@ -10270,7 +12795,6 @@ class ConfigViewerApp:
         self._update_filters_label_status()
 
 
-    #@profile 
     def perform_search(self):
         
         print("\n--- ConfigViewerApp.perform_search() ENTRY ---")
@@ -10281,12 +12805,25 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot search while there are pending hidden vehicles.")
-            time.sleep(3.125)
+
+            self.search_var.set("")
+            print("\n--- canceling ConfigViewerApp.perform_search() ---")
+
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
+
+
+        if self.skip_perform_search:
+            print("\n--- self.skip_perform_search evaluated to TRUE, not executing perform_search")
+            print("\n--- canceling ConfigViewerApp.perform_search() ---")
+            return
 
         self._initialize_search_attributes()
         self._reset_sidebar_filters_on_search()
@@ -10312,9 +12849,16 @@ class ConfigViewerApp:
         print(f"  DEBUG: perform_search - self.filter_state == 0 (View All): {self.filter_state == 0}")
         print(f"  DEBUG: perform_search - not self.is_data_subset_active (Global Filters OFF): {not self.is_data_subset_active}")
 
+
+
+
+
+
         if not query and self.filter_state == 0 and not self.is_data_subset_active:
             print("  DEBUG: perform_search - Condition MET for Search Results window DESTRUCTION.") # Debug - Condition Met
             if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
+
+                  
                 self.destroy_search_results_window()
                 self.search_results_window = None
                 self.is_search_results_window_active = False
@@ -10327,6 +12871,8 @@ class ConfigViewerApp:
             self.filter_button.config(text=f"{current_filter} [{item_count}]")
             self._update_filters_label_status()
             self.update_search_results_window_ui() # Update search results window if open
+            
+            self.trigger_toggle_sort_by_install_date_after_search_results_window_close()
             print("--- ConfigViewerApp.perform_search() EXIT - Skipped Layout Update AND Destroyed Search Results Window ---\n")
             return  # Exit here, skipping full layout update and destroying search results window
         # --- MODIFICATION END: Check for empty query AND "View All" filter AND GLOBAL FILTERS OFF to close search results window ---
@@ -10348,7 +12894,7 @@ class ConfigViewerApp:
 
         if query:
             if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
-                self.search_results_window = self._create_search_results_window(final_list)
+                self.search_results_window = self.show_search_results_window(final_list)
                 print("DEBUG: perform_search - Search Results window CREATED. is_search_results_window_active set to TRUE")
 
             self.search_results_window.lift()
@@ -10367,6 +12913,10 @@ class ConfigViewerApp:
 
         print(f"DEBUG: perform_search - final_list (count): {len(final_list)}") # <-- ADD THIS LINE
 
+
+
+
+        print(f"DEBUG: perform_search - calling _update_search_results_ui")
         self._update_search_results_ui(final_list, current_filter)
         self.update_search_results_window_ui()
         self.master.after(50, self.inherit_category_visibility_search_results)
@@ -10387,10 +12937,32 @@ class ConfigViewerApp:
     ##############################################################
 
 
-    def _create_search_results_window(self, final_list=None):
+
+    def show_search_results_window(self, final_list=None):
         """Creates and configures the Search Results window with smooth scrolling and dynamic resizing.
         MODIFIED to include CUSTOM SCROLLBAR for search results window.
         """
+ 
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- destroy_search_results_window() CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+        self.search_results_window_on_screen = True
+
 
         self.canvas.yview_moveto(0) # Reset main grid scroll to top
 
@@ -10457,9 +13029,9 @@ class ConfigViewerApp:
         data_to_populate = final_list # Use final_list if provided
         if data_to_populate is None:
             data_to_populate = self.search_results_data # Fallback to last search results if final_list is None
-            print("DEBUG: _create_search_results_window - Using self.search_results_data for population (final_list was None).") # Debug
+            print("DEBUG: show_search_results_window - Using self.search_results_data for population (final_list was None).") # Debug
         else:
-            print("DEBUG: _create_search_results_window - Using provided final_list for population.") # Debug
+            print("DEBUG: show_search_results_window - Using provided final_list for population.") # Debug
 
 
         if hasattr(self, 'search_results_scrollable_frame') and self.search_results_scrollable_frame:
@@ -10547,6 +13119,30 @@ class ConfigViewerApp:
         
         
     def destroy_search_results_window(self):
+
+
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- destroy_search_results_window() CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+        if self.filter_state != 0:
+            print("    destroy_search_results_window() - filter_state != 0, not destroying search results window.")
+            return # Don't destroy if filter is not "View All"
+
         if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
             self.search_results_window.destroy()
             self.search_results_window = None
@@ -10558,6 +13154,56 @@ class ConfigViewerApp:
                 self.categorize_button.config(state=tk.NORMAL, **button_style_args)
             if hasattr(self, 'category_list_button'):
                 self.category_list_button.config(state=tk.NORMAL, **button_style_args)
+
+            #if self.window_was_resized and self.filter_state == 0 and not self.search_var.get().strip() and not self.is_data_subset_active and self.all_filters_all:
+            
+            self.search_results_window_on_screen = False
+
+
+            if self.window_size_changed_during_search_results_window:
+                self.master.after(1000, self.condcheck())
+
+            
+            #self.trigger_toggle_sort_by_install_date_after_search_results_window_close()
+
+
+
+
+
+
+    def condcheck(self):
+
+        self.window_size_changed_during_search_results_window = False
+
+        if self.filter_state != 0 or  self.search_var.get().strip() or self.is_data_subset_active or not self.all_filters_all:
+            print(f"cond check not met, not updating the grid, a search results window is open and we don't want to update the grid layout under it?")
+
+            print("DEBUG: Checking condition to update grid layout after search results close:")
+            #print(f"  DEBUG COND CHECK 1: self.window_size_changed_during_search_results_window = {self.window_size_changed_during_search_results_window}")
+            print(f"  DEBUG COND CHECK 2: self.filter_state == 0 (Actual Value: {self.filter_state}) = {self.filter_state == 0}")
+            # For the 'not search_var...' part, let's check the intermediate value too
+            search_text_value = self.search_var.get().strip()
+            print(f"  DEBUG COND CHECK 3: not self.search_var.get().strip() (Actual Text: '{search_text_value}') = {not search_text_value}")
+            print(f"  DEBUG COND CHECK 4: not self.is_data_subset_active (Actual Value: {self.is_data_subset_active}) = {not self.is_data_subset_active}")
+            print(f"  DEBUG COND CHECK 5: self.all_filters_all = {self.all_filters_all}")
+
+
+        else:
+            print(f"cond check met, updating the grid")
+            print("DEBUG: Checking condition to update grid layout after search results close:")
+            #print(f"  DEBUG COND CHECK 1: self.window_size_changed_during_search_results_window = {self.window_size_changed_during_search_results_window}")
+            print(f"  DEBUG COND CHECK 2: self.filter_state == 0 (Actual Value: {self.filter_state}) = {self.filter_state == 0}")
+            # For the 'not search_var...' part, let's check the intermediate value too
+            search_text_value = self.search_var.get().strip()
+            print(f"  DEBUG COND CHECK 3: not self.search_var.get().strip() (Actual Text: '{search_text_value}') = {not search_text_value}")
+            print(f"  DEBUG COND CHECK 4: not self.is_data_subset_active (Actual Value: {self.is_data_subset_active}) = {not self.is_data_subset_active}")
+            print(f"  DEBUG COND CHECK 5: self.all_filters_all = {self.all_filters_all}")
+
+
+            print("    destroy_search_results_window is calling self.update_grid_layout() - after 500ms")
+            print("    because this condition was met ")
+            self.master.after(100, self.update_grid_layout) 
+
 
 
     def inherit_category_visibility_search_results(self):
@@ -10640,17 +13286,38 @@ class ConfigViewerApp:
     def update_search_results_window_geometry(self, event=None):
         """Updates the size and position of the search results window based on the main window."""
         if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
+            self.master.update_idletasks() # Force update of master window state
+
+
             # Get master window position and dimensions
             master_x = self.master.winfo_rootx()
             master_y = self.master.winfo_rooty()
             master_width = self.master.winfo_width()
             master_height = self.master.winfo_height()
 
+
+
+            if self.font_size_add == 0:
+                new_window_height = master_height - 100 # <--- CONTROLS HEIGHT \  To make the search results window taller, decrease
+                new_window_y = master_y + 50 # <--- CONTROLS VERTICAL OFFSET/POSITION  \ to move the search results window down, increase
+
+            elif self.font_size_add == 2:
+                new_window_height = master_height - 120
+                new_window_y = master_y + 60
+
+            elif self.font_size_add == 4:
+                new_window_height = master_height - 130 
+                new_window_y = master_y + 65 
+
+
             # Calculate new window position and size
-            new_window_width = master_width - 310 # Same calculation as before
-            new_window_height = master_height - 100 # Same calculation as before
+            new_window_width = master_width - 310
+
             new_window_x = master_x
-            new_window_y = master_y + 50
+
+
+
+
 
             # Apply new geometry
             self.search_results_window.geometry(f"{new_window_width}x{new_window_height}+{new_window_x}+{new_window_y}")
@@ -10680,6 +13347,27 @@ class ConfigViewerApp:
         This function is called whenever self.data changes and the search results window is active.
         MODIFIED: Added check for window and scrollable frame existence at start.
         """
+
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- lupdate_search_results_window_ui CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+
         # --- MODIFICATION START: Check if window and scrollable_frame exist ---
         if not hasattr(self, 'search_results_window') or not getattr(self, 'search_results_window', None) or not self.search_results_window.winfo_exists(): # <-- Corrected check
             print("DEBUG: update_search_results_window_ui - Search Results window does not exist, skipping UI update.")
@@ -10703,35 +13391,296 @@ class ConfigViewerApp:
             
 
     def load_image_item_search_results(self, item, category_subframe, category):
-        """Loads and displays an image item in the search results window, similar to main grid."""
-        # Extract item details (same as in main grid)
+        """
+        (EDITED) Creates the placeholder frame for an item in the search results window
+        and submits the data loading/processing task to a worker thread.
+        """
+        # --- Start: Keep original logic for item details extraction ---
+
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- load_image_item_search_results CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+
+
+        # --- Unpack item data ---
+        picture_path, spawn_cmd, zip_file, info_data, folder_name = (None,) * 5 # Initialize
         if isinstance(item, dict) and 'configs' in item:
-            config = item['configs'][0]  # Adjust if necessary
-            picture_path, spawn_cmd, zip_file, info_data, folder_name = config
-        else:
+            if item['configs']: config = item['configs'][0]; picture_path, spawn_cmd, zip_file, info_data, folder_name = config
+            else: print(f"Warning: Item dict empty 'configs'..."); return
+        elif isinstance(item, (list, tuple)) and len(item) == 5:
             picture_path, spawn_cmd, zip_file, info_data, folder_name = item
+        else: print(f"Warning: Unexpected item format..."); return
+        # --- End Unpack ---
+
+        # --- ADDED: Determine brand_for_main and name_for_main HERE (Main Thread) ---
+        # Mirror the logic from create_main_item_widgets
+        brand_for_main = info_data.get("Brand", "Unknown")
+        if not brand_for_main.strip(): brand_for_main = "Unknown"
+        type_for_main = info_data.get("Type", "Unknown")
+        if not type_for_main.strip(): type_for_main = "Unknown"
+        if brand_for_main == "Unknown": brand_for_main = type_for_main
+
+        name_for_main = info_data.get("Name")
+        if not name_for_main or not name_for_main.strip():
+            # Fallback: Extract from spawn_cmd if Name is missing/empty
+            extracted_name = self.extract_name_from_spawn_command(spawn_cmd)
+            name_for_main = extracted_name if extracted_name else folder_name # Use folder_name as final fallback
+
+
 
         # Retrieve current image count for the category in search results window
+        # Make sure self.image_counts_search_results and self.columns_search_results exist and are populated
+        if not hasattr(self, 'image_counts_search_results'): self.image_counts_search_results = {}
+        if not hasattr(self, 'columns_search_results') or not self.columns_search_results:
+            print("Warning: self.columns_search_results not set in load_image_item_search_results. Using fallback.")
+            self.columns_search_results = (4,) # Example fallback
+
         count = self.image_counts_search_results.get(category, 0)
         row = count // self.columns_search_results[0]
         col = count % self.columns_search_results[0]
 
-        item_frame = tk.Frame(category_subframe, bg="#444444")
-        item_frame.grid(row=row, column=col, padx=self.column_padding_search_results, pady=5, sticky="n")
+        # Create the placeholder container frame (Main Thread - SAFE)
+        # Ensure category_subframe is valid
+        if not category_subframe.winfo_exists():
+            print(f"Warning: category_subframe for category '{category}' destroyed before item frame creation.")
+            return
+
+        item_frame = tk.Frame(category_subframe, bg="#444444") # Keep background
+        item_frame.grid(row=row, column=col, padx=self.column_padding_search_results, pady=5, sticky="n") # Use search results padding
 
         # Increment the image count for the category in search results window
-        self.image_counts_search_results[category] += 1
+        self.image_counts_search_results[category] = count + 1 # More direct increment
 
-        # Load and display the image (reusing main grid's image loading function)
+        # --- MODIFIED: Submit data needed for label generation to the worker ---
         self.executor.submit(
-            self.load_and_display_image_search_results, # Use a new function for search results images
-            picture_path,
-            item_frame,
+            self._load_image_data_worker_search, # Call the NEW worker function
+            item_frame,          # Parent frame for UI update
+            picture_path,        # Original picture path
             zip_file,
             spawn_cmd,
-            info_data,
-            folder_name
+            info_data,           # Pass original info_data (might be needed for other things)
+            folder_name,         # Original folder_name
+            # --- NEW ARGUMENTS ---
+            brand_for_main,      # Determined brand for label
+            name_for_main,       # Determined name for label
+            self.show_folder_settings # Current state of the flag
+            # --- END NEW ARGUMENTS ---
         )
+
+
+
+    def _load_image_data_worker_search(self, parent_frame, picture_path, zip_file,
+                                  spawn_cmd, info_data, folder_name, # Original args
+
+                                  brand_for_main, name_for_main, show_folder_flag):
+        """
+        (NEW - Worker Thread) Loads image data, prepares label text.
+        Does NOT interact with Tkinter directly except to schedule the UI update.
+        """
+        pil_image = None
+        label_text = "Error" # Default label on error
+
+        try:
+            # --- Image Loading ---
+            if picture_path and os.path.exists(picture_path):
+                try:
+                    img = Image.open(picture_path).convert("RGBA")
+                    img = img.resize((250, 140), self.RESAMPLE_FILTER)
+                    pil_image = img.copy()
+                except Exception as e_img: pil_image = None
+            else: pil_image = None
+            if pil_image is None:
+                try:
+                    placeholder_path = self.DEFAULT_IMAGE_PATH
+                    if zip_file == "user_custom_configs": placeholder_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
+                    if os.path.exists(placeholder_path):
+                        img = Image.open(placeholder_path).convert("RGBA")
+                        img = img.resize((250, 140), self.RESAMPLE_FILTER)
+                        pil_image = img.copy()
+                    else: pil_image = Image.new("RGBA", (250, 140), (70, 70, 70, 255))
+                except Exception as e_placeholder: pil_image = Image.new("RGBA", (250, 140), (50, 50, 50, 255))
+            # --- End Image Loading ---
+
+            # --- REVISED Label Text Preparation ---
+            # Use the exact same logic as the main grid, using passed arguments
+            if not show_folder_flag:
+                label_text = f"{brand_for_main} - {name_for_main}"
+            else: # show_folder_flag is True
+                label_text = f"{brand_for_main} - {name_for_main} - [{folder_name}]"
+            # --- END REVISED Label Text ---
+
+
+            parent_frame.after(0, lambda: self._update_search_item_frame_ui(
+                parent_frame,
+                pil_image,
+                label_text, # Pass the correctly generated label text
+                spawn_cmd,
+                info_data,
+                zip_file,
+                picture_path,
+                folder_name
+            ))
+
+        except Exception as e_worker:
+            print(f"General error in _load_image_data_worker_search for {picture_path}: {e_worker}")
+            placeholder_pil = Image.new("RGBA", (250, 140), (80, 0, 0, 255))
+            parent_frame.after(0, lambda: self._update_search_item_frame_ui(parent_frame, placeholder_pil, "Load Error", None, None, None, None, None))
+
+
+    def _on_search_item_hover_enter(self, event, item_frame, info_data, picture_path, zip_file, folder_name, spawn_cmd):
+        """Handles hover enter specifically for search result items."""
+        # Find the image and label widgets within the item_frame passed by the event
+        lbl_img = None
+        lbl_name = None
+        for child in item_frame.winfo_children():
+            if isinstance(child, tk.Label):
+                # Distinguish based on stored image (might need a better way if structure varies)
+                if hasattr(child, 'image') and child.image:
+                    lbl_img = child
+                else:
+                    lbl_name = child
+
+        if lbl_img and lbl_img.winfo_exists():
+            lbl_img.config(bg=self.global_highlight_color)
+        if lbl_name and lbl_name.winfo_exists():
+            lbl_name.config(fg=self.global_highlight_color)
+
+        # --- RE-ADD Sidebar Update Call ---
+        # Use the main grid's debounced update function
+        if self.main_grid_sidebar_debounce_timer:
+            self.master.after_cancel(self.main_grid_sidebar_debounce_timer)
+        # Pass all necessary arguments to the debounced function
+        item_tuple = (picture_path, spawn_cmd, zip_file, info_data, folder_name) # Reconstruct item tuple if needed by sidebar func
+        self.main_grid_sidebar_debounce_timer = self.master.after(
+            200, # Debounce delay
+            lambda: self.debounced_main_sidebar_info_update(info_data, picture_path, zip_file, folder_name, item_tuple)
+        )
+        # --- END RE-ADD Sidebar Update Call ---
+
+    def _on_search_item_hover_leave(self, event, item_frame):
+        """Handles hover leave specifically for search result items."""
+        # Find the image and label widgets within the item_frame passed by the event
+        lbl_img = None
+        lbl_name = None
+        for child in item_frame.winfo_children():
+            if isinstance(child, tk.Label):
+                if hasattr(child, 'image') and child.image:
+                    lbl_img = child
+                else:
+                    lbl_name = child
+
+        # Restore default colors using stored attributes
+        if lbl_img and lbl_img.winfo_exists() and hasattr(lbl_img, 'default_bg_color'):
+            lbl_img.config(bg=lbl_img.default_bg_color)
+        if lbl_name and lbl_name.winfo_exists() and hasattr(lbl_name, 'default_fg_color'):
+            lbl_name.config(fg=lbl_name.default_fg_color)
+
+        # Hide sidebar info
+        self.hide_sidebar_info()
+        # --- Cancel any pending sidebar update timer ---
+        if self.main_grid_sidebar_debounce_timer:
+            self.master.after_cancel(self.main_grid_sidebar_debounce_timer)
+            self.main_grid_sidebar_debounce_timer = None
+
+
+
+    def _update_search_item_frame_ui(self, parent_frame, pil_image, label_text, spawn_cmd, info_data, zip_file, picture_path, folder_name):
+        """
+        (REVISED) Creates the actual Tkinter image and label widgets
+        inside the parent_frame for a search result item. Includes hover and sidebar fixes.
+        """
+        try:
+            if not parent_frame.winfo_exists():
+                return
+
+            if pil_image is None:
+                print(f"ERROR: _update_search_item_frame_ui received None for pil_image for item '{label_text}'.")
+                return
+
+            photo = ImageTk.PhotoImage(pil_image)
+
+            # --- Create Image Label ---
+            lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="white")
+            lbl_img.image = photo
+            lbl_img.pack(padx=0, pady=0)
+            # --- STORE Default BG Color ---
+            lbl_img.default_bg_color = "white"
+
+            # --- Determine Text Color ---
+            label_color = "white" # Default
+            if "_user--" in picture_path:
+                label_color = "lightblue"
+            else:
+                found_double_basename = False
+                if hasattr(self, 'ZIP_BASE_NAMES') and self.ZIP_BASE_NAMES:
+                    for base_name in self.ZIP_BASE_NAMES:
+                        if isinstance(picture_path, str) and picture_path.count(f"--{base_name}_{base_name}.zip") > 0:
+                            found_double_basename = True
+                            break
+                if found_double_basename:
+                    label_color = "#f7efd7"
+
+            # --- Create Text Label ---
+            lbl_name = tk.Label(
+                parent_frame,
+                text=label_text, # Use the label_text passed from the worker
+                wraplength=200,
+                justify="center",
+                fg=label_color, # Apply determined color
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
+                cursor="hand2",
+                bg="#444444",
+                height=3,
+                anchor=tk.N
+            )
+            lbl_name.pack(padx=0, pady=5)
+            # --- STORE Default FG Color ---
+            lbl_name.default_fg_color = label_color
+
+            # --- REVISED Hover Bindings ---
+            # Capture necessary data for the hover functions using lambda defaults
+            item_frame = parent_frame # The frame the event is bound to IS the parent_frame
+
+
+            lbl_img.bind("<Enter>", lambda event, frame=item_frame, i_data=info_data, p_path=picture_path, z_file=zip_file, f_name=folder_name, s_cmd=spawn_cmd:
+                        self._on_search_item_hover_enter(event, frame, i_data, p_path, z_file, f_name, s_cmd))
+            lbl_img.bind("<Leave>", lambda event, frame=item_frame: self._on_search_item_hover_leave(event, frame))
+            lbl_name.bind("<Enter>", lambda event, frame=item_frame, i_data=info_data, p_path=picture_path, z_file=zip_file, f_name=folder_name, s_cmd=spawn_cmd:
+                        self._on_search_item_hover_enter(event, frame, i_data, p_path, z_file, f_name, s_cmd))
+            lbl_name.bind("<Leave>", lambda event, frame=item_frame: self._on_search_item_hover_leave(event, frame))
+
+            # --- Click Bindings (Keep previous, ensure args are correct) ---
+            lbl_img.bind("<Button-1>", lambda e, f_name=folder_name: self.on_picture_click(f_name))
+            lbl_name.bind("<Button-1>", lambda e, f_name=folder_name: self.on_picture_click(f_name))
+
+            lbl_img.bind("<Button-3>", lambda e, s=None, i=None, p=None, z=None, f=None, zb=None, cn=None:
+                    self.on_image_right_click(s, i, p, z, f, zb, cn))
+            lbl_name.bind("<Button-3>", lambda e, s=None, i=None, p=None, z=None, f=None, zb=None, cn=None:
+                    self.on_image_right_click(s, i, p, z, f, zb, cn))
+
+        except tk.TclError as e:
+            print(f"TclError updating search item UI (parent likely destroyed): {e}")
+        except Exception as e_ui:
+            print(f"General error updating search item UI for '{label_text}': {e_ui}")
+            import traceback
+            traceback.print_exc() # Print full traceback for unexpected UI errors
+
 
     def load_and_display_image_search_results(self, picture_path, parent_frame, zip_file, spawn_cmd, info_data, folder_name):
         """Loads and displays image in search results window, reusing main grid's function for image loading."""
@@ -10745,7 +13694,28 @@ class ConfigViewerApp:
     def populate_search_results_window(self, scrollable_frame, data_list):
         """Populates the given scrollable frame with search results data, ensuring correct label-pictures order and toggling."""
 
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- load_image_item_search_results CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+
         print("\n--- populate_search_results_window() DEBUG ENTRY ---") # Debug Entry
+
         print(f"DEBUG: populate_search_results_window - data_list received (count): {len(data_list)}")
 
         grouped_data = self.format_grouped_data(data_list)
@@ -10777,7 +13747,7 @@ class ConfigViewerApp:
             item_count = len(category_items)
             header_text_with_count = f"{category} ({item_count})"
 
-            header_label = tk.Label(header_frame, text=header_text_with_count, font=("Segoe UI", 14, "bold"), bg="#444444", fg="lightgrey", anchor="w", cursor="hand2") # Added cursor="hand2" for visual feedback
+            header_label = tk.Label(header_frame, text=header_text_with_count, font=("Segoe UI", 14+self.font_size_add, "bold"), bg="#444444", fg="lightgrey", anchor="w", cursor="hand2") # Added cursor="hand2" for visual feedback
             header_label.pack(side=tk.LEFT, padx=10, pady=(10, 0))
 
             separator = tk.Frame(header_frame, height=4, bd=1, relief="sunken", bg="lightgrey", cursor="hand2") # Added cursor="hand2" for visual feedback
@@ -10893,7 +13863,9 @@ class ConfigViewerApp:
     # ------------------------------------------------------------
     def populate_initial_grid(self):
         self.load_floating_window_position()
+        print("    populate_initial_grid is calling self.perform_search()")
         self.perform_search()
+        print("    populate_initial_grid is calling self.update_grid_layout()")
         self.update_grid_layout()
         self.all_main_grid_images_cached = self.are_all_main_grid_images_cached()
         print(f"populate_initial_grid - all_main_grid_images_cached set to: {self.all_main_grid_images_cached}")
@@ -10935,6 +13907,14 @@ class ConfigViewerApp:
         
     #@profile
     def load_next_batch(self):
+
+        print(f"@@@ ENTERING load_next_batch - pause_loading: {self.pause_loading}, category_index: {self.current_category_index}, batch_index: {self.current_batch_index}")
+        if self.scanning_win:
+            self.scanning_win.destroy()
+
+ 
+        self.scanning_win = None
+        
         if self.pause_loading:
             # If loading is paused, try again after 100ms
             self.master.after(100, self.load_next_batch)
@@ -11037,10 +14017,6 @@ class ConfigViewerApp:
             # print("load_next_batch EXIT (Scheduled next batch - not all cached - after 150ms)") # ADDED
     
     
-        #if self.scanning_window:
-        #    self.scanning_window.destroy()
-        #
-        #self.scanning_window = None
 
 
 
@@ -11057,7 +14033,12 @@ class ConfigViewerApp:
 
 
     def update_progress_bar_main(self, loaded_count, total_count):
+
+
+
         if total_count > 0:
+
+
             progress_percent = (loaded_count / total_count) * 100
             fill_width = (200 * progress_percent) / 100
             self.progress_bar_fill_main.config(width=fill_width)
@@ -11079,21 +14060,24 @@ class ConfigViewerApp:
     def hide_progress_bar_main(self):
         self.progress_bar_bg_main.pack_forget()
         
-        if self.scanning_window:
-            self.scanning_window.destroy()
+#        if self.scanning_window:
+#            self.scanning_window.destroy()
 
-        self.scanning_window = None
+#        self.scanning_window = None
 
-        if self.scanning_win:
-            self.scanning_win.destroy()
+#        if self.scanning_win:
+#            self.scanning_win.destroy()
 
  
-        self.scanning_win = None
+#        self.scanning_win = None
 
 
 
     def hide_progress_bar_details(self):
         self.progress_bar_bg_details.pack_forget()
+
+        
+
 
 
 
@@ -11213,7 +14197,19 @@ class ConfigViewerApp:
             # --- MODIFIED: Reset color of new label ---
             self.details_page_label.config(fg=self.details_page_label_original_color)
 
+            
+
+            
+            if self.resizing_window and self.details_window_opened_before:
+
+
+                self.perform_details_search()
+                self.resizing_window = False
+                self.details_window_opened_before = True
+
         self.details_window.after(2000, reset_header_color)
+
+
 
         if self.scanning_window:
             self.scanning_window.destroy()
@@ -11247,134 +14243,318 @@ class ConfigViewerApp:
         change_color()
     
 
+
     #@profile 
+
     def load_next_batch_details(self):
+        # Added print at start for easier debugging of sequence
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- load_next_batch_details CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+
+        print(f"@@@ load_next_batch_details START - Index: {self.current_details_batch_index}, Seq Index: {self.current_details_batch_index_in_sequence}, Placed: {self.total_details_items_placed}, Pause: {self.pause_loading}")
+
         if self.pause_loading:
             self.details_pause_counter += 1
-            print(f"Load Next Batch Details - PAUSED (Details Window - Paused Flag Active) [FORCED UNPAUSE] - Count: {self.details_pause_counter}")
-
-            if self.details_pause_counter > 10:
-                print("DEBUG: load_next_batch_details - PAUSE COUNT EXCEEDED THRESHOLD (10). FORCING UNPAUSE.")
+            print(f"Load Next Batch Details - PAUSED (Details Window - Paused Flag Active) - Count: {self.details_pause_counter}")
+            # Simplified pause logic slightly - adjust threshold as needed
+            # NOTE: Threshold was mentioned as potentially lower than 10 earlier
+            PAUSE_THRESHOLD = 2 # Or your actual lower value
+            if self.details_pause_counter > PAUSE_THRESHOLD:
+                print(f"DEBUG: load_next_batch_details - PAUSE COUNT EXCEEDED THRESHOLD ({PAUSE_THRESHOLD}). FORCING UNPAUSE.")
                 self.pause_loading = False
                 self.details_pause_counter = 0
                 print("DEBUG: load_next_batch_details - pause_loading FORCE-SET to FALSE, counter RESET.")
+                # Continue processing immediately instead of scheduling again
             else:
+                # Reschedule the check if still paused
                 self.master.after(100, self.load_next_batch_details)
                 return
 
+        # Reset pause counter if loading is not paused
         self.details_pause_counter = 0
 
+        # --- Reset batch retry count just before attempting to process a slice ---
+        # (Moved from original position for clarity - reset before each slice attempt)
+        self.details_batch_retry_count = 0
+
+        # Check if all batches for the current page have been processed
         if self.current_details_batch_index >= len(self.details_batches):
-            # All batches loaded in details window
-            self.details_canvas_sub.config(scrollregion=self.details_canvas_sub.bbox("all"))
+            print(f"DEBUG: load_next_batch_details - All batches for current page (Index {self.current_details_batch_index}) loaded.")
+            if hasattr(self, 'details_canvas_sub') and self.details_canvas_sub and self.details_canvas_sub.winfo_exists():
+                # Update scroll region one last time at the end
+                try:
+                    self.master.update_idletasks() # Ensure geometry is up-to-date
+                    frame_bbox = self.details_scrollable_frame.bbox("all")
+                    if frame_bbox:
+                        self.details_canvas_sub.config(scrollregion=frame_bbox)
+                        print(f"DEBUG: Final scrollregion update: {frame_bbox}")
+                    else: # Fallback
+                        self.details_canvas_sub.config(scrollregion=self.details_canvas_sub.bbox("all"))
+                        print(f"DEBUG: Final scrollregion update (canvas fallback)")
+                except Exception as e:
+                    print(f"ERROR during final scrollregion update: {e}")
             self.stop_details_loading_animation()
             self.hide_progress_bar_details()
-            # --- NEW: RESUME main grid loading AFTER 3-second delay ---
-            print("DEBUG: load_next_batch_details - Details batch load complete. Resuming main grid loading in 3 seconds...")
-            def resume_main_grid_loading():
-                self.pause_loading = False
-                self.load_next_batch()
-                print("DEBUG: load_next_batch_details - Main grid loading RESUMED (after 3-second delay).")
 
+
+            # ---vvv ADDED BACK - Start vvv---
+            # Resume main grid loading after a delay, similar to the old version's behavior.
+            print("DEBUG: load_next_batch_details - Details batch load complete. Resuming main grid loading in 3 seconds...")
+
+            def resume_main_grid_loading():
+                # Check if the necessary attributes/methods exist before using them
+                if hasattr(self, 'pause_loading'):
+                    print("DEBUG: resume_main_grid_loading - Setting pause_loading = False")
+                    self.pause_loading = False
+                else:
+                    print("WARN: resume_main_grid_loading - self.pause_loading attribute not found.")
+
+                if hasattr(self, 'load_next_batch') and callable(getattr(self, 'load_next_batch')):
+                    print("DEBUG: resume_main_grid_loading - Calling self.load_next_batch()")
+                    self.load_next_batch()
+                    print("DEBUG: resume_main_grid_loading - Main grid loading RESUMED (after 3-second delay).")
+                else:
+                    print("ERROR: resume_main_grid_loading - self.load_next_batch method not found or not callable.")
+
+            # Schedule the resumption using a 3000ms (3 second) delay
             self.master.after(3000, resume_main_grid_loading)
-            # --- NEW: RESUME main grid loading AFTER 3-second delay ---
+            # ---^^^ ADDED BACK - End ^^^---
+
+
+
+            print("DEBUG: load_next_batch_details - Details page batch load complete. Main grid resume scheduled.")
+            # Maybe lift windows one last time?
+            if hasattr(self, 'details_window') and self.details_window and self.details_window.winfo_exists():
+                self.details_window.lift()
+            return # Stop processing for this page
+
+        # --- Get the current main batch ---
+        try:
+            # Check index validity before accessing
+            if not (0 <= self.current_details_batch_index < len(self.details_batches)):
+                print(f"ERROR: Invalid current_details_batch_index {self.current_details_batch_index} vs len {len(self.details_batches)}. Aborting.")
+                self.stop_details_loading_animation()
+                self.hide_progress_bar_details()
+                return
+            current_main_batch = self.details_batches[self.current_details_batch_index]
+            # Ensure it's a list (might become None or empty if modified unexpectedly)
+            if not isinstance(current_main_batch, list):
+                print(f"ERROR: Batch at index {self.current_details_batch_index} is not a list ({type(current_main_batch)}). Assuming empty.")
+                current_main_batch = []
+                self.details_batches[self.current_details_batch_index] = current_main_batch # Correct it
+
+        except IndexError:
+            # This shouldn't happen with the check above, but added safety
+            print(f"ERROR: IndexError accessing details_batches at index {self.current_details_batch_index}. Aborting batch load.")
+            self.stop_details_loading_animation()
+            self.hide_progress_bar_details()
             return
 
-        batch = self.details_batches[self.current_details_batch_index]
-        self.current_details_batch_index += 1
+        # --- Determine slice size ---
+        # Assuming details_grid_batch_sizes might be dynamic or shorter than needed
+        # Using default_batch_size seems more robust based on previous code.
+        # Ensure default_batch_size is set appropriately elsewhere.
+        batch_size_to_load = getattr(self, 'default_batch_size', 10) # Default to 10 if not set
 
-        if self.current_details_batch_index_in_sequence < len(self.details_grid_batch_sizes):
-            batch_size_to_load = self.details_grid_batch_sizes[self.current_details_batch_index_in_sequence]
-        else:
-            batch_size_to_load = self.default_batch_size
+        # --- Get the slice to process ---
+        items_to_load_this_time = current_main_batch[:batch_size_to_load]
+        remaining_batch_items = current_main_batch[batch_size_to_load:]
 
-        items_to_load_this_time = batch[:batch_size_to_load]
-        batch = batch[batch_size_to_load:]
-        self.details_batches[self.current_details_batch_index - 1] = batch
+        # Update the main batch in the list with the remaining items
+        self.details_batches[self.current_details_batch_index] = remaining_batch_items
+        print(f"  DEBUG: Slice taken: {len(items_to_load_this_time)} items. Remaining in batch[{self.current_details_batch_index}]: {len(remaining_batch_items)}")
 
+        # If the slice is empty, it means the current main batch was already exhausted
+        # Move to the next main batch immediately
         if not items_to_load_this_time:
-            self.current_details_batch_index_in_sequence += 1
+            print(f"  DEBUG: No items in this slice (batch {self.current_details_batch_index} likely exhausted). Moving to next batch.")
+            self.current_details_batch_index += 1
+            self.current_details_batch_index_in_sequence = 0 # Reset sequence for the new main batch
+            self.master.after(50, self.load_next_batch_details) # Schedule next check quickly
+            return
+
+        # --- Update Progress Bar ---
+        # Note: Progress calculation might need adjustment based on pagination
+        # This calculates progress within the *current page* load
+        items_in_current_page = sum(len(b) for b in self.details_batches if isinstance(b, list)) + self.total_details_items_placed
+        items_loaded_this_page = self.total_details_items_placed + len(items_to_load_this_time)
+        self.update_progress_bar_details(items_loaded_this_page, items_in_current_page) # Adjust calculation if needed
+        # --- End Progress Bar ---
+
+        # --- Check/Recalculate layout BEFORE the loop ---
+        try:
+            if not hasattr(self, 'details_columns') or self.details_columns is None or not isinstance(self.details_columns, tuple) or len(self.details_columns) < 1:
+                print("WARN: self.details_columns is not valid before loop. Attempting recalculation.")
+                # Ensure canvas exists and has a width
+                if hasattr(self, 'details_canvas_sub') and self.details_canvas_sub and self.details_canvas_sub.winfo_exists() and self.details_canvas_sub.winfo_width() > 0:
+                    canvas_width = self.details_canvas_sub.winfo_width() - 20 # Example margin
+                    potential_cols, potential_pad = self.calculate_columns_for_width(canvas_width, is_details=True)
+                    self.details_columns = (potential_cols, potential_pad)
+                    self.details_column_padding = potential_pad
+                    print(f"  Recalculated details_columns: {self.details_columns}, padding: {self.details_column_padding}")
+                else:
+                    print("ERROR: Cannot recalculate columns, canvas invalid or width=0. Using fallback.")
+                    # Fallback to prevent crash - adjust as needed
+                    self.details_columns = (getattr(self, 'default_columns', 4), getattr(self, 'default_padding', 5))
+                    self.details_column_padding = self.details_columns[1]
+
+            # Ensure padding exists even if columns were valid
+            elif not hasattr(self, 'details_column_padding') or self.details_column_padding is None:
+                print("WARN: details_column_padding was missing, setting from details_columns tuple.")
+                self.details_column_padding = self.details_columns[1]
+
+        except Exception as layout_err:
+            print(f"!!!!!!!!!! HIT LAYOUT PRE-CHECK EXCEPTION !!!!!!!!!!!!!!")
+            print(f"ERROR: Failed during layout pre-check/recalculation: {layout_err}. Aborting slice.")
+            # Avoid infinite loop if canvas width is consistently bad
+            # Maybe stop loading for this page?
+            # For now, schedule next attempt but log error clearly.
             self.master.after(100, self.load_next_batch_details)
             return
+        # --- END Check/Recalculate ---
 
-        total_items_in_details_grid = sum(len(b) for b in self.details_batches)
-        items_loaded_in_details_so_far = 0
-
-        for batch_index in range(self.current_details_batch_index - 1):
-            bat = self.details_batches[batch_index]
-            if isinstance(bat, list):
-                items_loaded_in_details_so_far += len(bat)
-        items_loaded_in_details_so_far += len(items_to_load_this_time)
-
-        self.update_progress_bar_details(items_loaded_in_details_so_far, total_items_in_details_grid)
-
+        # --- Process items in the current slice ---
         for idx_in_batch, item in enumerate(items_to_load_this_time):
             if item is None:
+                print(f"WARN: Skipping None item at index {idx_in_batch} in slice.")
+                continue
+
+            # Ensure item is structured as expected before unpacking
+            if not isinstance(item, (list, tuple)) or len(item) != 5:
+                print(f"ERROR: Skipping malformed item: {item}")
                 continue
 
             picture_path, spawn_cmd, zip_file, info_data, folder_name = item
 
+            # Check if the target frame exists before creating item container
+            if not hasattr(self, 'details_scrollable_frame') or not self.details_scrollable_frame or not self.details_scrollable_frame.winfo_exists():
+                print("ERROR: details_scrollable_frame does not exist. Aborting item processing for this slice.")
+                # Stop processing this slice, maybe schedule next?
+                self.master.after(100, self.load_next_batch_details)
+                return
+
             container = tk.Frame(self.details_scrollable_frame, bg="#444444")
-            item_index_in_full_list = (self.current_details_batch_index - 1) * self.details_batch_size + idx_in_batch
-            try: # <--- ADD TRY BLOCK HERE
-                row = item_index_in_full_list // self.details_columns[0] # <--- POTENTIAL ERROR LINE
-                col = item_index_in_full_list % self.details_columns[0]
-            except TypeError as e: # <--- CATCH TypeError HERE
-                print(f"ERROR: TypeError in load_next_batch_details: {e}") # Print error for debugging
-                print("  Attempting to close and reopen details window to recover...") # Indicate recovery attempt
-                if hasattr(self, 'details_window') and self.details_window and self.current_details_folder:
-                    self.on_details_window_close() # Close details window
-                    #self.on_picture_click(self.current_details_folder) # Re-open details window for the same folder
-                    #print("  Details window closed and re-opened. Batch loading aborted for this cycle.") # Confirmation message
-                    print("  Application restarting due to batch loading failure. Batch loading aborted for this cycle.") # Confirmation message
 
+            try:
+                # --- USE THE TOTAL COUNTER FOR GRID PLACEMENT ---
+                row = self.total_details_items_placed // self.details_columns[0]
+                col = self.total_details_items_placed % self.details_columns[0]
+                # --- END GRID CALCULATION ---
 
-                    width = self.master.winfo_width()
-                    height = self.master.winfo_height()
-                    x = self.master.winfo_rootx()
-                    y = self.master.winfo_rooty()
-                    self.save_window_geometry(width, height, x, y) # Call save_window_geometry
-                    self.save_settings()
+                # Reset retry count on successful calculation (might be less needed now)
+                self.details_batch_retry_count = 0
 
+            # Keep TypeError catch as safety, though less likely with pre-check
+            except TypeError as e:
+                print(f"ERROR: TypeError in load_next_batch_details (grid calculation - total items): {e}. Retrying batch.")
+                self.details_batch_retry_count += 1
+                if self.details_batch_retry_count > getattr(self, 'MAX_DETAILS_BATCH_RETRIES', 3): # Use getattr for safety
+                    print(f"ERROR: Exceeded maximum retries. Aborting.")
+                    # Consider restart or just stopping the details load
+                    # self.restart_script() # Optional: if critical failure requires restart
+                    return # Stop loading
 
-                    self.restart_script()
-                return # <--- IMPORTANT: EXIT function to prevent further errors
+                # Revert batch state requires putting items back correctly
+                # This logic might need careful review if retries are common
+                current_batch_list = self.details_batches[self.current_details_batch_index]
+                failed_batch_part = items_to_load_this_time[idx_in_batch:]
+                # Prepend the failed part back to the *remaining* items for the current batch index
+                self.details_batches[self.current_details_batch_index] = failed_batch_part + current_batch_list
+                print(f"  Reverted batch state. Items to retry: {len(failed_batch_part)}. Rescheduling.")
+                self.master.after(100, self.load_next_batch_details) # Reschedule the same batch/slice
+                return # Exit current execution
 
-            container.grid(row=row, column=col, padx=self.details_column_padding, pady=5, sticky="nw")
+            # Use validated padding (already checked/set in pre-check)
+            current_padding = self.details_column_padding
+            container.grid(row=row, column=col, padx=current_padding, pady=5, sticky="nw")
 
+            # Load the actual content for the item
             self.load_image_item_details(item, container, row, col)
 
+            # --- INCREMENT THE TOTAL COUNTER ---
+            self.total_details_items_placed += 1
+            # --- END INCREMENT ---
+
+        # --- Slice Processing Complete ---
+
+        # Update scroll region periodically after each slice is added
+        if hasattr(self, 'details_canvas_sub') and self.details_canvas_sub and self.details_canvas_sub.winfo_exists():
+            try:
+                self.master.update_idletasks() # Allow Tkinter to update geometry
+                frame_bbox = self.details_scrollable_frame.bbox("all")
+                if frame_bbox:
+                    self.details_canvas_sub.config(scrollregion=frame_bbox)
+                    # Optional: print for debugging scroll updates
+                    # print(f"DEBUG: Updated scrollregion after slice: {frame_bbox}")
+            except Exception as e:
+                print(f"ERROR updating scrollregion after slice: {e}")
+
+        # --- Advance sequence index AFTER processing slice ---
         self.current_details_batch_index_in_sequence += 1
 
-        self.master.after(self.details_batch_delay, self.load_next_batch_details)
-        #self.start_debounce_details_highlighting()
-        self.details_window.lift()
+        # Check if the current main batch is now empty AFTER taking the slice
+        if not self.details_batches[self.current_details_batch_index]:
+            print(f"  DEBUG: Batch {self.current_details_batch_index} is now empty. Moving to next batch index.")
+            self.current_details_batch_index += 1
+            self.current_details_batch_index_in_sequence = 0 # Reset sequence for the new main batch
+
+        # Schedule the next slice/batch check
+        # Use getattr for safety in case details_batch_delay isn't set
+        delay = getattr(self, 'details_batch_delay', 50) # Default delay 50ms
+        self.master.after(delay, self.load_next_batch_details)
+
+        # --- Lift windows ---
+        if hasattr(self, 'details_window') and self.details_window and self.details_window.winfo_exists():
+            self.details_window.lift()
         if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists():
             self.current_detail_window.lift()
-
-        self.details_window.after(2000, lambda: (
-            self.details_window.lift(),
-            (self.current_detail_window.after(300, self.current_detail_window.lift)
-            if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists() else None)
+        # A single delayed lift might be sufficient
+        self.master.after(1500, lambda: (
+            (w.lift() if hasattr(self, n) and (w := getattr(self, n)) and w.winfo_exists() else None)
+            for n in ['details_window', 'current_detail_window']
         ))
+        # --- End Lift windows ---
 
-        # --- ADD THIS SECTION HERE ---
-        # Update sidebar content with the LAST item loaded in the batch
-        if self.no_configs_messagebox_condition: # Check the flag
+        # --- Update Sidebar for last item in the SLICE ---
+        # This updates sidebar frequently, maybe only needed at end of page?
+        # Check if the flag exists and is True, and if items were loaded
+        if getattr(self, 'no_configs_messagebox_condition', False) and items_to_load_this_time:
+            last_item = items_to_load_this_time[-1]
+            # Ensure last_item is valid before unpacking
+            if isinstance(last_item, (list, tuple)) and len(last_item) == 5:
+                picture_path, spawn_cmd, zip_file, info_data, folder_name = last_item
+                self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name)
+                
+                self.no_configs_messagebox_condition = False # Reset flag
+                print("DEBUG:  @@@ CONDITION MET --- no_configs_messagebox_condition ---  load_next_batch_details - Updated details sidebar for LAST item in SLICE.")
+            else:
+                print("WARN: Could not update sidebar, last item in slice was invalid.")
+        # --- End Update Sidebar ---
 
-            last_item = items_to_load_this_time[-1] # Get the last item from the batch
-            picture_path, spawn_cmd, zip_file, info_data, folder_name = last_item # Unpack the last item data
+        print("--- load_next_batch_details() EXIT (Scheduled next) ---\n")
+#        '''
 
-            # Call update_details_sidebar_content with data from the last item
-            self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name)
-            self.no_configs_messagebox_condition = False
-            print("DEBUG: load_next_batch_details - Calling update_details_sidebar_content for the LAST item in the batch.") # Debug print
 
-        # --- END ADDED SECTION ---
 
-        print("--- load_next_batch_details() EXIT ---\n")
-        
 
+############
         
         
     def load_image_item(self, item, category_subframe, category):
@@ -11654,6 +14834,8 @@ class ConfigViewerApp:
     # Load & Display Image (Main Grid - CACHED)
     # ------------------------------------------------------------
     def load_and_display_image(self, picture_path, parent_frame, zip_file, spawn_cmd, info_data, folder_name):
+
+
         try:
             # --- Normalize picture_path ---
             normalized_picture_path = os.path.normpath(os.path.abspath(picture_path))
@@ -11681,28 +14863,7 @@ class ConfigViewerApp:
                     )
                 return # Exit after using cached image
 
-            # --- No Memory Cache Hit: Load and Create ---
 
-            # --- NEW: Check Disk Cache (Optional - currently disabled for memory focus) ---
-            # disk_cache_path = os.path.join(self.disk_image_cache_dir, os.path.basename(cache_key))
-            # if os.path.exists(disk_cache_path):
-            #     try:
-            #         img = Image.open(disk_cache_path).convert("RGBA") # Load from disk cache
-            #         pil_image = img.copy()
-            #         photo = ImageTk.PhotoImage(img)
-            #         self._add_to_cache(cache_key, photo) # Add to memory cache (LRU)
-            #         if parent_frame.winfo_exists():
-            #             self.master.after(
-            #                 0,
-            #                 lambda: self.create_main_item_widgets(
-            #                     parent_frame, photo, pil_image, zip_file, spawn_cmd, info_data, picture_path, folder_name
-            #                 )
-            #             )
-            #         return
-            #     except Exception as e_disk_load:
-            #         print(f"Warning: Error loading from disk cache {disk_cache_path}: {e_disk_load}. Falling back to original load.")
-
-            # --- Load Image from Original Path (if no cache hit) ---
             if picture_path is None or not os.path.exists(picture_path):
                 return
             img = Image.open(picture_path).convert("RGBA")
@@ -11723,8 +14884,6 @@ class ConfigViewerApp:
             # --- SCHEDULE PhotoImage CREATION AND DISK CACHE SAVE IN MAIN THREAD ---
 
 
-        except Exception as e:
-            print(f"Error loading image {picture_path}: {e}")
 
 
 
@@ -11738,32 +14897,14 @@ class ConfigViewerApp:
              # --- Optimized Cache: Add to Memory Cache (LRU) ---
 
 
-             # --- Disk Cache Saving (Optional - disabled for memory focus) ---
-             # if save_to_disk_cache:
-             #     disk_cache_path = os.path.join(self.disk_image_cache_dir, os.path.basename(cache_key))
-             #     try:
-             #         #pil_image.save(disk_cache_path, "PNG")
-             #         #print(f"DEBUG: Saved image to disk cache: {disk_cache_path}")
-             #         pass # Disk cache disabled
-             #     except Exception as e_save:
-             #         print(f"Warning: Error saving to disk cache {disk_cache_path}: {e_save}")
-             # --- Disk Cache Saving (Optional - disabled for memory focus) ---
-
-
-             # --- Check pause_loading and queue UI update if paused ---
-             if self.pause_loading:
-                 self.main_grid_skipped_updates_queue.append((parent_frame, photo, None, zip_file, spawn_cmd, info_data, picture_path, folder_name)) # PIL Image removed from queue
-                 return
-             # --- END: Pause Check and Queue ---
-
              if parent_frame.winfo_exists():
                  # Schedule GUI update in the main thread
-                 self.master.after(
-                     0,
-                     lambda: self.create_main_item_widgets(
-                         parent_frame, photo, None, zip_file, spawn_cmd, info_data, picture_path, folder_name # PIL Image removed from call
-                     )
-                 )
+                self.master.after(
+                    0,
+                    # Modified lambda to accept an optional event arg 'e' and ignore it
+                    lambda e=None, pf=parent_frame, pht=photo, zp=zip_file, sc=spawn_cmd, idata=info_data, pp=picture_path, fn=folder_name:
+                        self.create_main_item_widgets(pf, pht, None, zp, sc, idata, pp, fn)
+                )
 
          except Exception as e:
              print(f"Error creating PhotoImage or updating UI: {e}")
@@ -11874,7 +15015,7 @@ class ConfigViewerApp:
             wraplength=200, #label length, don't remove current
             justify="center",
             fg=text_color, # Use DEFAULT text color here - HIGHLIGHTING IS HANDLED SEPARATELY
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 10+self.font_size_add, "bold"),
             cursor="hand2",
             bg="#444444", # <--- DARKER GRAY bg for lbl_info
             height=3,
@@ -12041,7 +15182,7 @@ class ConfigViewerApp:
         """
         Debounced function to update the main sidebar content.
         """
-        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item)
+        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None)
         #self.lift_search_results_window()
         self.main_grid_sidebar_debounce_timer = None # Reset timer
 
@@ -12186,7 +15327,7 @@ class ConfigViewerApp:
 
 
 
-    def show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item):
+    def show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None):
         """Shows sidebar info labels and updates content."""
         # --- NEW: Check if scrolling - if yes, early exit (disable sidebar update during scroll) ---
         if self.is_scrolling_main_grid:
@@ -12196,6 +15337,16 @@ class ConfigViewerApp:
         self.update_sidebar_content(info_data, picture_path, zip_file, folder_name)
         self.current_main_sidebar_item = item # Store the current item
         
+        # --- 2. ALSO Update the DETAILS sidebar ---
+        # Check if the details sidebar actually exists before trying to update it
+        if hasattr(self, 'details_sidebar_text_canvas') and self.details_sidebar_text_canvas.winfo_exists():
+            print(f"DEBUG show_main_sidebar_info: Triggering details sidebar update with path={individual_path}")
+            # Call the function responsible for the details sidebar update
+            self.update_details_sidebar_individual_info(individual_path, main_info_for_details)
+        else:
+            print("DEBUG show_main_sidebar_info: Details sidebar not found or doesn't exist, skipping update.")
+
+
     def show_zip_name_top_bar(self, zip_file, folder_name):
         """Displays the zip or folder name in the top bar."""
         if zip_file == "user_custom_configs":
@@ -12212,6 +15363,19 @@ class ConfigViewerApp:
     # ------------------------------------------------------------
     # On Right-Click -> hide
     # ------------------------------------------------------------
+
+    def _store_initial_minsize(self):
+        """Stores the initial minsize when the window is idle."""
+        try:
+            self._original_minsize = self.master.minsize()
+        except tk.TclError:
+             # Window might not be ready yet, store default
+             self._original_minsize = (1, 1)
+        print(f"Stored initial minsize: {self._original_minsize}") # Debug
+
+
+
+
     def on_image_right_click(self, zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info):
         #return
 
@@ -12219,10 +15383,14 @@ class ConfigViewerApp:
         #'''
         if self.search_results_window:
             scanning_win = self.show_scanning_window(text="Cannot hide vehicles while search or filtering is active.")
-            time.sleep(3.125)
+            self.lift_search_results_window()
             if scanning_win:
-                scanning_win.destroy()
-                self.lift_search_results_window()
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
             return
             #'''
 
@@ -12230,6 +15398,60 @@ class ConfigViewerApp:
         brand_name = info_data.get("Brand", "Unknown") # brand_name
         car_name = info_data.get("Name", "") # brand_name
         self.toggle_hidden_item(folder_name, zip_file, image_name, brand_name, car_name, lbl_img, lbl_info)
+
+
+        # 1. Determine if the size should be locked
+        should_be_locked = len(self.hidden_items_set) > 0 # Lock if set is NOT empty
+
+        # 2. Get current lock state (based on our flag)
+        is_currently_locked = self._is_size_locked_by_us
+
+        # 3. Apply changes only if the state needs to change
+        if should_be_locked and not is_currently_locked:
+            # --- Lock the size ---
+            try:
+                # Get the current size of the window
+                current_width = self.master.winfo_width()
+                current_height = self.master.winfo_height()
+
+                # Ensure dimensions are valid (winfo can return 1 initially)
+                if current_width > 1 and current_height > 1:
+                    # Store the *current* minsize before overriding it, just in case
+                    # (self._original_minsize holds the initial default)
+                    # current_min_w, current_min_h = self.master.minsize() # Optional to store this
+
+                    # Set min and max size to the current size
+                    self.master.minsize(current_width, current_height)
+                    self.master.maxsize(current_width, current_height)
+                    self._is_size_locked_by_us = True
+                    # print(f"Locked size to {current_width}x{current_height}") # Debug
+                else:
+                    # This might happen if the window isn't fully drawn/realized yet.
+                    # Consider delaying or logging a warning.
+                    print("Warning: Could not get valid window dimensions to lock size.")
+
+            except tk.TclError as e:
+                print(f"Warning: Error getting window info or setting size limits: {e}")
+
+
+        elif not should_be_locked and is_currently_locked:
+            # --- Unlock the size ---
+            try:
+                # Restore the original minimum size
+                self.master.minsize(self._original_minsize[0], self._original_minsize[1])
+
+                # Remove the maximum size constraint by setting it to screen dimensions
+                screen_width = self.master.winfo_screenwidth()
+                screen_height = self.master.winfo_screenheight()
+                self.master.maxsize(screen_width, screen_height)
+                self._is_size_locked_by_us = False
+                # print(f"Unlocked size. Restored min: {self._original_minsize}, Max: screen") # Debug
+
+            except tk.TclError as e:
+                 print(f"Warning: Error resetting window size limits: {e}")
+        else:
+             print("Size lock state already correct.") # Debug
+
     
 
     def _get_hidden_file_path(self):
@@ -12249,6 +15471,8 @@ class ConfigViewerApp:
                 f.write(line + '\n')
 
     def toggle_hidden_item(self, folder_name, zip_file, image_name, brand_name, car_name, lbl_img, lbl_txt):
+
+
 
         #self.hide_sidebar_info() 
         lower_folder_name = folder_name.lower()
@@ -12403,14 +15627,14 @@ class ConfigViewerApp:
 
         if self.items_to_be_hidden:
             print("--- self.items_to_be_hidden = True ---\n")
-            self.sidebar_filters_label.config(text=f"Vehicles Set to be Hidden: {len(self.hidden_items_set)} \n\nFiltering features disabled in this mode.\nRestart the application to hide the\nvehicles or unmark them for hiding to\nre-enable the features.", font=("Segoe UI", 11, "bold"))
+            self.sidebar_filters_label.config(text=f"Vehicles Set to be Hidden: {len(self.hidden_items_set)} \n\nFiltering, searching and resizing features disabled in this mode. Restart the application to hide the vehicles or unmark them for hiding to re-enable the features.", font=("Segoe UI", 11+self.font_size_add, "bold"))
             self._start_fade_loop(self.sidebar_filters_label, self.warning_color_sidebar, self.default_sidebar_color) # Loop fade sidebar between warning and white
             self._start_fade_loop(self.restart_button, self.warning_color_restart_button, self.default_restart_color)  # Loop fade restart button between warning and white
             self.restart_button_active_fg_color = "#ffa1a1"
 
         if not self.items_to_be_hidden:
             print("--- self.items_to_be_hidden = False ---\n")
-            self.sidebar_filters_label.config(fg=self.default_sidebar_color, text="Constraints", font=("Segoe UI", 14, "bold"))
+            self.sidebar_filters_label.config(fg=self.default_sidebar_color, text="Constraints", font=("Segoe UI", 14+self.font_size_add, "bold"))
             self._stop_fade_loop(self.sidebar_filters_label, self.default_sidebar_color) # Stop fade and set to default color
             self._stop_fade_loop(self.restart_button, self.default_restart_color) # Stop fade and set to default color
             self.restart_button_active_fg_color = "white" # Reset to default white for active state
@@ -12472,6 +15696,21 @@ class ConfigViewerApp:
         custom_input_file = os.path.join(self.script_dir, "data/outputGOODcustom.txt")
         input_file = os.path.join(self.script_dir, "data/outputGOOD.txt")
         hidden_txt_file = os.path.join(self.script_dir, "data/Hidden.txt")
+
+
+
+        backup_custom_input_file = os.path.join(self.script_dir, "data/backup/outputGOODcustom.txt")
+        backup_input_file = os.path.join(self.script_dir, "data/backup/outputGOOD.txt")
+
+
+        if os.path.exists(backup_input_file):
+
+            print(f"backup input files exist (load_hidden_vehicles_once)")
+
+            custom_input_file = backup_custom_input_file
+            input_file = backup_input_file
+
+
 
         print(f"Attempting to open custom input file: {custom_input_file}")
         print(f"Attempting to open regular input file: {input_file}")
@@ -12616,6 +15855,8 @@ class ConfigViewerApp:
             print(f"Error loading Hidden.txt: {e}")
 
         vehicles.sort(key=lambda vehicle: vehicle['brand'].lower())
+
+
         return vehicles
 ########
 
@@ -12636,19 +15877,23 @@ class ConfigViewerApp:
     def create_widgets_hidden_window(self, toplevel):
         toplevel.configure(bg="#333333") # Set toplevel window background color
 
-        main_label = tk.Label(toplevel, text="Hidden Vehicles", font=font.Font(family="Segoe UI", size=13, weight='bold'), background="#333333", foreground="white") # tk.Label, white text
-        main_label.pack(pady=10)
+        main_label = tk.Label(toplevel, text="Hidden Vehicles", font=font.Font(family="Segoe UI", size=13+self.font_size_add, weight='bold'), background="#333333", foreground="white") # tk.Label, white text
+        main_label.pack(pady=(10,2))
 
+        main_label_2 = tk.Label(toplevel, text="Right click vehicle previews on the main view to add them to them to this list.", font=font.Font(family="Segoe UI", size=10+self.font_size_add), background="#333333", foreground="white") # tk.Label, white text
+        main_label_2.pack(pady=(2,2))
+
+        main_label_2.config(wraplength=355) # Set wrap length for the label
         # Search Bar
         self.hidden_window_search_var = tk.StringVar()
-        self.hidden_window_search_entry = search_entry = tk.Entry(toplevel, textvariable=self.hidden_window_search_var, font=("Segoe UI", 12), width=30, bg="lightgrey", fg="black", insertbackground="black", relief=tk.FLAT, bd=2, highlightthickness=0)
+        self.hidden_window_search_entry = search_entry = tk.Entry(toplevel, textvariable=self.hidden_window_search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="lightgrey", fg="black", insertbackground="black", relief=tk.FLAT, bd=2, highlightthickness=0)
         self.hidden_window_search_entry.pack(pady=5, fill='x', padx=10)
-        self.hidden_window_search_entry.bind("<KeyRelease>", self.debounce_search)
+        self.hidden_window_search_entry.bind("<KeyRelease>", self._handle_hidden_search_key_release)
         self.hidden_window_search_entry.bind("<FocusIn>", self.on_search_focus_in)  # Bind FocusIn event
         self.hidden_window_search_entry.bind("<FocusOut>", self.on_search_focus_out) # Bind FocusOut event
 
 
-        self.placeholder_text = "Search here..." # Placeholder text
+        self.placeholder_text = "Search for hidden vehicles here...‎" # Placeholder - there's blank characters at the end
         self.set_search_placeholder() # Set placeholder initially
 
         # Content Frame - NEW FRAME TO HOLD CANVAS AND SCROLLBAR
@@ -12701,7 +15946,7 @@ class ConfigViewerApp:
             relief=tk.FLAT,
             bd=0,
             highlightthickness=0,
-            font=font.Font(family="Segoe UI", size=12),  # Increased font size (example: 12)
+            font=font.Font(family="Segoe UI", size=12+self.font_size_add),  # Increased font size (example: 12)
             pady=2   # Increased vertical padding (example: 10 pixels)
         ) # tk.Button, white text, flat style, increased font size and padding
         hidden_window_restart_button.pack(side='bottom', fill='x', padx=10, pady=10) # Pack at the bottom, fill width, BELOW content_frame
@@ -12729,6 +15974,12 @@ class ConfigViewerApp:
 
 
         
+    def _handle_hidden_search_key_release(self, event):
+        """Handles KeyRelease events for the search entry, ignoring Escape."""
+        # print(f"Key released: {event.keysym}") # Optional: for debugging
+        if event.keysym != 'Escape':
+            self.debounce_search()
+
 
 
     def set_search_placeholder(self):
@@ -12811,10 +16062,10 @@ class ConfigViewerApp:
         info_frame = tk.Frame(top_frame, bg="#444444", relief=tk.FLAT, bd=0, highlightthickness=0) # put info_frame in top_frame
         info_frame.pack(side="left", fill="x", expand=True)
 
-        brand_name_label = tk.Label(info_frame, text=f"{vehicle_data['brand']} {vehicle_data['name']}", font=font.Font(size=11, family="Segoe UI", weight='bold'), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
+        brand_name_label = tk.Label(info_frame, text=f"{vehicle_data['brand']} {vehicle_data['name']}", font=font.Font(size=11+self.font_size_add, family="Segoe UI", weight='bold'), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
         brand_name_label.pack(anchor="w")
 
-        folder_zip_label = tk.Label(info_frame, text=f"{vehicle_data['folder']} ({vehicle_data['zip_file']})", font=font.Font(size=10, family="Segoe UI"), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
+        folder_zip_label = tk.Label(info_frame, text=f"{vehicle_data['folder']} ({vehicle_data['zip_file']})", font=font.Font(size=10+self.font_size_add, family="Segoe UI"), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
         folder_zip_label.pack(anchor="w")
 
         # Store label widgets in vehicle_data for easy access later
@@ -12834,7 +16085,8 @@ class ConfigViewerApp:
             relief=tk.FLAT,
             bd=0,
             highlightthickness=0,
-            pady=2    # Increased vertical padding (example: 5 pixels)
+            pady=2,    # Increased vertical padding (example: 5 pixels)
+            font=("Segoe UI", 9+self.font_size_add)
         )
         unhide_button.pack(side="bottom", fill="x", padx=10, pady=(5,10))
         unhide_button.data = vehicle_data
@@ -12865,7 +16117,7 @@ class ConfigViewerApp:
 
 
 
-    def debounce_search(self, event=None):
+    def debounce_search(self):
         if self.hidden_window_search_after_id:
             self.hidden_window.after_cancel(self.hidden_window_search_after_id) # Use hidden_window.after_cancel
         self.hidden_window_search_after_id = self.hidden_window.after(self.hidden_window_search_DEBOUNCE_DELAY_MS, self.filter_vehicles) # Use hidden_window.after
@@ -12904,6 +16156,7 @@ class ConfigViewerApp:
             self.set_vehicle_text_color(vehicle_data, "white") # Set text to white when unhidden
 
         self.check_and_start_hidden_window_restart_button_fade() # Call this after toggling any button
+        self.unhide_was_toggled_in_hidden_window = True 
 
     def remove_hidden_line_from_file(self, line_to_remove):
         try:
@@ -13129,6 +16382,7 @@ class ConfigViewerApp:
             messagebox.showinfo("Deletion Successful",
                                 f"Deleted {deleted_count} custom configs for '{folder_name}'.")
             self._refresh_custom_config_data(folder_name)
+            print("    delete_all_custom_configs_for_vehicle is calling self.update_grid_layout()")
             self.update_grid_layout()
         else:
             messagebox.showinfo("No Configs Found", f"No custom configs found for '{folder_name}'.")
@@ -13183,115 +16437,149 @@ class ConfigViewerApp:
         """
         Handles a click on a picture in the main grid.
         Opens the details subgrid window for the clicked item.
-        MODIFIED to pass folder_name directly, and for Favorites filter logic
-        MODIFIED to pass search query to details window if in "Configs" mode.
+        MODIFIED to check force_details_mode flag before checking main filter state.
         """
-
-
-
-
-
-
-        if self.details_window:
-            self.details_window.destroy()
-
+        # --- Existing initial checks and pause logic ---
+        if self.details_window and self.details_window.winfo_exists():
+            # Optional: Check if it's the *same* folder being clicked again rapidly
+            # If so, maybe just focus? Or proceed with reopen? Current logic proceeds.
+             print("DEBUG: on_picture_click - Destroying existing details window before opening new one.")
+             # Destroy immediately without calling on_details_window_close if it interferes
+             # self.on_details_window_close() # Maybe avoid this if reopen calls it
+             self.details_window.destroy()
+             self.details_window = None
 
 
         print("\n--- on_picture_click() DEBUGGING - ENTRY - PAUSING MAIN GRID LOADING ---")
-
-        # --- NEW: Pause main grid loading BEFORE opening details window ---
         print("DEBUG: on_picture_click - PAUSING main grid loading...")
-        #self.pause_loading = True # PAUSE main grid loading
+        # self.pause_loading = True # Consider if pausing is still needed here or managed elsewhere
         if self.loading_pause_timer:
-            self.master.after_cancel(self.loading_pause_timer) # Cancel any pending resume timer
+            self.master.after_cancel(self.loading_pause_timer)
             self.loading_pause_timer = None
         print("DEBUG: on_picture_click - Main grid loading PAUSED.")
-        # --- NEW: Pause main grid loading BEFORE opening details window ---
 
-
-        # --- Destroy existing details window if open (as before) ---
-        if self.details_window:
-            print("DEBUG: on_picture_click - Destroying existing details window.")
-            self.on_details_window_close()
-            print("DEBUG: on_picture_click - Existing details window destroyed.")
-
-
-
-        print("\n--- on_picture_click() DEBUGGING - EXTENSIVE - CALL STACK TRACE - SELF ID ---") # Debug Entry - Self ID
-        print(f"  DEBUG: on_picture_click - SELF OBJECT ID: {id(self)}") # <--- DEBUG PRINT - SELF OBJECT ID
-
-        # traceback.print_stack(limit=5) # Print the last 5 frames of the call stack
-        print("--- END CALL STACK TRACE ---\n") # End Call Stack Trace
-
+        # --- Debugging info ---
+        print("\n--- on_picture_click() DEBUGGING - EXTENSIVE - CALL STACK TRACE - SELF ID ---")
+        print(f"  DEBUG: on_picture_click - SELF OBJECT ID: {id(self)}")
+        print("--- END CALL STACK TRACE ---\n")
         print(f"  DEBUG: on_picture_click - clicked_folder_name: {clicked_folder_name}")
-        print(f"  DEBUG: on_picture_click - self.filter_state: {self.filter_state}, Type: {type(self.filter_state)}")
-        print(f"  DEBUG: on_picture_click - self.filter_options: {self.filter_options}, Type: {type(self.filter_options)}")
-        print(f"  DEBUG: on_picture_click - self.filter_options[self.filter_state]: {self.filter_options[self.filter_state]}, Type: {type(self.filter_options[self.filter_state])}")
-        print(f"  DEBUG: on_picture_click - Comparing to string 'Favorites', Type: {type('Favorites')}") # Check type of "Favorites" string
-        print(f"  DEBUG: on_picture_click - String comparison result: self.filter_options[self.filter_state] == 'Favorites': {self.filter_options[self.filter_state] == 'Favorites'}")
-        print(f"  DEBUG: on_picture_click - Numerical comparison result: self.filter_state == 5: {self.filter_state == 5}")
 
-        if self.filter_state == 5 and self.filter_options[self.filter_state] == "Favorites":
-            self.details_window_should_open_in_favorites_mode = True
-            print("  DEBUG: on_picture_click - Condition evaluated to TRUE. Setting details_window_should_open_in_favorites_mode = True")
+        # --- <<< MODIFIED: Determine details window mode ---
+        print("  DEBUG: on_picture_click - Determining details_window_should_open_in_favorites_mode...")
+        if hasattr(self, 'force_details_mode') and self.force_details_mode:
+            # Override based on the flag set by toggle_favorites_mode_details_window
+            print(f"  DEBUG: on_picture_click - Override flag 'force_details_mode' is SET: '{self.force_details_mode}'")
+            if self.force_details_mode == 'favorites':
+                self.details_window_should_open_in_favorites_mode = True
+                print("  DEBUG: on_picture_click - Setting details_window_should_open_in_favorites_mode = True (FORCED)")
+            else: # 'all'
+                self.details_window_should_open_in_favorites_mode = False
+                print("  DEBUG: on_picture_click - Setting details_window_should_open_in_favorites_mode = False (FORCED)")
+            # Clear the flag after use!
+            self.force_details_mode = None
+            print("  DEBUG: on_picture_click - Cleared force_details_mode flag.")
         else:
-            self.details_window_should_open_in_favorites_mode = False
-            print("  DEBUG: on_picture_click - Condition evaluated to FALSE. Setting details_window_should_open_in_favorites_mode = False")
+            # Default behavior: Check the main application filter state
+            print("  DEBUG: on_picture_click - No override flag. Checking main filter state.")
+            print(f"  DEBUG: on_picture_click - self.filter_state: {self.filter_state}, Type: {type(self.filter_state)}")
+            print(f"  DEBUG: on_picture_click - self.filter_options: {self.filter_options}, Type: {type(self.filter_options)}")
+            if self.filter_state >= 0 and self.filter_state < len(self.filter_options):
+                 current_filter_option = self.filter_options[self.filter_state]
+                 print(f"  DEBUG: on_picture_click - Current Filter Option: {current_filter_option}, Type: {type(current_filter_option)}")
+                 print(f"  DEBUG: on_picture_click - Comparing to string 'Favorites', Type: {type('Favorites')}")
+                 print(f"  DEBUG: on_picture_click - String comparison result: {current_filter_option == 'Favorites'}")
+                 print(f"  DEBUG: on_picture_click - Numerical comparison result: self.filter_state == 5: {self.filter_state == 5}")
 
-        print(f"  DEBUG: on_picture_click - details_window_should_open_in_favorites_mode is now: {self.details_window_should_open_in_favorites_mode}")
-        print("--- on_picture_click() DEBUGGING - EXTENSIVE - EXIT ---\n") # Debug Exit
+                 # Assuming index 5 is 'Favorites'
+                 if self.filter_state == 5 and current_filter_option == "Favorites":
+                     self.details_window_should_open_in_favorites_mode = True
+                     print("  DEBUG: on_picture_click - Condition based on filter_state evaluated to TRUE. Setting details_window_should_open_in_favorites_mode = True")
+                 else:
+                     self.details_window_should_open_in_favorites_mode = False
+                     print("  DEBUG: on_picture_click - Condition based on filter_state evaluated to FALSE. Setting details_window_should_open_in_favorites_mode = False")
+            else:
+                 print(f"  WARNING: on_picture_click - Invalid filter_state index: {self.filter_state}")
+                 self.details_window_should_open_in_favorites_mode = False # Default to false on error
+                 print("  DEBUG: on_picture_click - Defaulting details_window_should_open_in_favorites_mode = False due to invalid filter state.")
 
+
+        print(f"  DEBUG: on_picture_click - FINAL details_window_should_open_in_favorites_mode is: {self.details_window_should_open_in_favorites_mode}")
+        print("--- on_picture_click() DEBUGGING - EXTENSIVE - EXIT ---\n")
+        # --- >>> END MODIFIED section ---
+
+
+        # --- Existing data retrieval logic ---
         subgrid_data = []
-        #print("  DEBUG: self.full_data keys:", list(self.full_data.keys())) # Debug - full_data keys
-
         if clicked_folder_name in self.full_data: # Now directly check for folder_name in full_data
             print(f"  DEBUG: Accessing folder_name directly in full_data: {clicked_folder_name}") # Debug - Folder Access
-            subgrid_data = self.full_data[clicked_folder_name] # Get subgrid data directly by folder_name
+            # Make sure you are getting the list of configs correctly
+            # Example assuming structure is {'folder': [config_item1, config_item2,...]}
+            # Adjust if your structure is {'folder': {'configs': [item1,...]}}
+            potential_data = self.full_data[clicked_folder_name]
+            if isinstance(potential_data, list): # Direct list of configs
+                 subgrid_data = potential_data
+            elif isinstance(potential_data, dict) and 'configs' in potential_data and isinstance(potential_data['configs'], list): # Nested structure
+                 subgrid_data = potential_data['configs']
+            else:
+                 print(f"  WARNING: Unexpected data structure for folder {clicked_folder_name}. Type: {type(potential_data)}")
+                 subgrid_data = [] # Default to empty if structure is wrong
         else:
             print("  DEBUG: Folder name NOT FOUND in full_data.") # Debug - Folder Not Found
-            messagebox.showinfo("No Details", "No additional details available for this item.")
-            return
+            # Maybe show message? For now, just prevents error.
+            # messagebox.showinfo("No Details", "No additional details available for this item.")
+            return # Exit if folder not found
 
         if not subgrid_data:
             print("  DEBUG: subgrid_data is EMPTY after retrieval.") # Debug - Empty subgrid_data
-            messagebox.showinfo("No Details", "No additional details available for this item.")
-            return
+            # messagebox.showinfo("No Details", "No additional details available for this item.")
+            return # Exit if no data found
         else:
             print(f"  DEBUG: subgrid_data retrieved successfully. Item count: {len(subgrid_data)}") # Debug - Subgrid Data Success
-            for item in subgrid_data:
-                #print(f"    DEBUG: Subgrid Item - picture_path: {item[0]}, folder_name: {item[4]}, zip_file: {item[2]}") # Debug - Subgrid Item details
-                pass
 
 
-        # Check if a details window is already open for this display_key
+        # --- Existing display key and header logic ---
         display_key = clicked_folder_name
-        if self.details_window and not self.details_window_closed and self.current_details_folder == display_key:
-            self.details_window.focus_set()  # Just bring the existing window to the front
-            return
+        # Simple header if info_data is complex to get here
+        details_header = f"Configs for {folder_name_for_display or clicked_folder_name}"
+        try: # Safely try to get Brand/Name for a nicer header
+            info_data = subgrid_data[0][3] if subgrid_data and len(subgrid_data[0]) > 3 and subgrid_data[0][3] else {}
+            brand = info_data.get("Brand", None) if info_data else None
+            name = info_data.get("Name", None) if info_data else None
+            if brand and name:
+                 details_header = f"Configs for {brand} {name} ({display_key})"
+            elif name:
+                 details_header = f"Configs for {name} ({display_key})"
+        except IndexError:
+            print("Warning: Could not access info_data for header due to IndexError.")
+        except Exception as e:
+            print(f"Warning: Error getting info_data for header: {e}")
 
-        info_data = subgrid_data[0][3] if subgrid_data[0][3] else {}
-        brand = info_data.get("Brand", "-") if info_data else "-"
-        name = info_data.get("Name", "-") if info_data else "-"
 
-        details_header = f"Showing configs for {brand or '-'} {name or '-'} ({display_key})" # Header is now simpler
+        # --- Existing search query logic ---
+        search_query_for_details = ""
+        if hasattr(self, 'search_mode') and self.search_mode == "Configs": # Check search_mode exists
+             if hasattr(self, 'search_var'): # Check search_var exists
+                 search_query_for_details = self.search_var.get().strip()
+             else:
+                 print("WARNING: search_var attribute not found.")
+        else:
+             # print("DEBUG: Not in 'Configs' search mode or attribute missing.") # Optional debug
+             pass
 
-        # --- NEW: Pass search query to details window if in "Configs" mode ---
-        search_query_for_details = "" # Default empty query
-        if self.search_mode == "Configs":
-            search_query_for_details = self.search_var.get().strip() # Get current search query from main window
-        # --- NEW: Pass search query to details window if in "Configs" mode ---
 
-
-        # --- MODIFIED: Pass 'self' instance and search_query_for_details ---
+        # --- Existing call to display_subgrid_in_new_window ---
+        print(f"  DEBUG: Calling display_subgrid_in_new_window for {display_key} with favorites_mode={self.details_window_should_open_in_favorites_mode}")
         self.display_subgrid_in_new_window(
-            self,  # <--- PASS 'self' (the ConfigViewerApp instance) as the FIRST argument
+            self,
             subgrid_data,
-            "folder_grouped",
+            "folder_grouped", # Confirm this is the correct zip_file placeholder
             details_header,
             display_key,
-            search_query=search_query_for_details # <--- PASS search query here
+            search_query=search_query_for_details
         )
-        print("--- on_picture_click() DEBUGGING END ---\n") # Debug Exit
+        print("--- on_picture_click() DEBUGGING END ---\n")
+
+
      
   
         
@@ -13310,6 +16598,8 @@ class ConfigViewerApp:
             current_filter = self.filter_options[self.filter_state] # Get filter name
             self.filter_button.config(text=f"{current_filter} [0]") # Update button text
             print(f"  DEBUG: set_main_grid_filter_mode - Filter state set to index: {filter_index}, text: '{current_filter}'") # Debug - State Set
+            
+            print("    set_main_grid_filter_mode is calling self.perform_search()")
             self.perform_search() # Re-apply search with new filter
             print("  DEBUG: set_main_grid_filter_mode - perform_search() called.") # Debug - Perform Search Called
         else:
@@ -13320,102 +16610,106 @@ class ConfigViewerApp:
 
 
     def toggle_favorites_mode_details_window(self):
-        """Toggles between 'View Favorites' and 'View All' modes in the details window, AND switches main grid filter.""" # Modified docstring
+        """
+        Toggles between 'View Favorites' and 'View All' modes JUST FOR the details window,
+        by closing and reopening it with the desired mode, without affecting the main grid filter.
+        """ # <<< MODIFIED docstring
         folder_name = self.current_details_folder
 
         print("\n--- toggle_favorites_mode_details_window() DEBUG ENTRY ---") # Debug - Entry
         print(f"  DEBUG: toggle_favorites_mode_details_window - Current details_window_is_favorites_filtered (BEFORE): {self.details_window_is_favorites_filtered}") # Debug - Before Check
         print(f"  DEBUG: toggle_favorites_mode_details_window - is_data_subset_active: {self.is_data_subset_active}") # Debug - Check global filter state
 
-        if self.is_data_subset_active: # <--- CHECK GLOBAL FILTER STATE HERE
-            #messagebox.showinfo(
-            #    "Action Unavailable",
-            #    "Please switch out of a filtered state first.",
-            #    parent=self.details_window
-            #)
-            scanning_win = None  # Initialize scanning_win
-
-            scanning_win = self.show_scanning_window(text="Cannot switch between View All/Favorites mode while filters are active.")
-            time.sleep(3.125)
-            if scanning_win:
-                scanning_win.destroy()
-
-            print("--- toggle_favorites_mode_details_window() EXIT - Global filter active ---\n") # Debug - Exit - Global Filter Active
-            return # <--- RETURN HERE IF GLOBAL FILTERS ARE ON
-
-
-        if self.details_window_is_favorites_filtered:
-            # Switch to View All mode
-            self.details_window_should_open_in_favorites_mode = False # TOGGLE FLAG HERE
-            button_text = "View Favorites"
-            print(f"  DEBUG: toggle_favorites_mode_details_window - Mode: View All, Setting details_window_is_favorites_filtered = FALSE, button_text = '{button_text}'") # Debug - View All Mode
-            
-            
-            self.search_var.set("")
-            self.set_main_grid_filter_mode(0) # <--- SET MAIN GRID FILTER TO "Show All..." (index 0)
-            print("  DEBUG: toggle_favorites_mode_details_window - Calling set_main_grid_filter_mode(0) for 'Show All'.") # Debug - Main Grid Filter Set
-
-        else:
-            # Switch to View Favorites mode
-            if self.check_favorites_exist_for_folder(folder_name):
-                self.details_window_should_open_in_favorites_mode = True # TOGGLE FLAG HERE
-                button_text = "View All"
-                print(f"  DEBUG: toggle_favorites_mode_details_window - Mode: View Favorites, Setting details_window_is_favorites_filtered = TRUE, button_text = '{button_text}'") # Debug - Favorites Mode
-
-                self.set_main_grid_filter_mode(5) # <--- SET MAIN GRID FILTER TO "Favorites" (index 5)
-                print("  DEBUG: toggle_favorites_mode_details_window - Calling set_main_grid_filter_mode(5) for 'Favorites'.") # Debug - Main Grid Filter Set
-
-                self.search_var.set("") # <--- CLEAR MAIN SEARCH BAR TEXT HERE
-                print("  DEBUG: toggle_favorites_mode_details_window - Clearing main search bar text.") # Debug
-                self.perform_search() # <--- PERFORM SEARCH ON MAIN GRID AFTER CLEARING SEARCH BAR <--- ADDED HERE
-                print("  DEBUG: toggle_favorites_mode_details_window - Calling perform_search() on main grid.") # Debug
-                
-                
-                           
-                
-                # --- MODIFICATION START: Open Search Results Window when switching to Favorites Mode ---
-                if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
-                    self.search_results_window = self._create_search_results_window(self.data) # Pass current data (main grid data)
-                    print("DEBUG: toggle_favorites_mode_details_window - Search Results window CREATED when switching to Favorites Mode.")
-                self.search_results_window.lift() # Bring to front if already open
-                print("DEBUG: toggle_favorites_mode_details_window - Search Results window LIFTED when switching to Favorites Mode.")
-
-                #self.master.after(500, self.reopen_details_window_in_current_mode) # Reopen window with 100ms delay don't uncomment this 
-                self.reopen_details_window_in_current_mode() # Call reopen ONLY if favorites exist
-                print("--- toggle_favorites_mode_details_window() EXIT - Favorites Exist Case ---\n") # Debug - Exit - Favs Exist
-                return # EARLY EXIT - IMPORTANT: Return here after reopen - REMOVED RETURN FOR DELAY TEST
-            else:
-                #messagebox.showinfo("Favorites", "No favorites for this folder.", parent=self.details_window)
-                scanning_win = None  # Initialize scanning_win
-
-                scanning_win = self.show_scanning_window(text="No favorites added for this vehicle.")
-                time.sleep(3.125)
-                if scanning_win:
+        if self.is_data_subset_active: # Check if global filters (like Brand, Name etc.) are active
+            scanning_win = None
+            try:
+                scanning_win = self.show_scanning_window(text="Cannot switch detail view mode while main filters are active.")
+                # Use after to destroy the window non-blockingly
+                self.master.after(3125, lambda: scanning_win.destroy() if scanning_win and scanning_win.winfo_exists() else None)
+            except Exception as e:
+                 print(f"Error managing scanning window: {e}")
+                 if scanning_win and scanning_win.winfo_exists():
                     scanning_win.destroy()
 
+            print("--- toggle_favorites_mode_details_window() EXIT - Global filter active ---\n") # Debug - Exit - Global Filter Active
+            return # Exit if global filters are on
 
-                button_text = "View Favorites" # Keep button text as "View Favorites" if no favs
-                print("  DEBUG: toggle_favorites_mode_details_window - No Favorites Exist, button_text = 'View Favorites'") # Debug - No Favs Case
-                return
+        # Initialize the flag before deciding the mode
+        self.force_details_mode = None # <<< ADDED: Ensure flag is reset initially
+
+        if self.details_window_is_favorites_filtered:
+            # Current is Favorites -> Switch to View All mode for reopen
+            self.force_details_mode = 'all' # <<< MODIFIED: Set flag for reopen
+            button_text = "View Favorites"
+            print(f"  DEBUG: toggle_favorites_mode_details_window - Mode: View All Requested. Setting force_details_mode = '{self.force_details_mode}'") # Debug - View All Mode
+
+            # self.set_main_grid_filter_mode(0) # <<< REMOVED: Do not change main grid filter
+            # print("  DEBUG: toggle_favorites_mode_details_window - Calling set_main_grid_filter_mode(0) for 'Show All'.") # <<< REMOVED
+
+        else:
+            # Current is View All -> Switch to View Favorites mode for reopen
+            if self.check_favorites_exist_for_folder(folder_name):
+                self.force_details_mode = 'favorites' # <<< MODIFIED: Set flag for reopen
+                button_text = "View All"
+                print(f"  DEBUG: toggle_favorites_mode_details_window - Mode: View Favorites Requested. Setting force_details_mode = '{self.force_details_mode}'") # Debug - Favorites Mode
+
+                # self.set_main_grid_filter_mode(5) # <<< REMOVED: Do not change main grid filter
+                # print("  DEBUG: toggle_favorites_mode_details_window - Calling set_main_grid_filter_mode(5) for 'Favorites'.") # <<< REMOVED
+
+                # self.search_var.set("") # <<< REMOVED: Do not clear main search bar
+                # print("  DEBUG: toggle_favorites_mode_details_window - Clearing main search bar text.") # <<< REMOVED
+                # self.perform_search() # <<< REMOVED: Do not perform search on main grid
+                # print("  DEBUG: toggle_favorites_mode_details_window - Calling perform_search() on main grid.") # <<< REMOVED
+
+                # --- REMOVED: Do not open separate Search Results Window ---
+                # if not hasattr(self, 'search_results_window') or not self.search_results_window or not self.search_results_window.winfo_exists():
+                #     self.search_results_window = self.show_search_results_window(self.data)
+                #     print("DEBUG: toggle_favorites_mode_details_window - Search Results window CREATED when switching to Favorites Mode.")
+                # self.search_results_window.lift()
+                # print("DEBUG: toggle_favorites_mode_details_window - Search Results window LIFTED when switching to Favorites Mode.")
+                # --- REMOVED ---
+
+                # NOTE: We proceed to call reopen_details_window_in_current_mode below ONLY if favorites exist
+            else:
+                # No favorites exist for this folder, inform user and do nothing else
+                scanning_win = None
+                try:
+                    scanning_win = self.show_scanning_window(text="No favorites added for this vehicle.")
+                    self.master.after(3125, lambda: scanning_win.destroy() if scanning_win and scanning_win.winfo_exists() else None)
+                except Exception as e:
+                    print(f"Error managing scanning window: {e}")
+                    if scanning_win and scanning_win.winfo_exists():
+                        scanning_win.destroy()
+
+                print("  DEBUG: toggle_favorites_mode_details_window - No Favorites Exist, cannot switch.") # Debug - No Favs Case
+                # Keep button text as "View Favorites" since we didn't switch
+                # Do not set force_details_mode, do not call reopen
+                print("--- toggle_favorites_mode_details_window() EXIT - No Favorites Found Case ---\n")
+                return # Exit because no favorites found
 
 
-        self.details_view_favorites_button.config(text=button_text) # Update button text
-        print(f"  DEBUG: toggle_favorites_mode_details_window - Button text UPDATED to: '{button_text}'") # Debug - Button Text Update
+        # --- Call the reopen mechanism ONLY IF a mode was determined ---
+        if self.force_details_mode:
+             print(f"  DEBUG: toggle_favorites_mode_details_window - Calling reopen mechanism with force_details_mode = '{self.force_details_mode}'")
+             # Assuming self.reopen_details_window_in_current_mode closes the current
+             # window and then effectively triggers on_picture_click(self.current_details_folder)
+             self.reopen_details_window_in_current_mode()
+             print("--- toggle_favorites_mode_details_window() EXIT - Reopen Triggered ---\n")
+        else:
+             # This case should ideally not be reached if logic above is correct, but good for safety
+             print("--- toggle_favorites_mode_details_window() EXIT - No Mode Change ---\n")
 
-        # --- ADDED DELAY HERE ---
-        #self.master.after(500, self.reopen_details_window_in_current_mode) # Reopen window with 100ms delay
-        # --- ADDED DELAY HERE ---
-        self.reopen_details_window_in_current_mode()
-        print("--- toggle_favorites_mode_details_window() EXIT - Normal Exit ---\n")
- 
+
+
     
+   
    
 
     # ------------------------------------------------------------
     # Details Subgrid (individual configs)
     # ------------------------------------------------------------
 
-
+   
     def display_subgrid_in_new_window(self, app_instance, subgrid_data, zip_file, details_header, display_key, search_query=""):
         """Opens a new Toplevel window to display a subgrid (list of configs)."""
         # --- NEW: Check and close Filters window if open ---
@@ -13439,11 +16733,15 @@ class ConfigViewerApp:
             self.filters_window.destroy()
             self.filters_window = None
 
-        print("\n--- display_subgrid_in_new_window() ENTRY - DEBUGGING FLAG VALUE - SELF ID ---")  # Debug Entry - Self ID
+        print("\n--- display_subgrid_in_new_window() ENTRY - DEBUGGING FLAG VALUE - SELF ID ---")
         print(f"  DEBUG: display_subgrid_in_new_window - SELF OBJECT ID: {id(self)}")
+        print(f"  DEBUG: display_subgrid_in_new_window - VALUE CHECK *BEFORE* LOGIC: self.details_window_should_open_in_favorites_mode = {getattr(self, 'details_window_should_open_in_favorites_mode', 'ATTRIBUTE_MISSING')}")
+
+        # Use the flag passed implicitly via self.details_window_should_open_in_favorites_mode
         print(f"  DEBUG: display_subgrid_in_new_window - ENTERING FUNCTION. Value of self.details_window_should_open_in_favorites_mode: {self.details_window_should_open_in_favorites_mode}")
         print(f"  DEBUG: display_subgrid_in_new_window - Received search_query: '{search_query}'")
 
+        # --- Prepare window state, create UI elements ---
         self._prepare_details_window_state(subgrid_data, zip_file, display_key)
         self._create_details_window()
         self._position_details_window()
@@ -13451,98 +16749,118 @@ class ConfigViewerApp:
         self._create_top_frame_content(details_header)
         self._create_bottom_frame_content()
         self._create_subgrid_canvas()
-        self._create_details_sidebar()
-        self._create_sidebar_buttons(zip_file)
 
-        # --- START MODIFICATION FOR DATA SUBSET FILTERING (apply BEFORE other filters) ---
-        if self.is_data_subset_active:  # Apply data subset filter if active
+        # --- Extract Brand Name for Potential Favorites Label ---
+        brand_name_for_label = "Unknown Brand" # Default
+        if subgrid_data:
+            try:
+                first_item_info = subgrid_data[0][3] if len(subgrid_data[0]) >= 4 else None
+                if first_item_info and isinstance(first_item_info, dict):
+                    brand_name_for_label = first_item_info.get("Brand", "Unknown Brand").strip()
+                    if not brand_name_for_label:
+                        brand_name_for_label = "Unknown Brand"
+            except (IndexError, TypeError):
+                print("Warning: Could not get brand name from first subgrid item for favorites label.")
+        # --- End Extract Brand Name ---
+
+        # --- <<< ADD DEBUG PRINT RIGHT BEFORE CALLING _create_details_sidebar >>> ---
+        should_be_fav_mode = getattr(self, 'details_window_should_open_in_favorites_mode', False)
+        print(f"  DEBUG: display_subgrid_in_new_window - *** CALLING _create_details_sidebar *** with is_favorites_mode={should_be_fav_mode}, brand_name='{brand_name_for_label}'")
+        # --- <<< END DEBUG PRINT >>> ---
+
+        # --- Create Sidebar - Pass Favorites Mode Flag and Brand Name ---
+        self._create_details_sidebar(
+            is_favorites_mode=should_be_fav_mode, # Use the checked value
+            brand_name=brand_name_for_label
+        )
+        # --- End Create Sidebar ---
+
+        self._create_sidebar_buttons(zip_file)  # Ensure details_view_favorites_button is created here
+
+
+
+        # --- Data Subset Filtering (if active) ---
+        if self.is_data_subset_active:
             print("DEBUG: display_subgrid_in_new_window - Data Subset Active - Filtering Subgrid Data by data_subset.txt")
-            subgrid_data = self._apply_details_data_subset_filter(subgrid_data) # Filter subgrid_data
+            subgrid_data = self._apply_details_data_subset_filter(subgrid_data)
             print(f"DEBUG: display_subgrid_in_new_window - Subgrid data count AFTER Data Subset filter: {len(subgrid_data)}")
-        # --- END MODIFICATION FOR DATA SUBSET FILTERING ---
 
+        # --- Determine display mode (Favorites or All) ---
+        print(f"display_subgrid_in_new_window: Checking details_window_should_open_in_favorites_mode: {self.details_window_should_open_in_favorites_mode}")
 
-        # --- START MODIFICATION FOR FAVORITES FILTER (and DEFAULTING to Favorites Only) ---
-        print(f"display_subgrid_in_new_window: Checking details_window_should_open_in_favorites_mode: {self.details_window_should_open_in_favorites_mode}") # DEBUG
         if self.details_window_should_open_in_favorites_mode:
-            print("DEBUG: display_subgrid_in_new_window - details_window_should_open_in_favorites_mode is TRUE (Filtering Subgrid Data).")
+            # *** Displaying Favorites ***
+            print("DEBUG: display_subgrid_in_new_window - details_window_should_open_in_favorites_mode is TRUE (Filtering Subgrid Data for Favorites).")
             self.details_is_favorites_filter_active = True
+            self.details_window_is_favorites_filtered = True
+            print(f"  DEBUG: display_subgrid_in_new_window - Setting details_window_is_favorites_filtered = True")
+
+            # --- Filter data for favorites (with deduplication) ---
             favorite_configs_set = self.read_favorites()
             filtered_subgrid_data = []
+            added_fav_keys = set()
             print(f"  DEBUG: favorite_configs_set: {favorite_configs_set}")
-            for item in subgrid_data: # Use ALREADY subsetted data here
+            for item in subgrid_data:
                 pic, spawn_cmd, zip_file_item, info_data, folder_name = item
                 config_name = self.extract_name_from_spawn_command(spawn_cmd)
-                fav_key = f"{folder_name}|{config_name}.pc"
+                if config_name: # Ensure config_name was extracted
+                    fav_key = f"{folder_name}|{config_name}.pc"
+                    if fav_key in favorite_configs_set and fav_key not in added_fav_keys:
+                        filtered_subgrid_data.append(item)
+                        added_fav_keys.add(fav_key)
+            print(f"DEBUG: Original subgrid data count: {len(subgrid_data)}, Filtered count (Favorites - Deduplicated): {len(filtered_subgrid_data)}")
+            final_subgrid_data = filtered_subgrid_data # Start with favorites data
 
-                print(f"    DEBUG: Checking item - folder_name: {folder_name}, config_name: {config_name}, fav_key: {fav_key}")
-                if fav_key in favorite_configs_set:
-                    print(f"      DEBUG: fav_key '{fav_key}' FOUND in favorite_configs_set. Appending item.")
-                    filtered_subgrid_data.append(item)
-                else:
-                    print(f"      DEBUG: fav_key '{fav_key}' NOT found in favorite_configs_set. Skipping item.")
-
-            print(f"DEBUG: Original subgrid data count: {len(subgrid_data)}, Filtered count (Favorites): {len(filtered_subgrid_data)}")
-            # --- MODIFIED: Filter data by search query NOW, BEFORE _initial_details_layout
+            # --- Apply search query if provided ---
             if search_query:
                 print(f"DEBUG: Applying search query '{search_query}' BEFORE initial layout (Favorites Mode).")
-                search_filtered_data = self._filter_details_data_by_query(filtered_subgrid_data, search_query) # Filter already FAVORITES data by query
-                final_subgrid_data = search_filtered_data # Use search-filtered data
+                final_subgrid_data = self._filter_details_data_by_query(final_subgrid_data, search_query)
+
+            # --- Layout and Button Config ---
+            self._initial_details_layout(final_subgrid_data, zip_file)
+            self.details_filtered_data = final_subgrid_data[:]
+            if hasattr(self, 'details_view_favorites_button') and self.details_view_favorites_button:
+                 self.details_view_favorites_button.config(text="View All")
+                 print("DEBUG: display_subgrid_in_new_window - Button text set to 'View All'")
             else:
-                final_subgrid_data = filtered_subgrid_data # Use only favorites-filtered data
-            # --- MODIFIED: Filter data by search query NOW, BEFORE _initial_details_layout
+                 print("WARNING: details_view_favorites_button not found or not valid.")
 
-            self._initial_details_layout(final_subgrid_data, zip_file) # Use FINAL filtered data (favorites AND search)
-            self.details_filtered_data = final_subgrid_data[:] # Update details_filtered_data
-            self.details_favorites_filter_button.config(text="Filter: Favorites Only")
-            self.details_view_favorites_button.config(text="View All") # Set button text to "View All"
-            print("DEBUG: display_subgrid_in_new_window - Button text set to 'View All'")
-            self.details_window_should_open_in_favorites_mode = False
-            self.show_progress_bar_details() # <----- SHOW PROGRESS BAR HERE
-
-        else: # Default case: Show All (non-favorites mode)
+        else:
+            # *** Displaying All ***
             print("DEBUG: display_subgrid_in_new_window - details_window_should_open_in_favorites_mode is FALSE (Show All).")
             self.details_is_favorites_filter_active = False
-             # --- MODIFIED: Filter data by search query NOW, BEFORE _initial_details_layout
+            self.details_window_is_favorites_filtered = False
+            print(f"  DEBUG: display_subgrid_in_new_window - Setting details_window_is_favorites_filtered = False")
+
+            final_subgrid_data = subgrid_data # Start with all (potentially subsetted) data
+
+            # --- Apply search query if provided ---
             if search_query:
                 print(f"DEBUG: Applying search query '{search_query}' BEFORE initial layout (Show All Mode).")
-                search_filtered_data = self._filter_details_data_by_query(subgrid_data, search_query) # Filter ALL data by query
-                final_subgrid_data = search_filtered_data # Use search-filtered data
+                final_subgrid_data = self._filter_details_data_by_query(final_subgrid_data, search_query)
+
+            # --- Layout and Button Config ---
+            self._initial_details_layout(final_subgrid_data, zip_file)
+            self.details_filtered_data = final_subgrid_data[:]
+            if hasattr(self, 'details_view_favorites_button') and self.details_view_favorites_button:
+                 self.details_view_favorites_button.config(text="View Favorites")
+                 print("DEBUG: display_subgrid_in_new_window - Button text set to 'View Favorites'")
             else:
-                final_subgrid_data = subgrid_data # Use all data if no search
-            # --- MODIFIED: Filter data by search query NOW, BEFORE _initial_details_layout
-
-            self._initial_details_layout(final_subgrid_data, zip_file) # Use FINAL filtered data (search or all)
-            self.details_filtered_data = final_subgrid_data[:] # Initialize details_filtered_data
-            self.details_favorites_filter_button.config(text="Filter: Show All")
-            self.details_view_favorites_button.config(text="View Favorites") # Set button text to "View Favorites"
-            print("DEBUG: display_subgrid_in_new_window - Button text set to 'View Favorites'")
-            self.show_progress_bar_details() # <----- SHOW PROGRESS BAR HERE
-        # --- END MODIFICATION FOR FAVORITES FILTER (and DEFAULTING to Favorites Only) ---
+                 print("WARNING: details_view_favorites_button not found or not valid.")
 
 
-        # --- NEW: Set search query in details window BUT DO NOT PERFORM SEARCH YET ---
-        if search_query: # Only if search_query is not empty
-            print(f"  DEBUG: display_subgrid_in_new_window - Setting details_search_var to: '{search_query}' (but NOT performing search yet).") # Debug
-            self.details_search_var.set(search_query) # Set the search variable
-        # --- NEW: Set search query in details window BUT DO NOT PERFORM SEARCH YET ---
+        # --- Common final steps ---
+        self.show_progress_bar_details()
 
+        if search_query:
+            print(f"  DEBUG: display_subgrid_in_new_window - Setting details_search_var to: '{search_query}' (but NOT performing search yet).")
+            self.details_search_var.set(search_query)
 
-        # --- NEW: Set details_window_is_favorites_filtered flag based on main filter ---
-        if self.filter_state == 5 and self.filter_options[self.filter_state] == "Favorites":
-            self.details_window_is_favorites_filtered = True
-        else:
-            self.details_window_is_favorites_filtered = False
-        print(f"display_subgrid_in_new_window - details_window_is_favorites_filtered set to: {self.details_window_is_favorites_filtered}")
-
-        # --- NO NEED TO SCHEDULE perform_details_search() HERE ANYMORE ---
-        # if search_query:
-        #     self.master.after_idle(self.perform_details_search) # Schedule search after idle tasks (layout) - REMOVED
-        #     print("  DEBUG: display_subgrid_in_new_window - Scheduled perform_details_search() to run AFTER ALL OTHER SETUP.") # Debug - Search Scheduled LAST
+        print(f"display_subgrid_in_new_window - Final state check: details_window_is_favorites_filtered is: {self.details_window_is_favorites_filtered}")
 
         print("--- display_subgrid_in_new_window() EXIT ---\n")
-  
-   
+
+
 
 
 #################
@@ -13585,7 +16903,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font": ("Segoe UI", 10)
+            "font": ("Segoe UI", 10+self.font_size_add)
         }
 
         def on_jump_to_page_button_hover_enter(event):
@@ -13612,9 +16930,12 @@ class ConfigViewerApp:
         self.jump_to_page_button.bind("<Button-1>", on_jump_to_page_button_click)
 
 
+        if not self.jump_to_page_button_should_be_bottom:
 
-        self.jump_to_page_button.pack(side="left", padx=(10, 0)) # Pack after search bar and before loading label
+            self.jump_to_page_button.pack(side="left", padx=(10, 0)) # Pack after search bar and before loading label
 
+        else:
+            pass
 
 
     def handle_jump_to_page_button_click(self):
@@ -13622,18 +16943,48 @@ class ConfigViewerApp:
         if hasattr(self, 'jump_to_page_dropdown_window') and self.jump_to_page_dropdown_window and self.jump_to_page_dropdown_window.winfo_exists():
             self.jump_to_page_dropdown_window.destroy()
             return
+        
 
-        button = self.jump_to_page_button
-        button_x = button.winfo_rootx()
-        button_y = button.winfo_rooty() + button.winfo_height()
+        if not self.jump_to_page_button_should_be_bottom:
 
-        self.jump_to_page_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+
+
+            button = self.jump_to_page_button
+
+            button_x = button.winfo_rootx()
+            button_y = button.winfo_rooty() + button.winfo_height()
+
+            self.jump_to_page_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+
+            dropdown_window.geometry(f"+{button_x}+{button_y}")
+
+
+        else:
+
+
+            button = self.jump_to_page_button_bottom
+
+            button_x = button.winfo_rootx()
+            button_y = button.winfo_rooty() # Get the top of the button
+
+            self.jump_to_page_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+            button_width = button.winfo_width() # Get the width of the button
+
+            #dropdown_window.update_idletasks()
+            #dropdown_height = dropdown_window.winfo_height()
+            #dropdown_y = button_y - dropdown_height
+            #dropdown_window.geometry(f"+{button_x - 31}+{dropdown_y - 43}")
+
+
+
+
+
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
-        dropdown_window.geometry(f"+{button_x}+{button_y}")
         dropdown_window.config(bg="#333333")
         dropdown_window.attributes("-topmost", True)
         dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+
 
         canvas = tk.Canvas(dropdown_window, bg="#333333", highlightthickness=0, width=100, height=200) # Width same as zip dropdown, make scrollable
         scrollbar = tk.Scrollbar(dropdown_window, orient="vertical", command=canvas.yview)
@@ -13667,7 +17018,7 @@ class ConfigViewerApp:
             page_button = tk.Button(
                 scrollable_frame,
                 text=f"Page {i}",
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda idx=i: on_page_button_click(idx),
                 borderwidth=1,
                 relief="solid",
@@ -13686,7 +17037,7 @@ class ConfigViewerApp:
         close_button = tk.Button(
             dropdown_window, # Place in dropdown_window
             text="Close",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 10+self.font_size_add, "bold"),
             command=self.destroy_jump_to_page_dropdown_menu,
             bg="#666666",
             fg="white",
@@ -13698,12 +17049,26 @@ class ConfigViewerApp:
         close_button.pack(side="bottom", fill="x") # Pack to bottom of dropdown_window
         # --- Close Button (below scrollable frame, in dropdown_window) ---
 
+        # Force update to calculate window size based on content
+        dropdown_window.update_idletasks()
+        # Get the actual dimensions of the dropdown window
+        window_width = dropdown_window.winfo_width()
+        window_height = dropdown_window.winfo_height()
+        # Calculate target X (button's right edge - window width)
+        target_x = (button_x + button_width) - window_width
+        # Calculate target Y (button's top edge - window height)
+        target_y = button_y - window_height
+        # Set the final position
+        dropdown_window.geometry(f"+{target_x}+{target_y}")
+
+
         dropdown_window.bind("<FocusOut>", lambda event: self.destroy_jump_to_page_dropdown_menu())
 
     def destroy_jump_to_page_dropdown_menu(self):
         if hasattr(self, 'jump_to_page_dropdown_window') and self.jump_to_page_dropdown_window and self.jump_to_page_dropdown_window.winfo_exists():
             self.jump_to_page_dropdown_window.destroy()
             self.jump_to_page_dropdown_window = None
+
 
     def go_to_details_page(self, page_index):
         """Navigates to the specified page in the details window."""
@@ -13768,7 +17133,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            "font": ("Segoe UI", 10) # REMOVE BOLD FONT - for zip search button
+            "font": ("Segoe UI", 10+self.font_size_add) # REMOVE BOLD FONT - for zip search button
         }
 
         def on_zip_search_button_hover_enter(event):
@@ -13795,7 +17160,7 @@ class ConfigViewerApp:
             top_details_frame,
             text=initial_button_text,
             **button_style_args_zip_search, # <--- APPLY BUTTON STYLES - zip search button style
-            #font=("Segoe UI", 10), # Removed redundant font argument HERE
+            #font=("Segoe UI", 10+self.font_size_add), # Removed redundant font argument HERE
             command=self.handle_zip_search_button_click
         )
 
@@ -13957,7 +17322,7 @@ class ConfigViewerApp:
         details_window.tk.call('tk', 'scaling', 1.25)
 
         details_window.title("Details List")
-        details_window.protocol("WM_DELETE_WINDOW", self.on_details_window_close)
+        details_window.protocol("WM_DELETE_WINDOW", self.close_details_window_from_x_button)
         self.details_window = details_window
         details_window.resizable(False, False)
         #details_window.transient(self.master)
@@ -13976,9 +17341,15 @@ class ConfigViewerApp:
         #details_window.bind("<Button-1>", self.on_details_window_click) 
         #details_window.bind("<ButtonPress-1>", self.on_details_window_click)
         details_window.bind("<ButtonPress-1>", self.debounced_on_details_window_click)
-        #self.details_window.bind_all("<Control-n>", lambda event: self.clear_details_sidebar_content())
+
+        #self.details_window.bind("<Escape>", lambda event: self.on_details_window_close())
+        #self.details_window.bind_all("<Control-n>", lambda event: self.clear_details_sidebar_content()) # debug
 
 
+    def close_details_window_from_x_button(self):
+        self.details_window_intentionally_closed = True
+        self.on_details_window_close()
+        
 
 
     def clear_details_sidebar_content(self):
@@ -14129,11 +17500,10 @@ class ConfigViewerApp:
 
         top_details_frame = tk.Frame(details_main_frame, bg="#333333", pady=5) # <--- CHANGED bg to "#333333"
         top_details_frame.pack(side="top", fill="x")
-        # self.smooth_fade_in_frame(top_details_frame, start_color="#FFFFFF", end_color="#D3D3D3", steps=15, delay=30) # <--- COMMENTED OUT FADE-IN
 
         bottom_details_frame = tk.Frame(details_main_frame, bg="#333333", pady=5) # <--- CHANGED bg to "#333333"
         bottom_details_frame.pack(side="bottom", fill="x")
-        # self.smooth_fade_in_frame(bottom_details_frame, start_color="#FFFFFF", end_color="#D3D3D3", steps=15, delay=30) # <--- COMMENTED OUT FADE-IN
+
 
         self.top_details_frame = top_details_frame # Storing for potential future use if needed
         self.bottom_details_frame = bottom_details_frame # Storing for potential future use if needed
@@ -14145,7 +17515,7 @@ class ConfigViewerApp:
     def _create_top_frame_content(self, details_header):
         """Creates content for the top frame of the details window (search, header, loading label, View Favorites button)."""
         # --- REMOVED "Search (Details):" label ---
-        # lbl_search_details = tk.Label(self.top_details_frame, text="Search (Details):", bg="#333333", fg="white", font=("Segoe UI", 10))
+        # lbl_search_details = tk.Label(self.top_details_frame, text="Search (Details):", bg="#333333", fg="white", font=("Segoe UI", 10+self.font_size_add))
         # lbl_search_details.pack(side="left", padx=(10, 5))
         # --- REMOVED "Search (Details):" label ---
 
@@ -14157,7 +17527,7 @@ class ConfigViewerApp:
             "highlightbackground": "#555555",
             "activebackground": "#666666",
             "activeforeground": "white",
-            #"font":("Segoe UI", 12, "bold") # REMOVE BOLD FONT - for details top bar buttons
+            #"font":("Segoe UI", 12+self.font_size_add, "bold") # REMOVE BOLD FONT - for details top bar buttons
         }
 
         def on_details_top_button_hover_enter(event):
@@ -14173,7 +17543,7 @@ class ConfigViewerApp:
             event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_details_top_button_hover_leave(e, bg, fg))
 
 
-        details_search_button = tk.Button(self.top_details_frame, text="🔍", font=("Segoe UI", 12),
+        details_search_button = tk.Button(self.top_details_frame, text="🔍", font=("Segoe UI", 12+self.font_size_add),
                                           command=self.perform_details_search, **button_style_args_details_top_bar) # <--- APPLY button_style_args
 
         details_search_button.bind("<Enter>", on_details_top_button_hover_enter)
@@ -14183,24 +17553,24 @@ class ConfigViewerApp:
 
 
         self.details_search_var = tk.StringVar()
-        details_search_entry = tk.Entry(self.top_details_frame, textvariable=self.details_search_var, font=("Segoe UI", 10),
+        details_search_entry = tk.Entry(self.top_details_frame, textvariable=self.details_search_var, font=("Segoe UI", 10+self.font_size_add),
                                         width=40, bg="lightgrey")
         details_search_entry.pack(side="left", padx=(0, 10)) # <--- PACK ENTRY SECOND
         #details_search_entry.bind("<Return>", lambda e: self.perform_details_search())
-        details_search_entry.bind("<KeyRelease>", lambda event: self.start_debounce_details_highlighting()) # <--- ADD THIS LINE - KEYRELEASE BINDING
+        details_search_entry.bind("<KeyRelease>", self._handle_details_search_key_release) # <--- ADD THIS LINE - KEYRELEASE BINDING
 
         self.add_zip_search_dropdown_to_details_window(self.top_details_frame) # <--- ADDED HERE - call the new function
         self.add_jump_to_page_button_to_details_window(self.top_details_frame) # <--- ADDED HERE - call the new function
 
         #self.custom_config_label_details = tk.Label(self.top_details_frame, text=details_header, bg="#333333",
-        #                                            font=("Segoe UI", 12, "bold",), fg="white")
+        #                                            font=("Segoe UI", 12+self.font_size_add, "bold",), fg="white")
         #self.custom_config_label_details.pack(side="left", padx=(20, 0))
 
         self.details_loading_label = tk.Label(
             self.top_details_frame,
             text="",
             bg="#333333",
-            font=("Segoe UI", 12, "bold")
+            font=("Segoe UI", 12+self.font_size_add, "bold")
         )
         self.details_loading_label.pack(side="left", padx=(10, 10)) # Pack loading label BEFORE button
 
@@ -14211,7 +17581,7 @@ class ConfigViewerApp:
         self.details_view_favorites_button = tk.Button(
             self.top_details_frame,
             text=button_text,
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 10+self.font_size_add),
             command=self.toggle_favorites_mode_details_window,
             **button_style_args_details_top_bar # <--- APPLY BUTTON STYLE - details top bar style
         )
@@ -14224,8 +17594,8 @@ class ConfigViewerApp:
         self.details_back_button = tk.Button(
             self.top_details_frame,
             text="Back",
-            font=("Segoe UI", 10),
-            command=self.on_details_window_close, # Use existing close function
+            font=("Segoe UI", 10+self.font_size_add),
+            command=self.close_details_window_from_x_button, # Use existing close function
             **button_style_args_details_top_bar
         )
         self.details_back_button.bind("<Enter>", on_details_top_button_hover_enter)
@@ -14234,6 +17604,13 @@ class ConfigViewerApp:
         self.details_back_button.pack(side="right", padx=(0, 10)) # Pack on the right, with padding
 
         self.details_header_original_color = "white"
+
+
+    def _handle_details_search_key_release(self, event):
+        """Handles KeyRelease events for the search entry, ignoring Escape."""
+        # print(f"Key released: {event.keysym}") # Optional: for debugging
+        if event.keysym != 'Escape':
+            self.start_debounce_details_highlighting()
 
 
     def start_debounce_details_highlighting(self):
@@ -14284,15 +17661,15 @@ class ConfigViewerApp:
         """
         # --- NEW: "Showing..." Label in Bottom Frame (FAR LEFT) - PACK FIRST ---
         self.details_showing_configs_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
-                                                    font=("Segoe UI", 12, "bold",), fg="white", anchor="w", justify="left")
+                                                    font=("Segoe UI", 12+self.font_size_add, "bold",), fg="white", anchor="w", justify="left")
         self.details_showing_configs_label.pack(side="left", padx=(10, 0))
         # --- NEW: "Showing..." Label in Bottom Frame (FAR LEFT) ---
 
-        self.details_command_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12))
+        self.details_command_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12+self.font_size_add))
         self.details_command_label.pack(side="left", padx=(10, 0))
 
         self.details_deleting_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
-                                               font=("Segoe UI", 12, "bold"))
+                                               font=("Segoe UI", 12+self.font_size_add, "bold"))
         self.details_deleting_label.pack(side="left", expand=True)
 
 
@@ -14317,15 +17694,15 @@ class ConfigViewerApp:
         def button_hover_leave(event):
             event.widget['bg'] = "#555555" # Revert to original color
 
-        self.details_prev_button = tk.Button(self.details_pagination_frame, text="Prev", font=("Segoe UI", 9, "bold"), command=self.go_to_previous_details_page, **button_style_args)
+        self.details_prev_button = tk.Button(self.details_pagination_frame, text="Prev", font=("Segoe UI", 9+self.font_size_add, "bold"), command=self.go_to_previous_details_page, **button_style_args)
         self.details_prev_button.pack(side="left", padx=5)
         self.details_prev_button.bind("<Enter>", button_hover_enter) # <--- HOVER EFFECT
         self.details_prev_button.bind("<Leave>", button_hover_leave) # <--- HOVER EFFECT
 
-        self.details_page_label = tk.Label(self.details_pagination_frame, text="Page: 1", bg="#333333", fg="white", font=("Segoe UI", 10))
+        self.details_page_label = tk.Label(self.details_pagination_frame, text="Page: 1", bg="#333333", fg="white", font=("Segoe UI", 10+self.font_size_add))
         self.details_page_label.pack(side="left", padx=5)
 
-        self.details_next_button = tk.Button(self.details_pagination_frame, text="Next", font=("Segoe UI", 9, "bold"), command=self.go_to_next_details_page, **button_style_args)
+        self.details_next_button = tk.Button(self.details_pagination_frame, text="Next", font=("Segoe UI", 9+self.font_size_add, "bold"), command=self.go_to_next_details_page, **button_style_args)
         self.details_next_button.pack(side="left", padx=5)
         self.details_next_button.bind("<Enter>", button_hover_enter) # <--- HOVER EFFECT
         self.details_next_button.bind("<Leave>", button_hover_leave) # <--- HOVER EFFECT
@@ -14335,17 +17712,44 @@ class ConfigViewerApp:
         self.details_favorites_filter_button = tk.Button(
             self.bottom_details_frame,
             text="Filter: Show All",  # Initial text
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 10+self.font_size_add),
             command=self.toggle_details_favorites_filter,
             **button_style_args
         )
         # DO NOT UNCOMMENT OR REMOVE THIS LINE - THIS BUTTON NEEDS TO BE HIDDEN AS IT CAUSES BUGGY BEHAVIOR AND ONLY MEANT FOR DEBUG
+
         #self.details_favorites_filter_button.pack(side="right", padx=(0, 10)) # Pack to the right, do not uncomment this line
+
         # --- NEW: Favorites Filter Button - Button CREATION MOVED BACK HERE ---
         self.details_favorites_filter_button.bind("<Enter>", button_hover_enter) # <--- HOVER EFFECT
         self.details_favorites_filter_button.bind("<Leave>", button_hover_leave) # <--- HOVER EFFECT
 
-        self.details_count_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12))
+
+
+        # --- NEW: Favorites Filter Button - Button CREATION MOVED BACK HERE ---
+        self.jump_to_page_button_bottom = tk.Button(
+            self.bottom_details_frame,
+            text="Jump to page",  # Initial text
+            font=("Segoe UI", 10+self.font_size_add),
+            command=self.handle_jump_to_page_button_click,
+            **button_style_args
+        )
+        if self.jump_to_page_button_should_be_bottom:
+
+            self.jump_to_page_button_bottom.pack(side="right", padx=(0, 10)) # Pack to the right, do not uncomment this line
+
+        else:
+            pass
+
+        
+        # --- NEW: Favorites Filter Button - Button CREATION MOVED BACK HERE ---
+        self.jump_to_page_button_bottom.bind("<Enter>", button_hover_enter) # <--- HOVER EFFECT
+        self.jump_to_page_button_bottom.bind("<Leave>", button_hover_leave) # <--- HOVER EFFECT
+
+
+
+
+        self.details_count_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12+self.font_size_add))
         #self.details_count_label.pack(side="right", padx=(5, 10)) # don't remove this comment, this is disabled on purpose
 
         self.details_page_label_original_color = "white"
@@ -14384,12 +17788,33 @@ class ConfigViewerApp:
     
 
     def reopen_details_window_in_current_mode(self):
-        """Closes and re-opens the details window in the current mode (favorites or all)."""
-        folder_name = self.current_details_folder
-        if self.details_window and not self.details_window_closed:
+        """
+        Placeholder/Assumed function: Closes the current details window
+        and triggers the reopening process (likely via on_picture_click).
+        """
+        print("DEBUG: reopen_details_window_in_current_mode() - Called")
+        if self.details_window and self.details_window.winfo_exists():
+            folder_to_reopen = self.current_details_folder
+            print(f"DEBUG: reopen_details_window_in_current_mode() - Closing current window for folder: {folder_to_reopen}")
             self.on_details_window_close() # Close existing window
-        self.on_picture_click(folder_name) # Reopen - on_picture_click handles mode based on self.details_window_should_open_in_favorites_mode
-    
+
+            # Add a small delay if needed, helps Tkinter process the destroy event
+            self.master.after(50, lambda: self._trigger_reopen(folder_to_reopen))
+            # Directly call internal trigger after delay
+            # self._trigger_reopen(folder_to_reopen) # Use this if after delay causes issues
+
+        else:
+            print("DEBUG: reopen_details_window_in_current_mode() - No details window found to reopen.")
+
+
+    def _trigger_reopen(self, folder_name):
+        """Internal helper to call on_picture_click for reopening."""
+        print(f"DEBUG: _trigger_reopen() - Calling on_picture_click for folder: {folder_name}")
+        # Pass folder_name. Event object is often unused, pass None if okay.
+        # Use folder_name for display name as well unless you have specific logic
+        self.on_picture_click(clicked_folder_name=folder_name, folder_name_for_display=folder_name)
+
+
     
     
     def _create_subgrid_canvas(self):
@@ -14426,8 +17851,20 @@ class ConfigViewerApp:
         canvas_sub.pack(side="left", fill="both", expand=True) # Canvas takes up most space on the LEFT
 
         # --- MODIFIED: Adjusted place arguments for scrollbar positioning ---
-        scrollbar_top_offset = 45  # Adjust to move scrollbar down from the top (positive value)
-        scrollbar_bottom_offset = 38 # Adjust to shorten scrollbar from the bottom (positive value)
+
+
+        if self.font_size_add == 0:
+            scrollbar_top_offset = 45  # Adjust to move scrollbar down from the top (positive value)
+            scrollbar_bottom_offset = 38 # Adjust to shorten scrollbar from the bottom (positive value)
+
+        elif self.font_size_add == 2:
+            scrollbar_top_offset = 52 
+            scrollbar_bottom_offset = 45 
+
+        elif self.font_size_add == 4:
+            scrollbar_top_offset = 55 
+            scrollbar_bottom_offset = 53 
+
 
         self.custom_scrollbar_canvas_details.place(
             relx=1.0,
@@ -14453,89 +17890,212 @@ class ConfigViewerApp:
         
 
 
+        
 
-    def _create_details_sidebar(self):
-        """Creates the details sidebar frame and its content (labels and placeholders)."""
-        self.details_sidebar_frame = tk.Frame(self.details_main_frame, width=315, bg="#333333", highlightthickness=0, highlightbackground="#333333", bd=4, relief=tk.FLAT) # <----- MODIFIED bg="#444444", highlightthickness=0, highlightbackground="#444444", bd=0, relief=tk.FLAT
-        self.details_sidebar_frame.pack(side="right", fill="y", padx=0, pady=0,  expand=False,  ) # <----- MODIFIED padx=0, pady=0
+
+    def _create_details_sidebar(self, is_favorites_mode=False, brand_name="Unknown Brand"):
+        """
+        Creates the details sidebar frame and its content.
+        MODIFIED: Accepts `is_favorites_mode` and `brand_name` to conditionally
+                  add the "Showing Favorites for..." label.
+        MODIFIED: Implements a scrollable area for the text content below the image
+                  using a CUSTOM scrollbar.
+        ADDED: More debugging prints. Adjusted padding slightly.
+        """
+        print(f"\n--- _create_details_sidebar() ENTRY ---") # <<< DEBUG
+        print(f"  DEBUG: Received is_favorites_mode = {is_favorites_mode}") # <<< DEBUG
+        print(f"  DEBUG: Received brand_name = {brand_name}") # <<< DEBUG
+
+        # --- Main Sidebar Frame ---
+        self.details_sidebar_frame = tk.Frame(
+            self.details_main_frame,
+            width=315,
+            bg="#333333",
+            highlightthickness=0, bd=0, relief=tk.FLAT
+        )
+        self.details_sidebar_frame.pack(side="right", fill="y", padx=0, pady=0, expand=False)
         self.details_sidebar_frame.pack_propagate(False)
 
         details_sidebar_padding = 10
-        self.details_sidebar_car_name_label = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 14, "bold"), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
-        self.details_sidebar_car_name_label.pack(in_=self.details_sidebar_frame, pady=(details_sidebar_padding*0.5, details_sidebar_padding), padx=details_sidebar_padding)
 
-        # Placeholder image for sidebar - CHANGED placeholder to MATCH sidebar_top_frame BG COLOR - "#444444"
-        placeholder_image = Image.new("RGB", (280, 150), "#333333") # CHANGED to "#444444" - MATCH sidebar_top_frame BG COLOR
+
+
+        # --- Conditional Favorites Label ---
+        self.favorites_mode_indicator_label = None # Initialize attribute
+        if is_favorites_mode:
+            print(f"  DEBUG: INSIDE is_favorites_mode block - Creating Favorites Label...") # <<< DEBUG
+            self.favorites_mode_indicator_label = tk.Label(
+                self.details_sidebar_frame,
+                text=f"Showing Favorites for...",
+                font=("Segoe UI", 12+self.font_size_add, "italic"),
+                fg="lightgrey",
+                bg="#333333",
+                anchor="center",
+                justify="center"
+            )
+            # Pack the favorites label AFTER car name, BEFORE image
+            self.favorites_mode_indicator_label.pack(
+                pady=(0, 1), # Padding above and below this label
+                padx=details_sidebar_padding,
+                fill='x'
+            )
+            print(f"  DEBUG: Packed favorites label: {self.favorites_mode_indicator_label.winfo_ismapped()}") # <<< DEBUG
+        else:
+            print(f"  DEBUG: is_favorites_mode is FALSE - Skipping Favorites Label.") # <<< DEBUG
+
+
+        # --- Top Fixed Section ---
+        self.details_sidebar_car_name_label = tk.Label(
+            self.details_sidebar_frame, text="", font=("Segoe UI", 14+self.font_size_add, "bold"),
+            bg="#333333", fg="lightgrey", wraplength=280, justify="center"
+        )
+        # Pack the car name label first
+        self.details_sidebar_car_name_label.pack(pady=(details_sidebar_padding * 0.5, 5), padx=details_sidebar_padding, fill='x') # Reduced bottom padding
+        print(f"  DEBUG: Packed car name label: {self.details_sidebar_car_name_label.winfo_ismapped()}") # <<< DEBUG
+
+
+        # Continue packing the rest of the fixed top section
+        placeholder_image = Image.new("RGB", (280, 150), "#333333")
         placeholder_photo = ImageTk.PhotoImage(placeholder_image)
-        self.details_sidebar_image_label = tk.Label(self.details_sidebar_frame, image=placeholder_photo, bg="#333333") # Dark bg
+        self.details_sidebar_image_label = tk.Label(
+            self.details_sidebar_frame, image=placeholder_photo, bg="#333333"
+        )
         self.details_sidebar_image_label.image = placeholder_photo
-        self.details_sidebar_image_label.pack(in_=self.details_sidebar_frame, pady=(0, details_sidebar_padding), padx=details_sidebar_padding)
+        # Pack the image label AFTER the potential favorites label
+        self.details_sidebar_image_label.pack(pady=(0, details_sidebar_padding), padx=details_sidebar_padding)
+        print(f"  DEBUG: Packed image label: {self.details_sidebar_image_label.winfo_ismapped()}") # <<< DEBUG
 
-        self.details_sidebar_loading_label = tk.Label(self.details_sidebar_frame, text="Loading...", font=("Segoe UI", 10, "italic"), fg=self.global_highlight_color, bg="#333333") # Dark bg, orange fg
-        self.details_sidebar_loading_label.pack(in_=self.details_sidebar_frame, pady=(0, details_sidebar_padding), padx=details_sidebar_padding)
-        self.details_sidebar_loading_label.pack_forget()
+        # ... (Rest of the function: loading label, scrollable section, buttons remain the same) ...
 
-        #self.details_sidebar_config_name_label = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 10), bg="#333333", fg="lightgrey", wraplength=280, justify="center") # Dark bg, lightgrey fg
-        #self.details_sidebar_config_name_label.config(text="")
-        #self.details_sidebar_config_name_label.pack(in_=self.details_sidebar_frame, side="bottom", pady=details_sidebar_padding, padx=details_sidebar_padding)
-
+        # --- Middle Scrollable Section (Unchanged) ---
+        scroll_container_frame = tk.Frame(self.details_sidebar_frame, bg="#333333")
+        scroll_container_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        # ... (canvas, scrollbar, inner frame creation) ...
+        self.details_sidebar_text_canvas = tk.Canvas(scroll_container_frame, bg="#333333", highlightthickness=0, bd=0)
+        self.custom_scrollbar_canvas_sidebar_text = tk.Canvas(scroll_container_frame, bg="#555555", width=15, highlightthickness=0, cursor="arrow")
+        self.scrollbar_thumb_sidebar_text = self.custom_scrollbar_canvas_sidebar_text.create_rectangle(0, 0, 15, 20, fill=self.global_highlight_color, outline="")
+        self.custom_scrollbar_canvas_sidebar_text.bind("<ButtonPress-1>", self.custom_sidebar_text_scrollbar_click)
+        self.custom_scrollbar_canvas_sidebar_text.bind("<B1-Motion>", self.custom_sidebar_text_scrollbar_drag)
+        self.custom_scrollbar_canvas_sidebar_text.bind("<ButtonRelease-1>", self.custom_sidebar_text_scrollbar_release)
+        self.details_sidebar_text_canvas.configure(yscrollcommand=self.custom_sidebar_text_scrollbar_set)
+        self.custom_scrollbar_canvas_sidebar_text.pack(side="right", fill="y")
+        self.details_sidebar_text_canvas.pack(side="left", fill="both", expand=True)
+        self.details_sidebar_text_scrollable_frame = tk.Frame(self.details_sidebar_text_canvas, bg="#333333")
+        self.details_sidebar_text_canvas.create_window((0, 0), window=self.details_sidebar_text_scrollable_frame, anchor="nw")
+        self.details_sidebar_text_scrollable_frame.bind("<Configure>", lambda e: self.details_sidebar_text_canvas.configure(scrollregion=self.details_sidebar_text_canvas.bbox("all")))
+        self.details_sidebar_text_canvas.bind("<Enter>", lambda e: self.details_sidebar_text_canvas.bind_all("<MouseWheel>", self._on_mousewheel_details_sidebar_text))
+        self.details_sidebar_text_canvas.bind("<Leave>", lambda e: self.details_sidebar_text_canvas.unbind_all("<MouseWheel>"))
         self._create_sidebar_info_labels()
-        
-        
+
+        # --- Bottom Fixed Section (Buttons - Unchanged) ---
+        self.details_buttons_frame = tk.Frame(self.details_sidebar_frame, bg="#333333")
+        self.details_buttons_frame.pack(side="bottom", fill="x", pady=(0, 10), padx=10)
+
+        # Initial call to set scrollbar state correctly
+        self.master.after(50, lambda: self.custom_sidebar_text_scrollbar_set(0, 1))
+
+        print(f"--- _create_details_sidebar() EXIT ---") # <<< DEBUG
+
+
+
+    def _on_mousewheel_details_sidebar_text(self, event):
+        """Handles mouse wheel scrolling for the details sidebar text canvas
+           by initiating smooth scrolling."""
+        if self.details_sidebar_text_canvas and self.details_sidebar_text_canvas.winfo_exists():
+            # Determine scroll direction and magnitude
+            if os.name == 'nt': # Windows
+                delta = int(event.delta / 120)
+            else: # Linux/macOS
+                delta = 1 if event.num == 4 else -1 if event.num == 5 else 0
+
+            if delta != 0:
+                # Call the new start function for smooth scroll
+                self.start_smooth_scroll_sidebar_text(delta)
+
 
 
     def _create_sidebar_info_labels(self):
-        """Creates the information labels within the details sidebar."""
-        details_sidebar_padding = 10
+        """
+        Creates the information labels within the details sidebar's SCROLLABLE FRAME.
+        MODIFIED: Parent is now self.details_sidebar_text_scrollable_frame.
+                  Packing happens within update_details_sidebar_content.
+        ADDED: Labels for Top Speed, Torque, Power, 0-100, 100-0, Fuel Type.
+        """
+        # Parent frame is now the inner scrollable frame
+        parent = self.details_sidebar_text_scrollable_frame
 
-        # --- NEW: "Selected Configuration" Label ---
-        self.details_sidebar_selected_config_label_cat = tk.Label(self.details_sidebar_frame, text="Selected Configuration:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_selected_config_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(10, 0))
-        self.details_sidebar_selected_config_label_val = tk.Label(self.details_sidebar_frame, text="Custom/Unspecified", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_selected_config_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 1))
+        details_sidebar_padding = 10 # Keep padding consistent
+        label_font_cat = ("Segoe UI", 11+self.font_size_add, "bold")
+        label_font_val = ("Segoe UI", 11+self.font_size_add, "italic")
+        label_bg = "#333333"
+        label_fg_cat = "white"
+        label_fg_val = "lightgrey"
+        label_anchor = "w"
+        label_justify = "left"
+        label_wraplength = 280
 
-        # --- MODIFIED: Config Name Label - LEFT ALIGNED, ITALIC, NO "Config:" prefix, UNDER "Selected Configuration" ---
-        self.details_sidebar_config_name_label = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 10, "italic"), bg="#333333", fg="lightgrey", anchor=tk.W, justify=tk.LEFT, wraplength=280) # Modified Font, Anchor, Justify
-        self.details_sidebar_config_name_label.pack(in_=self.details_sidebar_frame, fill="x", padx=details_sidebar_padding, pady=(0, 0)) # NEW POSITION - UNDER "Selected Configuration"
-        # --- MODIFIED: Config Name Label ---
 
 
-        # --- NEW DETAILS SIDEBAR INFO LABELS ---
-        self.details_sidebar_description_label_cat = tk.Label(self.details_sidebar_frame, text="Description:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_description_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(10, 0))
-        self.details_sidebar_description_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_description_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5))
+        # --- Existing Labels ---
+        self.details_sidebar_description_label_cat = tk.Label(parent, text="Description:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_description_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
 
-        # --- MODIFIED: Zip File Label instead of Top Speed ---
-        self.details_sidebar_zipfile_label_cat = tk.Label(self.details_sidebar_frame, text="Zip File:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_zipfile_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0)) # Added padding # Renamed
-        self.details_sidebar_zipfile_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_zipfile_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5)) # Added padding # Renamed
-        # --- MODIFIED: Zip File Label instead of Top Speed ---
+        self.details_sidebar_zipfile_label_cat = tk.Label(parent, text="Zip File:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_zipfile_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
 
-        self.details_sidebar_value_label_cat = tk.Label(self.details_sidebar_frame, text="Value:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_value_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0))
-        self.details_sidebar_value_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_value_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5))
-        self.details_sidebar_brand_label_cat = tk.Label(self.details_sidebar_frame, text="Brand:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_brand_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0))
-        self.details_sidebar_brand_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_brand_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5))
-        self.details_sidebar_bodystyle_label_cat = tk.Label(self.details_sidebar_frame, text="Body Style:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_bodystyle_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0))
-        self.details_sidebar_bodystyle_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_bodystyle_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5))
-        self.details_sidebar_weight_label_cat = tk.Label(self.details_sidebar_frame, text="Weight:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_weight_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0))
-        self.details_sidebar_weight_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_weight_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5))
-        self.details_sidebar_years_label_cat = tk.Label(self.details_sidebar_frame, text="Years:", font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", anchor="w", justify="left") # Dark bg, white category fg
-        self.details_sidebar_years_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0))
-        self.details_sidebar_years_label_val = tk.Label(self.details_sidebar_frame, text="", font=("Segoe UI", 11, "italic"), bg="#333333", fg="lightgrey", anchor="w", justify="left", wraplength=280) # Dark bg, lightgrey info fg
-        self.details_sidebar_years_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 10))
-        # --- END NEW DETAILS SIDEBAR INFO LABELS ---
+        self.details_sidebar_value_label_cat = tk.Label(parent, text="Value:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_value_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        self.details_sidebar_brand_label_cat = tk.Label(parent, text="Brand:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_brand_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        self.details_sidebar_bodystyle_label_cat = tk.Label(parent, text="Body Style:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_bodystyle_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        self.details_sidebar_weight_label_cat = tk.Label(parent, text="Weight:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_weight_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        self.details_sidebar_years_label_cat = tk.Label(parent, text="Years:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_years_label_val = tk.Label(parent, text="", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+
+        # --- Selected Configuration ---
+        self.details_sidebar_selected_config_label_cat = tk.Label(parent, text="Selected Configuration:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_selected_config_label_val = tk.Label(parent, text="Custom/Unspecified", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- Config Name (from PC file) ---
+        self.details_sidebar_config_name_label = tk.Label(parent, text="", font=("Segoe UI", 10+self.font_size_add, "italic"), bg=label_bg, fg=label_fg_val, anchor=tk.W, justify=tk.LEFT, wraplength=label_wraplength)
+
+        # --- Top Speed ---
+        self.details_sidebar_topspeed_label_cat = tk.Label(parent, text="Top Speed:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_topspeed_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- Torque ---
+        self.details_sidebar_torque_label_cat = tk.Label(parent, text="Torque:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_torque_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- Power ---
+        self.details_sidebar_power_label_cat = tk.Label(parent, text="Power:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_power_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- 0-100 km/h ---
+        self.details_sidebar_0_100_label_cat = tk.Label(parent, text="0-100 km/h:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_0_100_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- 100-0 km/h ---
+        self.details_sidebar_100_0_label_cat = tk.Label(parent, text="100-0 km/h:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_100_0_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+        # --- Fuel Type ---
+        self.details_sidebar_fuel_type_label_cat = tk.Label(parent, text="Fuel Type:", font=label_font_cat, bg=label_bg, fg=label_fg_cat, anchor=label_anchor, justify=label_justify)
+        self.details_sidebar_fuel_type_label_val = tk.Label(parent, text="N/A", font=label_font_val, bg=label_bg, fg=label_fg_val, anchor=label_anchor, justify=label_justify, wraplength=label_wraplength)
+
+
+
         
      
+
+
 
 
 
@@ -14547,12 +18107,14 @@ class ConfigViewerApp:
         button_width = 280 // 15
         button_style_args = self.button_style_args.copy()
 
-        self.details_replace_current_button = tk.Button(self.details_buttons_frame, text="Replace Current", font=("Segoe UI", 10), width=button_width, **button_style_args)
-        self.details_spawn_new_button = tk.Button(self.details_buttons_frame, text="Spawn New", font=("Segoe UI", 10), width=button_width, **button_style_args)
-        self.details_add_to_queue_button = tk.Button(self.details_buttons_frame, text="Add to Spawn Queue", font=("Segoe UI", 10), width=button_width, **button_style_args)
-        self.details_sidebar_favorites_button = tk.Button(self.details_buttons_frame, text="Add to Favorites", font=("Segoe UI", 10), width=button_width, **button_style_args)
+        self.details_sidebar_show_details_button = tk.Button(self.details_buttons_frame, text="Customize Color", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
+        self.details_replace_current_button = tk.Button(self.details_buttons_frame, text="Replace Current", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
+        self.details_spawn_new_button = tk.Button(self.details_buttons_frame, text="Spawn New", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
+        self.details_add_to_queue_button = tk.Button(self.details_buttons_frame, text="Add to Spawn Queue", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
+        self.details_sidebar_favorites_button = tk.Button(self.details_buttons_frame, text="Add to Favorites", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
 
         buttons = [
+            self.details_sidebar_show_details_button,
             self.details_replace_current_button,
             self.details_spawn_new_button,
             #self.details_add_to_queue_button,
@@ -14569,8 +18131,9 @@ class ConfigViewerApp:
             if hasattr(self, 'details_delete_custom_config_button') and self.details_delete_custom_config_button:
                 self.details_delete_custom_config_button.pack_forget()
 
+        self.details_sidebar_show_details_button.config(command=self.on_details_sidebar_show_details_click)
         self.details_replace_current_button.config(command=lambda: self.on_replace_current_button_click(spawn_cmd=None, event=None))
-        self.details_spawn_new_button.config(command=self.on_spawn_new_button_click)
+        self.details_spawn_new_button.config(command=lambda: self.on_spawn_new_button_click(spawn_cmd=None, event=None))
         #self.details_add_to_queue_button.config(command=self.on_add_to_queue_button_click)
         self.details_sidebar_favorites_button.config(command=self.on_details_sidebar_favorites_click)
         
@@ -14668,6 +18231,8 @@ class ConfigViewerApp:
                     if self.details_page > 0 and len(items_on_current_page_before_deletion) <= 1:
                         self.details_page -= 1
                     self.refresh_details_grid_after_favorite_change()
+
+                    print("    on_details_sidebar_favorites_click is calling self.perform_search()")
                     self.perform_search()
                     self._update_details_pagination_bar()
                     print("DEBUG: on_details_sidebar_favorites_click - Navigated to previous page and refreshed UI.")
@@ -14686,6 +18251,7 @@ class ConfigViewerApp:
             if self.details_window_is_favorites_filtered:
                 print("DEBUG: on_details_sidebar_favorites_click - Details window IS in Favorites mode, refreshing grids after favorite addition.")
                 self.refresh_details_grid_after_favorite_change()
+                print("    on_details_sidebar_favorites_click is calling self.perform_search()")
                 self.perform_search()
 
 
@@ -14738,7 +18304,7 @@ class ConfigViewerApp:
 
         print("--- update_details_sidebar_favorites_button_text() EXIT ---\n") # Debug: Function exit
         
-    def toggle_details_favorites_filter(self):
+    def toggle_details_favorites_filter(self): #unfinished
         """
         Toggles the Favorites filter in the details window and updates the button text.
         DEBUGGING: Added debug prints to track flag values in toggle_details_favorites_filter.
@@ -14783,11 +18349,16 @@ class ConfigViewerApp:
             self.details_count_label.config(text=f"Total: {len(self.details_filtered_data)}") # Update count
 
 
+
+    open_color_mode = False
     def on_details_sidebar_show_details_click(self):
         """Handles click on the 'Show Details' button in the details sidebar.
            Opens the Configuration Details window for the current sidebar config.
            Now with more robust data retrieval for spawn_cmd and related info.
-        """
+       
+         """
+        ConfigViewerApp.open_color_mode = True
+
         spawn_cmd = self.current_details_sidebar_spawn_cmd
         info_data = self.current_details_sidebar_info_data
         picture_path = self.current_details_sidebar_picture_path
@@ -14808,6 +18379,11 @@ class ConfigViewerApp:
             if not folder_name: print("  - folder_name is missing")
             if not zip_file_base_name: print("  - zip_file_base_name is missing")
             if not config_name: print("  - config_name is missing")
+        
+        if ConfigViewerApp.open_color_mode:
+            self.customize_color_config(spawn_cmd, folder_name)
+            ConfigViewerApp.open_color_mode = False
+
 
 
     def read_favorites(self):
@@ -14820,8 +18396,26 @@ class ConfigViewerApp:
         watcher_filepaths = set() # Set to store filepaths from WatcherOutput.txt
         zip_structure_lines = set() # Set to store lines from zip_structure.txt
 
+
         watcher_output_file = os.path.join(self.script_dir, "data/WatcherOutput.txt")
         zip_structure_file = os.path.join(self.script_dir, "data/zip_structure.txt") # Define zip_structure.txt path
+
+
+        backup_watcher_output_file = os.path.join(self.script_dir, "data/backup/WatcherOutput.txt")
+        backup_zip_structure_file = os.path.join(self.script_dir, "data/backup/zip_structure.txt")
+
+
+
+        if os.path.exists(backup_zip_structure_file):
+
+            print(f"backup input files exist (read_favorites)")
+
+            zip_structure_file = backup_zip_structure_file
+            watcher_output_file = backup_watcher_output_file
+
+            
+
+
 
         # --- 1. Read Favorites.txt ---
         if os.path.exists(self.favorites_file_path):
@@ -14896,11 +18490,15 @@ class ConfigViewerApp:
             self.favorite_configs = valid_favorites # Ensure self.favorite_configs is updated even if no changes to write
             print("DEBUG: No invalid favorites found, Favorites.txt not updated.") # Debug print for no update
 
+
         return self.favorite_configs
 
 
     def write_favorites(self):
         """Writes the current set of favorite configurations to Favorites.txt."""
+
+
+
         try:
             with open(self.favorites_file_path, "w", encoding="utf-8") as f:
                 for fav in sorted(list(self.favorite_configs)):
@@ -14931,9 +18529,14 @@ class ConfigViewerApp:
             print(f"Error in add_to_favorites: {e}")
             messagebox.showerror("Error", f"Error adding to favorites: {e}", parent=self.master)  # Show error messagebox
         finally:
-            time.sleep(0.725)
             if scanning_win:
-                scanning_win.destroy()
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
     def remove_from_favorites(self, vehicle_folder, pc_filename):
         """Removes a configuration from the favorites list and updates Favorites.txt, showing a scanning window."""
@@ -14948,230 +18551,430 @@ class ConfigViewerApp:
             print(f"Error in remove_from_favorites: {e}")
             messagebox.showerror("Error", f"Error removing from favorites: {e}", parent=self.master) # Show error messagebox
         finally:
-            time.sleep(0.725)
             if scanning_win:
-                scanning_win.destroy()
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
  
-
-
-
 
 
     def _initial_details_layout(self, subgrid_data, zip_file, search_query=""):
         """Handles initial layout logic after the details window is drawn."""
+
         def initial_layout_logic():
             print("\n--- _initial_details_layout.initial_layout_logic() DEBUG ---")
-            print(f"  DEBUG: initial_layout - Received zip_file: {zip_file}")
+            print(f"  DEBUG: initial_layout - Received zip_file: {zip_file}") # zip_file here is the CATEGORY ('folder_grouped')
 
+            # Use the provided subgrid_data directly - DO NOT FLATTEN
             filtered_subgrid_data = subgrid_data
+            print(f"DEBUG: _initial_details_layout - Using subgrid_data directly. Total items: {len(filtered_subgrid_data)}")
 
-
-            print("DEBUG: _initial_details_layout - Flattening subgrid_data...")
-            flattened_data = []
-            for sublist in filtered_subgrid_data: # Assuming subgrid_data is a list of lists (or similar structure)
-                if isinstance(sublist, list): # Check if it's actually a list (safety check)
-                    flattened_data.extend(sublist) # Extend flattened list with items from sublist
-                else:
-                    flattened_data.append(sublist) # If not a list, append directly
-            filtered_subgrid_data = flattened_data # Replace original with flattened list
-            print(f"DEBUG: _initial_details_layout - subgrid_data FLATTENED. Total items: {len(filtered_subgrid_data)}")
-
-            
+            # --- Define Helper Function for Sorting (File Reading Version) ---
+            # --- Define Helper Function for Sorting (File Reading Version - ADJUSTED) ---
             def get_config_value(item):
-                """Helper function to extract and safely convert 'Value' to float for sorting."""
-                picture_path, spawn_cmd, zip_file, info_data, folder_name = item
-                zip_file_base_name = os.path.splitext(zip_file)[0]
-                config_name = self.extract_name_from_spawn_command(spawn_cmd)
-                individual_info_path = self.find_individual_info_file(
-                    folder_name, zip_file_base_name, config_name
-                )
-                #value = float('inf')  # Default high value for items without a valid "Value" 
-                value = float('-inf')  # Default low value for items without a valid "Value" 
-                if individual_info_path and os.path.exists(individual_info_path):
-                    individual_info_json, _ = self._load_individual_info(individual_info_path)
-                    value_str = individual_info_json.get("Value", None)
-                    if value_str:
-                        try:
-                            value = float(value_str)
-                        except ValueError:
-                            pass  # Keep default 'inf' for non-numeric values
-                return value
+                """
+                Helper function to extract 'Value' from the corresponding JSON file
+                and safely convert to float for sorting.
+                ADAPTED for _load_individual_info returning (dict, file_content_string).
+                """
+                default_sort_value = float('-inf') # Errors/missing go last in ascending sort
 
-            print("DEBUG: _initial_details_layout - Sorting subgrid_data by 'Value'...")
-            filtered_subgrid_data.sort(key=get_config_value) # Sort by 'Value'
+                try:
+                    # --- Structure Check ---
+                    if not isinstance(item, (list, tuple)) or len(item) != 5:
+                        print(f"WARN: get_config_value - Invalid item structure encountered: Type={type(item)}, Len={len(item) if isinstance(item, (list, tuple)) else 'N/A'}")
+                        try: item_preview = str(item)[:100]
+                        except Exception: item_preview = "[Unrepresentable Item]"
+                        print(f"   Problematic Item Preview: {item_preview}...")
+                        return default_sort_value
+                    # --- End Structure Check ---
+
+                    # Unpack item components
+                    picture_path, spawn_cmd, item_zip_file, _, folder_name = item
+
+                    # --- File Reading Logic ---
+                    if not all([spawn_cmd, item_zip_file, folder_name]):
+                         print(f"WARN: get_config_value - Missing data for item: {str(item)[:100]}")
+                         return default_sort_value
+
+                    # Handle potential 'folder_grouped' - needs verification
+                    if item_zip_file == "folder_grouped":
+                         print(f"DEBUG: get_config_value - Encountered 'folder_grouped'. Need logic to find original zip for {spawn_cmd}")
+                         # Add fallback logic here if possible, otherwise return default
+                         return default_sort_value # Cannot proceed without actual zip
+
+                    zip_file_base_name = os.path.splitext(item_zip_file)[0]
+                    config_name = self.extract_name_from_spawn_command(spawn_cmd)
+                    if not config_name or config_name.startswith("UnknownConfig") or config_name.startswith("Error"):
+                         print(f"WARN: get_config_value - Could not determine config name for {spawn_cmd}")
+                         return default_sort_value
+
+                    individual_info_path = self.find_individual_info_file(
+                        folder_name, zip_file_base_name, config_name
+                    )
+                    # print(f"DEBUG: get_config_value - Looking for info file at: {individual_info_path}") # Verbose
+
+                    value = default_sort_value # Start with default
+
+                    if individual_info_path:
+                        # Call _load_individual_info which returns (dict, file_content_string)
+                        individual_info_dict, file_content_debug = self._load_individual_info(individual_info_path)
+
+                        # --- **** CORRECTED SUCCESS CHECK **** ---
+                        # Check if the *first* returned element is a non-empty dictionary.
+                        # This indicates _load_individual_info succeeded in extracting info.
+                        if isinstance(individual_info_dict, dict) and individual_info_dict:
+                            # Successfully loaded/extracted info, proceed to get 'Value'
+                            value_str = individual_info_dict.get("Value", None)
+                            if value_str is not None:
+                                try:
+                                    value = float(value_str)
+                                    # print(f"DEBUG: get_config_value - Extracted Value: {value} for {config_name}") # Verbose success
+                                except (ValueError, TypeError):
+                                    print(f"WARN: get_config_value - Could not convert 'Value' ({value_str}) to float for Cmd: {spawn_cmd} from file: {individual_info_path}")
+                                    # Keep default value
+                            # else: 'Value' key missing, keep default
+                        else:
+                            # Load failed or returned empty dict, use default value.
+                            # The file_content_debug might contain raw text, but we treat this as failure for sorting.
+                            # Avoid printing the full file content here unless debugging specific load failures.
+                            if not individual_info_path or not os.path.exists(individual_info_path):
+                                # Don't warn if the file genuinely doesn't exist (already handled by _load_individual_info print)
+                                pass
+                            else:
+                                # Warn if the file exists but info extraction failed (returned empty dict)
+                                print(f"WARN: get_config_value - Info extraction failed (got empty dict) for file: {individual_info_path}")
+                            # Keep default value
+                        # --- **** END CORRECTED SUCCESS CHECK **** ---
+
+                    # else: find_individual_info_file returned None or empty string, keep default value
+                    return value
+
+                except Exception as e:
+                    try: item_str_preview = str(item)[:100]
+                    except Exception: item_str_preview = "[Unrepresentable Item]"
+                    print(f"ERROR: Unexpected error in get_config_value for item preview {item_str_preview}...: {e}")
+                    # traceback.print_exc() # Uncomment for full traceback during debugging
+                    return default_sort_value
+
+            print("DEBUG: _initial_details_layout - Sorting subgrid_data by 'Value' (ascending)...")
+            # Sort ascending (lowest to highest) - remove reverse=True
+            filtered_subgrid_data.sort(key=get_config_value)
             print("DEBUG: _initial_details_layout - subgrid_data SORTED by 'Value'.")
-            # --- NEW: Sorting logic by "Value" ---
+
+            # --- Calculate the info path for the FIRST item AFTER sorting ---
+            # This logic should now work if sorting is successful and data structure is correct
+            first_item_info_path = None
+            if filtered_subgrid_data:
+                try:
+                    # Get the first item (should be the one with the lowest 'Value')
+                    first_item = filtered_subgrid_data[0]
+                    # Check structure *again* before unpacking, just in case sort failed silently
+                    if isinstance(first_item, (list, tuple)) and len(first_item) == 5:
+                        picture_path, spawn_cmd, item_zip_file, info_data, folder_name = first_item
+                        zip_file_base_name = os.path.splitext(item_zip_file)[0]
+                        config_name = self.extract_name_from_spawn_command(spawn_cmd)
+                        if config_name and not config_name.startswith("UnknownConfig"):
+                            first_item_info_path = self.find_individual_info_file(
+                                folder_name, zip_file_base_name, config_name
+                            )
+                            print(f"DEBUG: _initial_details_layout - Calculated info path for first item (lowest value): {first_item_info_path}")
+                        else:
+                             print(f"WARN: Could not determine config name for the first sorted item's command: {spawn_cmd}")
+                    else:
+                        print(f"WARN: First item after sorting has unexpected structure: {str(first_item)[:100]}")
+
+                except Exception as e:
+                    # This catch block might be hit if unpacking fails even after the check
+                    print(f"ERROR: Could not determine info path for the first sorted item: {e}")
+                    # traceback.print_exc() # Uncomment for debugging
+            else:
+                print("DEBUG: _initial_details_layout - Filtered data is empty, no first item info path to calculate.")
+            # --- End Calculation for first item ---
 
 
+            # --- Calculate paged_data for the initial page ---
+            if not hasattr(self, 'details_page'): self.details_page = 0
+            # Ensure items_per_page is valid
+            items_per_page = getattr(self, 'items_per_page', 50) # Default if missing
+            if not isinstance(items_per_page, int) or items_per_page <= 0: items_per_page = 50
 
-
-            # --- Calculate paged_data FIRST for the initial page ---
-            start_index = self.details_page * self.items_per_page
-            end_index = start_index + self.items_per_page
+            start_index = self.details_page * items_per_page
+            end_index = start_index + items_per_page
             paged_data = filtered_subgrid_data[start_index:end_index]
 
-             # Get first page data
-            print(f"  DEBUG: Initial Load - paged_data calculated for first page, item count: {len(paged_data)}") # Debug
-            print(f"  DEBUG: items_per_page: {self.items_per_page}") # Debug
-            print(f"  DEBUG: details_batch_size: {self.details_batch_size}") # Debug
+            print(f"  DEBUG: Initial Load - paged_data calculated for first page (page {self.details_page}), item count: {len(paged_data)}")
+            print(f"  DEBUG: items_per_page: {items_per_page}")
+
+            details_batch_size = getattr(self, 'details_batch_size', 10) # Default if missing
+            if not isinstance(details_batch_size, int) or details_batch_size <= 0: details_batch_size = 10
+            print(f"  DEBUG: details_batch_size: {details_batch_size}")
+
 
             self.details_batches = [
-                paged_data[i: i + self.details_batch_size]
-                for i in range(0, len(paged_data), self.details_batch_size)
+                paged_data[i: i + details_batch_size]
+                for i in range(0, len(paged_data), details_batch_size)
             ]
-            print(f"  DEBUG: Initial Load - Number of batches created: {len(self.details_batches)}") # Debug
+            print(f"  DEBUG: Initial Load - Number of batches created: {len(self.details_batches)}")
             if self.details_batches:
-                print(f"  DEBUG: Initial Load - Size of first batch: {len(self.details_batches[0]) if self.details_batches else 0}") # Debug - Size of first batch
+                print(f"  DEBUG: Initial Load - Size of first batch: {len(self.details_batches[0]) if self.details_batches else 0}")
 
-            # --- DEBUG: Inspect content of the FIRST batch ---
+            # --- DEBUG Inspect first batch (should show proper filenames now) ---
             if self.details_batches and self.details_batches[0]:
-                print("  DEBUG: First 3 items in the FIRST batch (filenames):")
+                print("  DEBUG: First 3 items in the FIRST batch (picture paths):")
                 for i in range(min(3, len(self.details_batches[0]))):
                     item = self.details_batches[0][i]
-                    if item and item[0]:
+                    # Check item structure robustly before accessing index 0
+                    if isinstance(item, (list, tuple)) and len(item) > 0 and isinstance(item[0], str):
                         print(f"    - Item {i+1}: {os.path.basename(item[0])}")
+                    elif isinstance(item, (list, tuple)):
+                         print(f"    - Item {i+1}: Item tuple/list OK, but picture path (item[0]) is missing or not a string.")
                     else:
-                        print(f"    - Item {i+1}: Item data or picture_path is None")
+                        print(f"    - Item {i+1}: Item data is not a list/tuple or is empty.")
             else:
                 print("  DEBUG: First batch is EMPTY or NO batches created.")
-            # --- DEBUG: Inspect content of the FIRST batch ---
+            # --- END DEBUG ---
 
-            # --- ENSURE INITIALIZATION of current_details_batch_index here, BEFORE calling load_next_batch_details ---
-            self.current_details_batch_index = 0 # <--- ENSURE INITIALIZATION HERE
-            print(f"DEBUG: _initial_details_layout - ENSURING current_details_batch_index = {self.current_details_batch_index} BEFORE load_next_batch_details()") # Debug - Initialization Check
+            # Initialize state variables
+            self.current_details_batch_index = 0
+            self.current_details_batch_index_in_sequence = 0 # Assuming this is used elsewhere
+            self.total_details_items_placed = 0 # Assuming this is used elsewhere
+            print(f"DEBUG: _initial_details_layout - ENSURING state before load: batch_idx={self.current_details_batch_index}, seq_idx={self.current_details_batch_index_in_sequence}, total_placed={self.total_details_items_placed}")
 
-            if len(filtered_subgrid_data) > 0:
-                self.start_details_loading_animation()
-                self.show_progress_bar_details() # <----- SHOW PROGRESS BAR HERE
-                print("DEBUG: _initial_details_layout - Calling load_next_batch_details() NOW...") # Debug - Before Call
-                self.load_next_batch_details() # Start loading batches (now only for paged_data)
-                print("DEBUG: _initial_details_layout - load_next_batch_details() RETURNED.") # Debug - After Call
+            # Load initial batch if data exists
+            if self.details_batches:
+                # Start loading animations/progress bars only if they exist
+                if hasattr(self, 'start_details_loading_animation'): self.start_details_loading_animation()
+                if hasattr(self, 'show_progress_bar_details'): self.show_progress_bar_details()
 
+                print("DEBUG: _initial_details_layout - Calling load_next_batch_details() NOW...")
+                if hasattr(self, 'load_next_batch_details'):
+                    self.load_next_batch_details()
+                    print("DEBUG: _initial_details_layout - load_next_batch_details() RETURNED.")
+                else:
+                    print("ERROR: load_next_batch_details method not found!")
+            else:
+                print("DEBUG: _initial_details_layout - No items/batches for this page. Skipping load.")
+                if hasattr(self, 'stop_details_loading_animation'): self.stop_details_loading_animation()
+                if hasattr(self, 'hide_progress_bar_details'): self.hide_progress_bar_details()
 
             print("  DEBUG: Calling _set_initial_sidebar_content from initial_layout...")
-            self._set_initial_sidebar_content(filtered_subgrid_data, zip_file)
-            print("  DEBUG: _set_initial_sidebar_content RETURNED.")
+            # Ensure method exists and handle potential errors from it
+            if hasattr(self, '_set_initial_sidebar_content'):
+                try:
+                    # Pass the potentially corrected first_item_info_path
+                    self._set_initial_sidebar_content(filtered_subgrid_data, zip_file, first_item_info_path)
+                    print("  DEBUG: _set_initial_sidebar_content RETURNED.")
+                except Exception as e:
+                    print(f"ERROR: Exception during _set_initial_sidebar_content: {e}")
+                    # Maybe provide default sidebar content or just log the error
+                    # traceback.print_exc() # Uncomment for debugging the sidebar error specifically
+            else:
+                 print("WARN: _set_initial_sidebar_content method not found.")
 
-            self.details_count_label.config(text=f"Total: {len(filtered_subgrid_data)}")
-            print("  DEBUG: Details window initial layout complete.")
 
-            self._update_details_pagination_bar() # <--- ADDED: Update pagination bar initially
-            self._schedule_sidebar_update_from_image()
-            self.details_window.after_idle(lambda: setattr(self, 'details_sidebar_update_locked', True))
+            # Update UI elements safely
+            if hasattr(self, 'details_count_label') and self.details_count_label:
+                try:
+                    self.details_count_label.config(text=f"Total: {len(filtered_subgrid_data)}")
+                except Exception as e:
+                    print(f"ERROR: Failed to update details_count_label: {e}")
+
+            print("  DEBUG: Details window initial layout mostly complete.")
+
+            # Call subsequent UI updates safely
+            if hasattr(self, '_update_details_pagination_bar'): self._update_details_pagination_bar()
+            if hasattr(self, '_schedule_sidebar_update_from_image'): self._schedule_sidebar_update_from_image()
+
+            if hasattr(self, 'details_window') and self.details_window:
+                # Use try-except for safety if lambda target might not exist
+                try:
+                    self.details_window.after_idle(lambda: setattr(self, 'details_sidebar_update_locked', True))
+                except Exception as e:
+                    print(f"ERROR: Failed to schedule details_sidebar_update_locked: {e}")
+
             print("--- _initial_details_layout.initial_layout_logic() DEBUG EXIT ---\n")
 
-            if self.details_window_is_favorites_filtered:
-                self.details_view_favorites_button.config(text="View All") # Set button text to "View All" - Favorites Mode
-            else:
-                self.details_view_favorites_button.config(text="View Favorites") # Set button text to "View Favorites" - View All Mode
+            # Update favorites button safely
+            if hasattr(self, 'details_view_favorites_button') and self.details_view_favorites_button:
+                try:
+                    is_fav_filtered = getattr(self, 'details_window_is_favorites_filtered', False)
+                    if is_fav_filtered:
+                        self.details_view_favorites_button.config(text="View All")
+                    else:
+                        self.details_view_favorites_button.config(text="View Favorites")
+                except Exception as e:
+                     print(f"ERROR: Failed to update details_view_favorites_button text: {e}")
+
+        # Schedule the initial layout logic
+        if hasattr(self, 'details_window') and self.details_window:
+            self.details_window.after(10, initial_layout_logic)
+        else:
+            print("ERROR: _initial_details_layout - Details window does not exist. Cannot schedule layout.")
+            # Consider if initial_layout_logic should run anyway in some cases,
+            # or if this indicates a prior failure.
 
 
-        self.details_window.after(10, initial_layout_logic)
-  
-        
-   
 
 
-
-
-    def _set_initial_sidebar_content(self, subgrid_data, zip_file): # <--- zip_file is "folder_grouped" here
-        """Sets the initial content of the details sidebar based on default or first item."""
-        print("\n--- _set_initial_sidebar_content() DEBUG ---")
-        print(f"  DEBUG: _set_initial_sidebar_content - Received zip_file ARGUMENT: {zip_file}")
+    def _set_initial_sidebar_content(self, subgrid_data, zip_file, individual_info_path=None):
+        """
+        Sets the initial content of the details sidebar based on default or first item.
+        REVISED AGAIN: Fixes UnboundLocalError and config name label timing.
+        """
+        print("\n--- _set_initial_sidebar_content() DEBUG (Revised: Fix Default + Elif Logic) ---")
+        print(f"  DEBUG: Received zip_file ARGUMENT (category): {zip_file}")
 
         default_config_item = self.find_default_config_item_details(subgrid_data, zip_file)
+
+        # --- Variables to hold the data of the item being displayed ---
+        item_to_display_data = None
+        calculated_individual_path = None # Path calculated specifically for the item being displayed
+
         if default_config_item:
             print("  DEBUG: Default config item FOUND, using default config for sidebar...")
-            default_picture_path, default_spawn_cmd, _, default_info_data, folder_name = default_config_item
+            # Unpack data from the default item
+            default_picture_path, default_spawn_cmd, default_item_zip_file, default_info_data, folder_name = default_config_item
+            item_to_display_data = default_config_item # Store the tuple
 
-            default_item_zip_file = default_config_item[2] # Get zip_file from the item tuple
-            print(f"  DEBUG: Default config item's zip_file value: {default_item_zip_file}")
+            print(f"  DEBUG: Default config item's specific zip_file value: {default_item_zip_file}")
+            print(f"  DEBUG: Default item's folder_name: {folder_name}")
 
-            # --- MODIFIED: Pass default_item_zip_file instead of zip_file arg ---
-            self.update_details_sidebar_content(default_info_data, default_picture_path, default_item_zip_file, folder_name) # Pass default_item_zip_file
-            # --- MODIFIED: Pass default_item_zip_file instead of zip_file arg ---
-
-            self.update_details_sidebar_config_name(default_spawn_cmd)
-            self.is_details_sidebar_showing_default = True
-
-            # --- ENSURE sidebar attributes are set for DEFAULT config ---
+            # --- Set sidebar instance state correctly for the DEFAULT item FIRST ---
             self.current_details_sidebar_spawn_cmd = default_spawn_cmd
             self.current_details_sidebar_info_data = default_info_data
             self.current_details_sidebar_picture_path = default_picture_path
-            self.current_details_sidebar_zip_file = default_item_zip_file # Store item-specific zip_file
-            self.current_details_folder = folder_name # <---- ENSURE folder_name is set here as well for default
-            # --- ENSURE sidebar attributes are set for DEFAULT config ---
-            print("  DEBUG: Calling update_details_sidebar_favorites_button_text() for DEFAULT config...") # Debug - Button Update Call
-            self.update_details_sidebar_favorites_button_text() # <--- ADD CALL HERE - FOR DEFAULT CONFIG
-            print("  DEBUG: update_details_sidebar_favorites_button_text() RETURNED (DEFAULT config).") # Debug - Button Update Return
-
-            print("  DEBUG: Initial sidebar content set to DEFAULT config.")
-        elif subgrid_data:
-            print("  DEBUG: No default config, using FIRST config for sidebar...")
-            first_item = subgrid_data[0]
-            first_picture_path, first_spawn_cmd, _, first_info_data, folder_name = first_item
-
-            first_item_zip_file = first_item[2] # Get zip_file from the item tuple
-            print(f"  DEBUG: First item's zip_file value: {first_item_zip_file}")
-
-            # --- MODIFIED: Pass first_item_zip_file instead of zip_file arg ---
-            self.update_details_sidebar_content(first_info_data, first_picture_path, first_item_zip_file, folder_name) # Pass first_item_zip_file
-            # --- MODIFIED: Pass first_item_zip_file instead of zip_file arg ---
-
-            self.update_details_sidebar_config_name(first_spawn_cmd)
+            self.current_details_sidebar_zip_file = default_item_zip_file
+            self.current_details_folder = folder_name
             self.is_details_sidebar_showing_default = True
+            print(f"  DEBUG: Instance state updated for default item: folder='{self.current_details_folder}', spawn='{self.current_details_sidebar_spawn_cmd}'")
 
-            # --- ENSURE sidebar attributes are set for FIRST config (fallback) ---
+            # --- Calculate the CORRECT individual info path for THIS default item ---
+            default_config_name = self.extract_name_from_spawn_command(default_spawn_cmd)
+            correct_default_zip_base_name = os.path.splitext(default_item_zip_file)[0] if default_item_zip_file else None
+            if folder_name and correct_default_zip_base_name and default_config_name:
+                print(f"  DEBUG: Finding path with folder='{folder_name}', zip_base='{correct_default_zip_base_name}', config='{default_config_name}'")
+                calculated_individual_path = self.find_individual_info_file(
+                    folder_name, correct_default_zip_base_name, default_config_name
+                )
+                print(f"  DEBUG: Calculated default_individual_info_path = {calculated_individual_path}")
+            else:
+                print("  WARN: Could not calculate default individual info path due to missing components.")
+                calculated_individual_path = None
+
+        elif subgrid_data:
+            # --- Fallback to first sorted item ---
+            print("  DEBUG: No default config, using FIRST config from provided data for sidebar...")
+            first_item = subgrid_data[0]
+            item_to_display_data = first_item # Store the tuple
+            # Unpack just for state setting and path calculation
+            first_picture_path, first_spawn_cmd, first_item_zip_file, first_info_data, folder_name = first_item
+            # Use the path calculated by the caller, as it pertains to this first sorted item
+            calculated_individual_path = individual_info_path
+            print(f"  DEBUG: Using pre-calculated path for first sorted item: {calculated_individual_path}")
+
+            print(f"  DEBUG: First item's specific zip_file value: {first_item_zip_file}")
+            print(f"  DEBUG: First item's folder_name: {folder_name}")
+
+            # Set state for the first item
             self.current_details_sidebar_spawn_cmd = first_spawn_cmd
             self.current_details_sidebar_info_data = first_info_data
             self.current_details_sidebar_picture_path = first_picture_path
-            self.current_details_sidebar_zip_file = first_item_zip_file # Store item-specific zip_file
-            self.current_details_folder = folder_name # <---- ENSURE folder_name is set here as well for first item
-            # --- ENSURE sidebar attributes are set for FIRST config (fallback) ---
-            print("  DEBUG: Calling update_details_sidebar_favorites_button_text() for FIRST config...") # Debug - Button Update Call
-            self.update_details_sidebar_favorites_button_text() # <--- ADD CALL HERE - FOR FIRST CONFIG
-            print("  DEBUG: update_details_sidebar_favorites_button_text() RETURNED (FIRST config).") # Debug - Button Update Return
+            self.current_details_sidebar_zip_file = first_item_zip_file
+            self.current_details_folder = folder_name
+            self.is_details_sidebar_showing_default = False # Showing first, not necessarily default
+            print(f"  DEBUG: Instance state updated for first item: folder='{self.current_details_folder}', spawn='{self.current_details_sidebar_spawn_cmd}'")
 
-            print("  DEBUG: Initial sidebar content set to FIRST config.")
         else:
-            # --- MODIFIED: Show messagebox and debug info when no configs are available + OKAY/CANCEL MESSAGE BOX ---
-            folder_name = self.current_details_folder # <--- ADDED: Assign folder_name here
-            message = "No configurations available for item,\n\nhere is what should have been displayed [debug]:\n"
-            message += f"\n- Zip File: {zip_file}" # Include zip_file info
-            message += f"\n- Folder Name: {folder_name}" # Include folder_name info  # <-- NOW folder_name is assigned
+            # --- Handle No Data (Keep existing logic) ---
+            folder_name = self.current_details_folder
+            print("  DEBUG: No subgrid data, sidebar will remain placeholder.")
+            # Show messagebox logic...
+            message = "No configurations available for item..."
+            # ... (rest of messagebox logic) ...
+            self.details_search_var.set("")
+            self.perform_details_search()
 
-            # --- NEW: Include filter information in messagebox if data subset is active ---
-            if self.is_data_subset_active:
-                filter_info_text = self.format_filter_settings_for_messagebox() # Get formatted filter info
-                if filter_info_text:
-                    message += "\n\n--- Global Filters Active ---\n" + filter_info_text # Append filter info
-                else:
-                    message += "\n\n--- Global Filters Active (No specific criteria set) ---"
-            # --- NEW: Include filter information in messagebox if data subset is active ---
+            print("  DEBUG: Calling update_details_sidebar_favorites_button_text() - NO DATA case...")
+            self.update_details_sidebar_favorites_button_text()
+            print("  DEBUG: update_details_sidebar_favorites_button_text() RETURNED (NO DATA case).")
+            print("--- _set_initial_sidebar_content() DEBUG EXIT (No Data) ---\n")
+            return # Exit early if no data
 
-            # --- NEW: Add list of configurations that caused the folder to appear ---
-            if self.full_data and folder_name in self.full_data:
-                configs_list_str = "\n".join([f"- {cfg[1]}" for cfg in self.full_data[folder_name]]) # Extract spawn commands
-                message += "\n\nConfigurations for this folder (if available):\n" + configs_list_str
+        # --- COMMON UPDATE LOGIC (Runs if default OR first item was found) ---
+        if item_to_display_data:
+            # Unpack the data for the item we decided to display
+            display_picture_path, display_spawn_cmd, display_item_zip_file, display_info_data, display_folder_name = item_to_display_data
+
+            # --- Step 1: Update Config Name Label Text FIRST ---
+            # Use the spawn command associated with the item being displayed
+            print(f"  DEBUG: Calling update_details_sidebar_config_name for '{display_spawn_cmd}'...")
+            self.update_details_sidebar_config_name(display_spawn_cmd) # Sets the text
+
+            # --- Step 2: Call the function that updates most labels, PASSING the calculated path ---
+            print(f"  DEBUG: Calling update_details_sidebar_individual_info with calculated path '{calculated_individual_path}'...")
+            # Pass the main info data corresponding to the item being displayed
+            self.update_details_sidebar_individual_info(calculated_individual_path, display_info_data)
+            # This function handles loading individual data and packing the labels (including config name now)
+
+            # --- Step 3: Update Car Name Label and Image ---
+            # Car Name Label (uses main_info_data)
+            brand = display_info_data.get("Brand", "").strip()
+            name = display_info_data.get("Name", "").strip()
+            vehicle_type = display_info_data.get("Type", "").strip()
+            # FIX: Define display_name_text consistently
+            display_name_text = "Unknown" # Default
+            if brand: display_name_text = f"{brand} {name}" if name else (f"{brand} {vehicle_type}" if vehicle_type else brand)
+            elif name: display_name_text = name
+            elif vehicle_type: display_name_text = vehicle_type
+            if hasattr(self, 'details_sidebar_car_name_label') and self.details_sidebar_car_name_label.winfo_exists():
+                 print(f"  DEBUG: Setting car name label to: '{display_name_text}'")
+                 self.details_sidebar_car_name_label.config(text=display_name_text)
             else:
- 
-                self.no_configs_messagebox_condition = True  
-                #message += "\n\nNo configurations found in full_data for this folder."
+                print("  WARN: details_sidebar_car_name_label not found.")
 
+            # Image Loading (uses picture_path)
+            print(f"  DEBUG: Loading image from path: {display_picture_path}")
+            try:
+                 photo = None
+                 if display_picture_path and os.path.exists(display_picture_path):
+                     # Add import for Image and ImageTk if not already globally available
+                     # from PIL import Image, ImageTk
+                     # Also ensure self.RESAMPLE_FILTER is defined (e.g., Image.Resampling.LANCZOS)
+                     img = Image.open(display_picture_path).convert("RGB")
+                     img = img.resize((280, 157), self.RESAMPLE_FILTER)
+                     photo = ImageTk.PhotoImage(img)
+                     print("  DEBUG: Image loaded and resized successfully.")
+                 else: # Load placeholder if path invalid or missing
+                     print(f"  WARN: Image path invalid or missing ('{display_picture_path}'), loading placeholder.")
+                     placeholder_image = Image.new("RGB", (280, 157), "#333333")
+                     photo = ImageTk.PhotoImage(placeholder_image)
 
-            self.details_search_var.set("") # Clear details search bar
-            self.no_configs_messagebox_condition = True 
-            self.perform_details_search() # Perform details search with cleared query
-            print("DEBUG: messagebox.askokcancel - User clicked OK, details search bar cleared and perform_details_search() called.") # Debug message
+                 if hasattr(self, 'details_sidebar_image_label') and self.details_sidebar_image_label.winfo_exists():
+                    self.details_sidebar_image_label.config(image=photo, bg="#333333")
+                    self.details_sidebar_image_label.image = photo # Keep reference
+                    print("  DEBUG: Sidebar image label updated.")
+                 else:
+                    print("  WARN: details_sidebar_image_label not found.")
+            except Exception as e:
+                 print(f"ERROR loading details sidebar image in _set_initial_sidebar_content: {e}")
+                 # Optional: Set placeholder on error here as well
 
+            # Zip Label correction (just in case, though individual_info should handle it)
+            self._ensure_correct_zip_label()
 
+            # --- Step 4: Update favorites button (based on instance state already set) ---
+            print(f"  DEBUG: Calling update_details_sidebar_favorites_button_text...")
+            self.update_details_sidebar_favorites_button_text()
 
-            print("  DEBUG: No subgrid data, sidebar will remain placeholder (and messagebox shown).")
-            print("  DEBUG: Calling update_details_sidebar_favorites_button_text() - NO DATA case (button should be 'Add')...") # Debug - Button Update Call - No Data
-            self.update_details_sidebar_favorites_button_text() # <--- ADD CALL HERE - FOR NO DATA CASE - Should default to "Add"
-            print("  DEBUG: update_details_sidebar_favorites_button_text() RETURNED (NO DATA case).") # Debug - Button Update Return - No Data
-        print("--- _set_initial_sidebar_content() DEBUG EXIT ---\n")
+            print(f"  DEBUG: Initial sidebar content SET for {'DEFAULT' if self.is_details_sidebar_showing_default else 'FIRST'} config.")
+
+        print("--- _set_initial_sidebar_content() DEBUG EXIT (Revised) ---\n")
         
 
 
@@ -15342,19 +19145,27 @@ class ConfigViewerApp:
 
         
 
-    def _initialize_combined_info(self): # MODIFIED - Removed Top Speed
+    def _initialize_combined_info(self): # MODIFIED - Added new keys
         """
         Initializes the combined info dictionary with default "N/A" values.
+        ADDED: Keys for new performance stats.
         """
         return {
             "Description": "N/A",
-            # "Top Speed": "N/A", # REMOVED - TOP SPEED
             "Value": "N/A",
             "Brand": "N/A",
             "Body Style": "N/A",
             "Weight": "N/A",
             "Years": "N/A",
-            "Configuration": "N/A"
+            "Configuration": "N/A",
+            # --- NEW Performance Keys ---
+            "Top Speed": "N/A",
+            "Torque": "N/A",
+            "Power": "N/A",
+            "0-100 km/h": "N/A",
+            "100-0 km/h": "N/A",
+            "Fuel Type": "N/A",
+            # --- End NEW ---
         }
 
     def _extract_top_speed(self, extracted_info):
@@ -15445,15 +19256,19 @@ class ConfigViewerApp:
             return body_style
         return "N/A"
 
-    def _set_configuration_label(self, combined_info):
+    def _set_configuration_label(self, individual_data): # MODIFIED: Takes individual_data
         """
-        Sets the "Selected Configuration" label in the details sidebar.
+        Sets the "Selected Configuration" label in the details sidebar using individual_data.
         """
-        if combined_info["Configuration"] != "N/A":
-            self.details_sidebar_selected_config_label_val.config(text=combined_info["Configuration"])
-            print(f"   DEBUG: Set Configuration: {combined_info['Configuration']}")
-        elif hasattr(self, 'current_details_sidebar_spawn_cmd'):
-            self.details_sidebar_selected_config_label_val.config(text="Custom/Unspecified")
+        config_display_name = individual_data.get("Configuration", "Custom/Unspecified") # Use get()
+        # Ensure label exists before configuring
+        if hasattr(self, 'details_sidebar_selected_config_label_val') and self.details_sidebar_selected_config_label_val.winfo_exists():
+            self.details_sidebar_selected_config_label_val.config(text=config_display_name)
+            print(f"   DEBUG: Set Configuration Label (from individual_data): {config_display_name}")
+        else:
+             print("   WARN: details_sidebar_selected_config_label_val does not exist when trying to set configuration.")
+
+
 
     def _populate_sidebar_labels(self, combined_info): # MODIFIED - Zip File Label
         """
@@ -15491,22 +19306,266 @@ class ConfigViewerApp:
         self.details_sidebar_years_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 10))
 
 
+
     def update_details_sidebar_individual_info(self, individual_info_path, main_info_data=None):
         """
-        Updates the details sidebar with information, broken down into functions.
+        Updates the details sidebar, prioritizing individual config data and using
+        main vehicle data ONLY if the specific key is MISSING from individual data.
+        Formatting is handled more directly/robustly.
+        MODIFIED: Prioritizes individual data more strictly.
+        MODIFIED: Integrated and refined formatting logic.
         """
-        extracted_info, file_content = self._load_individual_info(individual_info_path)
-        combined_info = self._initialize_combined_info()
+        print(f"\n--- update_details_sidebar_individual_info() ENTRY (Prioritize Individual Logic) ---")
+        print(f"  DEBUG: individual_info_path = {individual_info_path}")
+        print(f"  DEBUG: main_info_data available: {main_info_data is not None}")
 
-        # combined_info["Top Speed"] = self._extract_top_speed(extracted_info) # REMOVED
-        combined_info["Brand"] = self._extract_brand(extracted_info, main_info_data)
-        self._merge_extracted_details(extracted_info, combined_info)
-        combined_info["Years"] = self._extract_years(extracted_info, main_info_data, file_content)
-        combined_info["Body Style"] = self._extract_body_style(extracted_info, main_info_data)
+        # 1. Load individual data (includes fallbacks if JSON load fails)
+        individual_data, _ = self._load_individual_info(individual_info_path)
+        print(f"  DEBUG: Data loaded from _load_individual_info: {individual_data}")
 
-        self._set_configuration_label(combined_info)
-        self._populate_sidebar_labels(combined_info)
-        self._pack_sidebar_labels()
+        # --- More Robust Formatting Helper ---
+        def format_display_value(key, value, unit="", decimals=0, default="N/A"):
+            """Formats a value for display, handling None, N/A strings, and conversion errors."""
+            print(f"  DEBUG format_display_value: key='{key}', input_value='{value}' (type: {type(value)})")
+
+            # 1. Handle None, empty string, or explicit "N/A" string upfront
+            #    Treat empty string from get() as needing fallback/default.
+            if value is None or str(value).strip().upper() == "N/A":
+                 print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Input None or NA string)")
+                 return default
+
+            # Treat purely empty strings as invalid for numeric/unit formatting
+            if str(value).strip() == "":
+                print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Input was empty string)")
+                return default
+
+            # 2. Attempt numeric conversion and formatting for specific keys
+            if key in ["Value", "Weight", "Top Speed", "Torque", "Power", "0-100 km/h", "100-0 km/h"]:
+                try:
+                    num_value = float(value)
+
+                    if key == "Top Speed":
+                        # Special handling for Top Speed (m/s to km/h)
+                        # Allow 0 display
+                        num_value_kmh = round(num_value * 3.6, 0)
+                        result = f"{int(num_value_kmh)}{unit}" # unit is ' km/h'
+                    elif key in ["Value", "Weight", "Torque", "Power"]: # Integer fields
+                         # Allow 0 display
+                         result = f"{int(round(num_value, 0))}{unit}"
+                    elif key in ["0-100 km/h", "100-0 km/h"]: # Float fields with decimals
+                         # Allow 0.0 display
+                         format_string = "{:." + str(decimals) + "f}"
+                         result = f"{format_string.format(num_value)}{unit}"
+                    else: # Should not happen based on keys checked above
+                         result = str(num_value) # Fallback conversion
+
+                    print(f"  DEBUG format_display_value: key='{key}', Returning formatted numeric '{result}'")
+                    return result
+
+                except (ValueError, TypeError):
+                    # 3. Handle non-numeric strings that aren't "N/A" (caught above)
+                    print(f"  DEBUG format_display_value: key='{key}', ValueError/TypeError converting '{value}'")
+                    if isinstance(value, str):
+                        # Return the original string if it wasn't convertible (e.g., "Prototype", "Electric")
+                        print(f"  DEBUG format_display_value: key='{key}', Returning original string '{value}'")
+                        return value
+                    else:
+                        # It was some other non-convertible type? Return default.
+                        print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Conversion error, not string)")
+                        return default
+            else:
+                # 4. For non-numeric keys (like Brand, Description), just return the string value
+                print(f"  DEBUG format_display_value: key='{key}', Returning string value '{str(value)}' for non-numeric key.")
+                return str(value) # Ensure it's a string
+
+        # --- Helper to get value: Prioritize individual, fallback to main ONLY IF KEY MISSING in individual ---
+        def get_prioritized_value(key, default="N/A"):
+            value = individual_data.get(key, None) # Use None as sentinel for missing key
+
+            if value is not None: # Key exists in individual_data
+                print(f"  DEBUG get_prioritized: Key '{key}' -> Found in individual_data: '{value}'")
+                # Let format_display_value handle if it's "", "N/A", or valid data
+                return value
+            else: # Key was NOT FOUND in individual_data
+                print(f"  DEBUG get_prioritized: Key '{key}' -> Not found in individual_data. Checking main_info_data.")
+                if main_info_data:
+                    main_value = main_info_data.get(key, None) # Check main, use None as sentinel
+                    if main_value is not None:
+                        print(f"  DEBUG get_prioritized: Key '{key}' -> Found in main_info_data: '{main_value}'")
+                        # Let format_display_value handle if it's "", "N/A", or valid data
+                        return main_value
+                    else:
+                        # Key not in main either
+                        print(f"  DEBUG get_prioritized: Key '{key}' -> Not found in main_info_data. Using default '{default}'.")
+                        return default # Return the formatting function's default sentinel
+                else:
+                    # No main_info_data
+                    print(f"  DEBUG get_prioritized: Key '{key}' -> No main_info_data. Using default '{default}'.")
+                    return default # Return the formatting function's default sentinel
+
+
+        # 2. Update Labels using the new getter and the robust formatter
+        self._set_configuration_label(individual_data) # Still uses individual_data primarily for config name
+
+        # Update the text using the prioritized getter and robust formatter
+        # Note: Pass the UNFORMATTED value from get_prioritized_value to format_display_value
+        self.details_sidebar_description_label_val.config(text=format_display_value("Description", get_prioritized_value("Description")))
+        self.details_sidebar_value_label_val.config(text=format_display_value("Value", get_prioritized_value("Value"), " ", 0))
+        self.details_sidebar_brand_label_val.config(text=format_display_value("Brand", get_prioritized_value("Brand")))
+        self.details_sidebar_bodystyle_label_val.config(text=format_display_value("Body Style", get_prioritized_value("Body Style")))
+        self.details_sidebar_weight_label_val.config(text=format_display_value("Weight", get_prioritized_value("Weight"), " kg", 0))
+        # Years needs its own logic - assuming self.extract_years_string_from_data handles N/A etc.
+        years_value = get_prioritized_value("Years", None) # Get raw years data
+        self.details_sidebar_years_label_val.config(text=self.extract_years_string_from_data(years_value)) # Process it
+        self.details_sidebar_zipfile_label_val.config(text=os.path.basename(str(self.current_details_sidebar_zip_file or "N/A")))
+
+        # --- Update NEW performance labels ---
+        self.details_sidebar_topspeed_label_val.config(text=format_display_value("Top Speed", get_prioritized_value("Top Speed"), " km/h", 0))
+        self.details_sidebar_torque_label_val.config(text=format_display_value("Torque", get_prioritized_value("Torque"), " Nm", 0))
+        self.details_sidebar_power_label_val.config(text=format_display_value("Power", get_prioritized_value("Power"), " hp", 0))
+        self.details_sidebar_0_100_label_val.config(text=format_display_value("0-100 km/h", get_prioritized_value("0-100 km/h"), " s", 1))
+        self.details_sidebar_100_0_label_val.config(text=format_display_value("100-0 km/h", get_prioritized_value("100-0 km/h"), " m", 1))
+        self.details_sidebar_fuel_type_label_val.config(text=format_display_value("Fuel Type", get_prioritized_value("Fuel Type")))
+        # --- End Update NEW ---
+
+
+        # 3. Pack the labels (This packing logic remains largely the same, as it checks the FINAL text)
+        all_sidebar_labels = [
+            self.details_sidebar_selected_config_label_cat, self.details_sidebar_selected_config_label_val,
+            self.details_sidebar_config_name_label,
+            self.details_sidebar_description_label_cat, self.details_sidebar_description_label_val,
+            self.details_sidebar_zipfile_label_cat, self.details_sidebar_zipfile_label_val,
+            self.details_sidebar_value_label_cat, self.details_sidebar_value_label_val,
+            self.details_sidebar_brand_label_cat, self.details_sidebar_brand_label_val,
+            self.details_sidebar_bodystyle_label_cat, self.details_sidebar_bodystyle_label_val,
+            self.details_sidebar_weight_label_cat, self.details_sidebar_weight_label_val,
+            self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val,
+            # --- NEW Performance Labels ---
+            self.details_sidebar_topspeed_label_cat, self.details_sidebar_topspeed_label_val,
+            self.details_sidebar_torque_label_cat, self.details_sidebar_torque_label_val,
+            self.details_sidebar_power_label_cat, self.details_sidebar_power_label_val,
+            self.details_sidebar_0_100_label_cat, self.details_sidebar_0_100_label_val,
+            self.details_sidebar_100_0_label_cat, self.details_sidebar_100_0_label_val,
+            self.details_sidebar_fuel_type_label_cat, self.details_sidebar_fuel_type_label_val,
+        ]
+        for widget in all_sidebar_labels:
+            if widget and widget.winfo_exists():
+                widget.pack_forget()
+
+        # --- Pack in the CORRECT VISUAL ORDER ---
+        pack_padding_top = 5
+        pack_padding_bottom = 0
+        pack_padx = 10
+
+        def pack_pair(cat_widget, val_widget):
+            # Check the FINAL text assigned to the value widget
+            value_text = val_widget.cget("text") if val_widget and val_widget.winfo_exists() else "N/A"
+            should_pack = True
+            # Define formatted default/NA values to check against
+            # These should match the outputs of format_display_value when data is 0 or default "N/A"
+            na_values = ["N/A", "0 Nm", "0 hp", "0.0 s", "0.0 m", "0 kg", "0 ", "0 km/h"] # Added 0 km/h
+
+            # Special check for Configuration display
+            if val_widget == self.details_sidebar_selected_config_label_val and value_text == "Custom/Unspecified":
+                 should_pack = True # Always show the configuration name label
+            elif value_text in na_values:
+                 print(f"  DEBUG pack_pair: Hiding widgets for '{cat_widget.cget('text') if cat_widget else 'Unknown'}' because value_text '{value_text}' is in na_values.")
+                 should_pack = False
+            # Handle potential non-string values from Years extraction if it doesn't return "N/A" properly
+            elif val_widget == self.details_sidebar_years_label_val and (value_text is None or value_text.strip() == ""):
+                 print(f"  DEBUG pack_pair: Hiding Years widgets because value_text is None or empty.")
+                 should_pack = False
+
+
+            if should_pack:
+                 print(f"  DEBUG pack_pair: Packing widgets for '{cat_widget.cget('text') if cat_widget else 'Unknown'}'. Value: '{value_text}'")
+                 if cat_widget and cat_widget.winfo_exists():
+                     cat_widget.pack(fill="x", padx=pack_padx, pady=(pack_padding_top, 0))
+                 if val_widget and val_widget.winfo_exists():
+                     val_widget.pack(fill="x", padx=pack_padx, pady=(0, pack_padding_bottom))
+            else:
+                # Explicitly forget widgets if value is effectively N/A or invalid
+                if cat_widget and cat_widget.winfo_exists(): cat_widget.pack_forget()
+                if val_widget and val_widget.winfo_exists(): val_widget.pack_forget()
+
+        # Pack the top config info
+        pack_pair(self.details_sidebar_selected_config_label_cat, self.details_sidebar_selected_config_label_val)
+        # Config name label might need separate handling if it's always shown
+        if self.details_sidebar_config_name_label and self.details_sidebar_config_name_label.winfo_exists():
+             config_name_text = self.details_sidebar_config_name_label.cget("text")
+             if config_name_text and config_name_text != "N/A": # Example check
+                 self.details_sidebar_config_name_label.pack(fill="x", padx=pack_padx, pady=(0, 5))
+             else:
+                 self.details_sidebar_config_name_label.pack_forget()
+
+
+        # Pack the information labels using the pair logic
+        pack_pair(self.details_sidebar_description_label_cat, self.details_sidebar_description_label_val)
+        pack_pair(self.details_sidebar_zipfile_label_cat, self.details_sidebar_zipfile_label_val)
+        pack_pair(self.details_sidebar_value_label_cat, self.details_sidebar_value_label_val)
+        pack_pair(self.details_sidebar_brand_label_cat, self.details_sidebar_brand_label_val)
+        pack_pair(self.details_sidebar_bodystyle_label_cat, self.details_sidebar_bodystyle_label_val)
+        pack_pair(self.details_sidebar_weight_label_cat, self.details_sidebar_weight_label_val)
+        pack_pair(self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val) # Assumes extract_years handles N/A display
+
+        # --- Pack the NEW performance labels ---
+        pack_pair(self.details_sidebar_topspeed_label_cat, self.details_sidebar_topspeed_label_val)
+        pack_pair(self.details_sidebar_torque_label_cat, self.details_sidebar_torque_label_val)
+        pack_pair(self.details_sidebar_power_label_cat, self.details_sidebar_power_label_val)
+        pack_pair(self.details_sidebar_0_100_label_cat, self.details_sidebar_0_100_label_val)
+        pack_pair(self.details_sidebar_100_0_label_cat, self.details_sidebar_100_0_label_val)
+        # Special packing for Fuel Type at the end? Or use pack_pair? Using pack_pair for consistency.
+        pack_pair(self.details_sidebar_fuel_type_label_cat, self.details_sidebar_fuel_type_label_val)
+        # If extra bottom padding needed for last item (Fuel Type):
+        if self.details_sidebar_fuel_type_label_val.winfo_ismapped(): # Check if it was packed
+             self.details_sidebar_fuel_type_label_val.pack_configure(pady=(0, 10))
+
+
+        # 4. --- Update scrollregion and reset scroll position ---
+        self.details_sidebar_text_scrollable_frame.update_idletasks()
+        self.details_sidebar_text_canvas.configure(scrollregion=self.details_sidebar_text_canvas.bbox("all"))
+        self.details_sidebar_text_canvas.yview_moveto(0)
+        self.custom_sidebar_text_scrollbar_set(0,1) # Update scrollbar appearance
+
+        self._ensure_correct_zip_label()
+        print("  DEBUG: Details sidebar text scroll position reset to top.")
+        print("--- update_details_sidebar_individual_info() EXIT ---\n")
+
+
+    def _ensure_correct_zip_label(self):
+        """
+        Checks the final text of the zip file label in the details sidebar
+        and corrects specific raw identifiers to their user-friendly display names.
+        This acts as a post-processing step AFTER other updates might have run.
+        """
+        print("--- _ensure_correct_zip_label() ENTRY ---")
+        try:
+            # Check if the target label exists
+            if hasattr(self, 'details_sidebar_zipfile_label_val') and self.details_sidebar_zipfile_label_val and self.details_sidebar_zipfile_label_val.winfo_exists():
+                current_text = self.details_sidebar_zipfile_label_val.cget("text")
+                print(f"  DEBUG: Checking current zip label text: '{current_text}'")
+
+                # Check for the specific raw identifiers that need correction
+                if current_text == "user_custom_configs":
+                    print("  DEBUG: Correcting 'user_custom_configs' to 'Custom Configuration'")
+                    #self.details_sidebar_zipfile_label_val.config(text="Custom Configuration")
+
+                    self.details_sidebar_zipfile_label_val.config(text=f"Custom Configuration in folder: {self.current_details_folder}")
+                elif current_text == "folder_grouped": # Might as well check for this too
+                    print("  DEBUG: Correcting 'folder_grouped' to 'Custom Configuration'")
+                    self.details_sidebar_zipfile_label_val.config(text=f"Custom Configuration in folder: {self.current_details_folder}")
+                # Add elif for any other raw identifiers you want to map to display names here
+                else:
+                    print(f"  DEBUG: Zip label text '{current_text}' requires no correction.")
+
+            else:
+                print("  WARN: details_sidebar_zipfile_label_val widget not found or destroyed. Cannot correct label.")
+
+        except Exception as e:
+            print(f"ERROR in _ensure_correct_zip_label: {e}")
+        print("--- _ensure_correct_zip_label() EXIT ---")
+        
+
 
     def extract_years_string_from_data(self, years_data):
         """
@@ -15565,10 +19624,10 @@ class ConfigViewerApp:
             return "N/A"
 
                  
-    def extract_info_with_regex(self, file_content):
+    def extract_info_with_regex(self, file_content): # MODIFIED - Added new keys
         """
         Fallback method to extract info from the file content using regular expressions,
-        now including "Author".
+        now including new performance stats.
         """
         info_data = {}
         patterns = {
@@ -15577,37 +19636,73 @@ class ConfigViewerApp:
             "Brand": r'"Brand"\s*:\s*"([^"]*)"',
             "Body Style": r'"Body Style"\s*:\s*"([^"]*)"',
             "Weight": r'"Weight"\s*:\s*"([^"]*)"',
-            "Years": r'"Years"\s*:\s*({.*?})',  # Modified to capture the whole object.
+            "Years": r'"Years"\s*:\s*({.*?})',
             "Configuration": r'"Configuration"\s*:\s*"([^"]*)"',
-            "Author": r'"Author"\s*:\s*"([^"]*)"', # <-- ADDED pattern for "Author"
+            "Author": r'"Author"\s*:\s*"([^"]*)"',
+            # --- NEW Performance Keys ---
+            "Top Speed": r'"Top Speed"\s*:\s*([\d\.]+)', # Capture numeric value
+            "Torque": r'"Torque"\s*:\s*([\d\.]+)', # Capture numeric value
+            "Power": r'"Power"\s*:\s*([\d\.]+)', # Capture numeric value
+            "0-100 km/h": r'"0-100 km/h"\s*:\s*([\d\.]+)', # Capture numeric value
+            "100-0 km/h": r'"100-0 km/h"\s*:\s*([\d\.]+)', # Capture numeric value
+            "Fuel Type": r'"Fuel Type"\s*:\s*"([^"]*)"',
+            # --- End NEW ---
          }
 
         for key, pattern in patterns.items():
             match = re.search(pattern, file_content, re.IGNORECASE)
             if match:
-                info_data[key] = match.group(1)
+                info_data[key] = match.group(1).strip() # Use strip()
 
         return info_data
 
-    def extract_info_secondary_method(self, file_content):
+    def extract_info_secondary_method(self, file_content): # MODIFIED - Added new keys
         """
         Secondary method to extract info using a more lenient approach,
-        now also looking for "Author".
+        now also looking for new performance stats.
         """
         info_data = {}
         lines = file_content.split('\n')
+        # --- List of keys to extract ---
+        keys_to_extract = [
+            "Description", "Value", "Brand", "Body Style", "Weight", "Years",
+            "Configuration", "Author",
+            # --- NEW Performance Keys ---
+            "Top Speed", "Torque", "Power", "0-100 km/h", "100-0 km/h", "Fuel Type"
+            # --- End NEW ---
+        ]
+        # --- End List ---
+
         for line in lines:
             match = re.search(r'\s*"?(.*?)"?\s*:\s*"?(.*?)"?,?', line)
             if match:
                 key = match.group(1).strip()
                 value = match.group(2).strip()
-                if key in ["Description", "Value", "Brand", "Body Style", "Weight", "Years", "Configuration", "Author"]: # <-- ADDED "Author" to key list
+                if key in keys_to_extract: # Check against the list
                     info_data[key] = value
         return info_data
 
         
     def perform_details_search(self):
         """Performs search in details view, enforcing Favorites filter and ZIP filter."""
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- perform_details_search CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
 
         scanning_win = self.show_scanning_window(text="Loading...")
 
@@ -15718,10 +19813,13 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot search by zip while in Favorites mode.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
 
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
 
             print("--- handle_zip_search_button_click() EXIT - Favorites mode active ---\n") # Debug Exit
             return
@@ -15811,7 +19909,7 @@ class ConfigViewerApp:
             dropdown_button = tk.Button(
                 scrollable_frame, # <--- Place buttons in scrollable_frame
                 text=option,
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 10+self.font_size_add, "bold"),
                 command=lambda opt=option: on_menu_option_click(opt),
                 borderwidth=1,
                 relief="solid",
@@ -15830,7 +19928,7 @@ class ConfigViewerApp:
         close_button = tk.Button(
             dropdown_main_frame, # Place in dropdown_main_frame
             text="Close",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 10+self.font_size_add, "bold"),
             command=self.destroy_zip_search_dropdown_menu,
             bg="#666666",
             fg="white",
@@ -15902,24 +20000,55 @@ class ConfigViewerApp:
 
 
     def _apply_details_favorites_only_filter(self, data_to_filter):
-        """Applies ONLY the Favorites filter to the details data."""
+        """
+        Applies ONLY the Favorites filter to the details data,
+        ensuring deduplication based on favorite key.
+        """
+        # Optional: Keep this check, although the caller (perform_details_search)
+        # already verifies self.details_window_is_favorites_filtered
         if not self.details_window_is_favorites_filtered:
+            print("DEBUG: _apply_details_favorites_only_filter - Filter not active, returning original data.")
             return data_to_filter # Return original data if filter not active
 
         filtered_list = []
-        print("\n--- _apply_details_favorites_only_filter() DEBUG ---") # DEBUG START - FAVORITES ONLY FILTER
-        print("  DEBUG: _apply_details_favorites_only_filter - Applying Favorites Only filter.") # DEBUG - Filter Start
+        added_fav_keys = set()  # <<<--- ADD THIS LINE ---<<<
+
+        print("\n--- _apply_details_favorites_only_filter() DEBUG ---")
+        print("  DEBUG: _apply_details_favorites_only_filter - Applying Favorites Only filter WITH DEDUPLICATION.") # Updated message
 
         favorite_configs_set = self.read_favorites()
         for item in data_to_filter:
-            pic, spawn_cmd, zip_file_item, info_data, folder_name = item
-            config_name = self.extract_name_from_spawn_command(spawn_cmd)
-            fav_key = f"{folder_name}|{config_name}.pc"
-            if fav_key in favorite_configs_set:
-                filtered_list.append(item) # Add only if it's a favorite
+            try: # Add try-except for robustness when unpacking/processing
+                # Ensure item has the expected structure before unpacking
+                if not isinstance(item, (list, tuple)) or len(item) != 5:
+                    print(f"WARN: Skipping malformed item in favorite filter: {item}")
+                    continue
 
-        print(f"  DEBUG: _apply_details_favorites_only_filter - Filtered list count (favorites only): {len(filtered_list)}") # DEBUG - Filtered List Count
-        print("--- _apply_details_favorites_only_filter() DEBUG END ---\n") # DEBUG END - FAVORITES ONLY FILTER
+                pic, spawn_cmd, zip_file_item, info_data, folder_name = item
+                config_name = self.extract_name_from_spawn_command(spawn_cmd)
+
+                # Handle cases where extraction might fail
+                if not config_name:
+                    print(f"WARN: Could not extract config name from spawn_cmd: {spawn_cmd}. Skipping.")
+                    continue
+                if not folder_name:
+                     print(f"WARN: Missing folder_name for item with spawn_cmd: {spawn_cmd}. Skipping.")
+                     continue
+
+                fav_key = f"{folder_name}|{config_name}.pc"
+
+                # <<<--- MODIFY THIS CONDITION ---<<<
+                if fav_key in favorite_configs_set and fav_key not in added_fav_keys:
+                    filtered_list.append(item)
+                    added_fav_keys.add(fav_key) # <<<--- ADD THIS LINE ---<<<
+
+            except Exception as e:
+                 # Catch potential errors during processing an item
+                 print(f"ERROR processing item in _apply_details_favorites_only_filter: {item[:2]}... - {e}")
+                 continue # Skip problematic item
+
+        print(f"  DEBUG: _apply_details_favorites_only_filter - Filtered list count (favorites only, deduplicated): {len(filtered_list)}") # Updated message
+        print("--- _apply_details_favorites_only_filter() DEBUG END ---\n")
         return filtered_list
 
 
@@ -15977,7 +20106,8 @@ class ConfigViewerApp:
 
      
             
-
+    #this is unused now
+    '''
     def load_all_info_data_on_startup(self):
         """Loads all info data into cache on startup."""
         print("\n--- ConfigViewerApp.load_all_info_data_on_startup() ENTRY ---") # Debug Entry
@@ -16018,112 +20148,213 @@ class ConfigViewerApp:
         self.scanning_win = None
 
         self.scanning_win = self.show_scanning_window(text="Initializing Data...")
-
+        '''
 
 
     #@profile 
     def rebuild_simple_details(self):
         """
-        Rebuilds the details window's subgrid, now with pagination,
-        ENFORCING Favorites filter even for empty search in Favorites mode. <--- MODIFIED DOCSTRING
+        Rebuilds the details window's subgrid, respecting pagination and filters.
         """
-        if not self.details_window:
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- rebuild_simple_details CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+        
+        if not hasattr(self, 'details_window') or not self.details_window or not self.details_window.winfo_exists():
+            print("WARN: rebuild_simple_details called but details_window does not exist.")
+            return
+        if not hasattr(self, 'details_scrollable_frame') or not self.details_scrollable_frame:
+            print("WARN: rebuild_simple_details called but details_scrollable_frame does not exist.")
             return
 
-        print("\n--- rebuild_simple_details() ENTRY - Page:", self.details_page, "---") # Debug - Page Number
-        print(f"  DEBUG: rebuild_simple_details - items_per_page: {self.items_per_page}") # Debug - items_per_page
-        print(f"  DEBUG: rebuild_simple_details - details_page: {self.details_page}") # Debug - details_page
-        print(f"  DEBUG: rebuild_simple_details - len(self.details_filtered_data): {len(self.details_filtered_data)}") # Debug - Filtered Data Length
-        print(f"  DEBUG: rebuild_simple_details - details_window_is_favorites_filtered: {self.details_window_is_favorites_filtered}") # Debug - Favorites Filter State <--- ADDED
+        print("\n--- rebuild_simple_details() ENTRY - Page:", self.details_page, "---")
+        print(f"  DEBUG: rebuild_simple_details - items_per_page: {self.items_per_page}")
+        print(f"  DEBUG: rebuild_simple_details - details_page: {self.details_page}")
+        print(f"  DEBUG: rebuild_simple_details - len(self.details_filtered_data): {len(self.details_filtered_data) if hasattr(self, 'details_filtered_data') else 'N/A'}")
+        print(f"  DEBUG: rebuild_simple_details - details_window_is_favorites_filtered: {self.details_window_is_favorites_filtered}")
 
+        # Ensure details_filtered_data exists
+        if not hasattr(self, 'details_filtered_data'):
+            print("ERROR: rebuild_simple_details - self.details_filtered_data not found. Aborting.")
+            return # Or perhaps re-run the filtering logic if applicable
 
-
-
+        # --- Sorting logic (apply sorting to the currently filtered data) ---
         def get_config_value(item):
-            """Helper function to extract and safely convert 'Value' to float for sorting."""
-            picture_path, spawn_cmd, zip_file, info_data, folder_name = item
-            zip_file_base_name = os.path.splitext(zip_file)[0]
-            config_name = self.extract_name_from_spawn_command(spawn_cmd)
-            individual_info_path = self.find_individual_info_file(
-                folder_name, zip_file_base_name, config_name
-            )
-            #value = float('inf')  # Default high value for items without a valid "Value"  <--- CHANGED to float('inf')
-            value = float('-inf')  # Default low value for items without a valid "Value"
-            if individual_info_path and os.path.exists(individual_info_path):
-                individual_info_json, _ = self._load_individual_info(individual_info_path)
-                value_str = individual_info_json.get("Value", None)
-                if value_str:
-                    try:
-                        value = float(value_str)
-                    except ValueError:
-                        pass  # Keep default 'inf' for non-numeric values
-            return value
+            """
+            Helper function to extract 'Value' from the corresponding JSON file
+            and safely convert to float for sorting.
+            ADAPTED for _load_individual_info returning (dict, file_content_string).
+            """
+            default_sort_value = float('-inf') # Errors/missing go last in ascending sort
 
-        print("DEBUG: _initial_details_layout - Sorting subgrid_data by 'Value'...")
-        self.details_filtered_data.sort(key=get_config_value) # Sort by 'Value' <--- SORTING details_filtered_data directly
-        print("DEBUG: _initial_details_layout - subgrid_data SORTED by 'Value'.")
-        # --- NEW: Sorting logic by "Value" ---
+            try:
+                # --- Structure Check ---
+                if not isinstance(item, (list, tuple)) or len(item) != 5:
+                    print(f"WARN: get_config_value - Invalid item structure encountered: Type={type(item)}, Len={len(item) if isinstance(item, (list, tuple)) else 'N/A'}")
+                    try: item_preview = str(item)[:100]
+                    except Exception: item_preview = "[Unrepresentable Item]"
+                    print(f"   Problematic Item Preview: {item_preview}...")
+                    return default_sort_value
+                # --- End Structure Check ---
 
+                # Unpack item components
+                picture_path, spawn_cmd, item_zip_file, _, folder_name = item
 
+                # --- File Reading Logic ---
+                if not all([spawn_cmd, item_zip_file, folder_name]):
+                        print(f"WARN: get_config_value - Missing data for item: {str(item)[:100]}")
+                        return default_sort_value
 
-        # --- MODIFIED: Use details_filtered_data directly for pagination (already filtered by search AND favorites) ---
-        data_to_paginate = self.details_filtered_data # <--- USE details_filtered_data directly
-        # --- MODIFIED: Use details_filtered_data directly for pagination ---
+                # Handle potential 'folder_grouped' - needs verification
+                if item_zip_file == "folder_grouped":
+                        print(f"DEBUG: get_config_value - Encountered 'folder_grouped'. Need logic to find original zip for {spawn_cmd}")
+                        # Add fallback logic here if possible, otherwise return default
+                        return default_sort_value # Cannot proceed without actual zip
 
+                zip_file_base_name = os.path.splitext(item_zip_file)[0]
+                config_name = self.extract_name_from_spawn_command(spawn_cmd)
+                if not config_name or config_name.startswith("UnknownConfig") or config_name.startswith("Error"):
+                        print(f"WARN: get_config_value - Could not determine config name for {spawn_cmd}")
+                        return default_sort_value
 
+                individual_info_path = self.find_individual_info_file(
+                    folder_name, zip_file_base_name, config_name
+                )
+                # print(f"DEBUG: get_config_value - Looking for info file at: {individual_info_path}") # Verbose
+
+                value = default_sort_value # Start with default
+
+                if individual_info_path:
+                    # Call _load_individual_info which returns (dict, file_content_string)
+                    individual_info_dict, file_content_debug = self._load_individual_info(individual_info_path)
+
+                    # --- **** CORRECTED SUCCESS CHECK **** ---
+                    # Check if the *first* returned element is a non-empty dictionary.
+                    # This indicates _load_individual_info succeeded in extracting info.
+                    if isinstance(individual_info_dict, dict) and individual_info_dict:
+                        # Successfully loaded/extracted info, proceed to get 'Value'
+                        value_str = individual_info_dict.get("Value", None)
+                        if value_str is not None:
+                            try:
+                                value = float(value_str)
+                                # print(f"DEBUG: get_config_value - Extracted Value: {value} for {config_name}") # Verbose success
+                            except (ValueError, TypeError):
+                                print(f"WARN: get_config_value - Could not convert 'Value' ({value_str}) to float for Cmd: {spawn_cmd} from file: {individual_info_path}")
+                                # Keep default value
+                        # else: 'Value' key missing, keep default
+                    else:
+                        # Load failed or returned empty dict, use default value.
+                        # The file_content_debug might contain raw text, but we treat this as failure for sorting.
+                        # Avoid printing the full file content here unless debugging specific load failures.
+                        if not individual_info_path or not os.path.exists(individual_info_path):
+                            # Don't warn if the file genuinely doesn't exist (already handled by _load_individual_info print)
+                            pass
+                        else:
+                            # Warn if the file exists but info extraction failed (returned empty dict)
+                            print(f"WARN: get_config_value - Info extraction failed (got empty dict) for file: {individual_info_path}")
+                        # Keep default value
+                    # --- **** END CORRECTED SUCCESS CHECK **** ---
+
+                # else: find_individual_info_file returned None or empty string, keep default value
+                return value
+
+            except Exception as e:
+                try: item_str_preview = str(item)[:100]
+                except Exception: item_str_preview = "[Unrepresentable Item]"
+                print(f"ERROR: Unexpected error in get_config_value for item preview {item_str_preview}...: {e}")
+                # traceback.print_exc() # Uncomment for full traceback during debugging
+                return default_sort_value
+
+        print("DEBUG: rebuild_simple_details - Sorting details_filtered_data by 'Value'...")
+        self.details_filtered_data.sort(key=get_config_value)
+        print("DEBUG: rebuild_simple_details - details_filtered_data SORTED by 'Value'.")
+        # --- End Sorting ---
+
+        # Data to paginate is the already filtered and now sorted data
+        data_to_paginate = self.details_filtered_data
+
+        # --- Clear existing widgets and RESET STATE ---
         for widget in self.details_scrollable_frame.winfo_children():
             widget.destroy()
-        print("  DEBUG: rebuild_simple_details - Existing widgets DESTROYED.") # Debug - Widgets Destroyed
-        ConfigViewerApp.details_widget_count = 0
-        print("DEBUG: rebuild_simple_details - Widget count RESET to 0.") # Debug - Widget Count Reset
+        print("  DEBUG: rebuild_simple_details - Existing widgets DESTROYED.")
+        self.total_details_items_placed = 0 # <<< --- RESET COUNTER HERE --- <<<
+        # Reset widget count if you track it specifically for the details view
 
+        ConfigViewerApp.details_widget_count = 0
+        print(f"DEBUG: rebuild_simple_details - total_details_items_placed RESET to {self.total_details_items_placed}.")
+
+        # --- Prepare data for the CURRENT page ---
         start_index = self.details_page * self.items_per_page
         end_index = start_index + self.items_per_page
-        paged_data = data_to_paginate[start_index:end_index] # <--- USE data_to_paginate for slicing
+        paged_data = data_to_paginate[start_index:end_index]
 
-        print(f"  DEBUG: rebuild_simple_details - Loading page {self.details_page + 1}, items from index {start_index} to {end_index-1}, count: {len(paged_data)}")
-        print(f"  DEBUG: rebuild_simple_details - First 3 items in paged_data:") # <--- ADD DEBUG PRINT
+        print(f"  DEBUG: rebuild_simple_details - Loading page {self.details_page + 1}, items index {start_index} to {end_index-1}, count: {len(paged_data)}")
+        print(f"  DEBUG: rebuild_simple_details - First 3 items in paged_data:")
         if paged_data:
             for i in range(min(3, len(paged_data))):
                 item = paged_data[i]
-                if item and item[0]: # Check if item and picture_path exist
+                if item and len(item) > 0 and item[0]:
                     print(f"    - Item {i+1}: {os.path.basename(item[0])}")
                 else:
-                    print(f"    - Item {i+1}: Item data or picture_path is None")
+                    print(f"    - Item {i+1}: Item data or picture_path is None/invalid")
         else:
-            print("  DEBUG: rebuild_simple_details - paged_data is EMPTY.") # Check for empty paged_data
+            print("  DEBUG: rebuild_simple_details - paged_data is EMPTY for this page.")
 
+        # Create batches ONLY for the current page
         self.details_batches = [
             paged_data[i: i + self.details_batch_size]
             for i in range(0, len(paged_data), self.details_batch_size)
         ]
-        self.current_details_batch_index = 0
-        print(f"  DEBUG: rebuild_simple_details - Created batches for CURRENT PAGE, batch count: {len(self.details_batches)}")
+        self.current_details_batch_index = 0 # Reset batch index for the new page load
+        self.current_details_batch_index_in_sequence = 0 # Also reset sequence index
+        print(f"  DEBUG: rebuild_simple_details - Created batches for page, count: {len(self.details_batches)}")
         if self.details_batches:
-            print(f"  DEBUG: rebuild_simple_details - Size of first batch: {len(self.details_batches[0])}") # Size of first batch
+            print(f"  DEBUG: rebuild_simple_details - Size of first batch: {len(self.details_batches[0])}")
         else:
-            print("  DEBUG: rebuild_simple_details - NO batches created (details_batches is empty).") # No Batches Created
+            print("  DEBUG: rebuild_simple_details - NO batches created.")
 
-        # --- ENSURE INITIALIZATION of current_details_batch_index here, before calling load_next_batch_details ---
-        self.current_details_batch_index = 0 # <--- ENSURE INITIALIZATION HERE
-        print(f"DEBUG: rebuild_simple_details - ENSURING current_details_batch_index = {self.current_details_batch_index} BEFORE load_next_batch_details()") # Debug - Initialization Check
+        print(f"DEBUG: rebuild_simple_details - State before load: batch_idx={self.current_details_batch_index}, seq_idx={self.current_details_batch_index_in_sequence}, total_placed={self.total_details_items_placed}")
 
-        if paged_data:
+        # --- Start loading items for the current page ---
+        if self.details_batches: # Check if there are batches to load
             self.start_details_loading_animation()
-            print("DEBUG: rebuild_simple_details - Calling load_next_batch_details() NOW...") # Debug - Before Call
-            self.load_next_batch_details() # Start loading batches (now only for paged_data)
-            print("DEBUG: rebuild_simple_details - load_next_batch_details() RETURNED.") # Debug - After Call
+            print("DEBUG: rebuild_simple_details - Calling load_next_batch_details() NOW...")
+            self.load_next_batch_details()
+            print("DEBUG: rebuild_simple_details - load_next_batch_details() RETURNED.")
         else:
-            self.stop_details_loading_animation()
+            print("DEBUG: rebuild_simple_details - No batches to load for this page.")
+            self.stop_details_loading_animation() # Stop animation if no items
 
-        if self.details_count_label:
+        # Update total count label (using full filtered data count)
+        if hasattr(self, 'details_count_label') and self.details_count_label:
             self.details_count_label.config(text=f"Total: {len(self.details_filtered_data)}")
 
-        self._update_details_pagination_bar() # <--- ADDED: Update pagination bar initially
-        #self.start_debounce_details_highlighting()
+        self._update_details_pagination_bar() # Update pagination bar based on full filtered data
 
-        self.details_canvas_sub.yview_moveto(0)
-        print("--- rebuild_simple_details() DEBUG EXIT ---\n") # Debug Exit
+        #self.start_debounce_details_highlighting()
+        
+        # Reset scroll position to the top for the new page
+        if hasattr(self, 'details_canvas_sub') and self.details_canvas_sub:
+            self.details_canvas_sub.yview_moveto(0)
+
+        print("--- rebuild_simple_details() DEBUG EXIT ---\n")
+
 
 
 
@@ -16132,6 +20363,25 @@ class ConfigViewerApp:
         """
         Handles the details window resize event with debounce, only updating layout on column breakpoint change.
         """
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            #print(f"    Code context: {caller_code_context}") # Might be None
+
+        #print(f"--- throttled_details_resize CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
         if self.details_window and event.widget == self.details_window:
             new_width = self.details_window.winfo_width()
             new_height = self.details_window.winfo_height()
@@ -16153,6 +20403,25 @@ class ConfigViewerApp:
         Callback function triggered after debounce for details window resize.
         Updates the subgrid layout only if the number of columns needs to change.
         """
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- on_details_resize_complete CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
         details_canvas_width = self.details_canvas_sub.winfo_width() - 20 # Adjust for margins
         if details_canvas_width <= 0:
             return # Avoid calculations with non-positive width
@@ -16177,6 +20446,26 @@ class ConfigViewerApp:
         now using paged_data BUT **PREVENTS RE-TRIGGERING BATCH LOAD**.
         MODIFIED to only handle layout, not start new batch load.
         """
+
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- update_subgrid_layout_on_resize CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
         print("\n--- update_subgrid_layout_on_resize() ENTRY ---") # Debug Entry
         print(f"DEBUG: update_subgrid_layout_on_resize - BEFORE function logic - current_details_batch_index: {getattr(self, 'current_details_batch_index', 'ATTRIBUTE_MISSING')}") # Debug - Before Logic
 
@@ -16193,14 +20482,6 @@ class ConfigViewerApp:
             # --- MODIFIED: Calculate paged_data for current page on resize ---
 
 
-            # --- MODIFIED: Reset widget count at start of resize layout ---
-            ConfigViewerApp.details_widget_count = 0
-            print("DEBUG: update_subgrid_layout_on_resize - Widget count RESET to 0 for resize.")
-            # --- MODIFIED: Reset widget count at start of resize layout ---
-
-            # Clear existing widgets
-            for widget in self.details_scrollable_frame.winfo_children():
-                widget.destroy()
 
             # Determine the available width
             self.details_canvas_sub.update_idletasks()
@@ -16213,7 +20494,6 @@ class ConfigViewerApp:
             # --- ADDED DEBUG PRINTS HERE ---
 
 
-            image_width = 200
 
 
             if self.details_columns is None: # Initial column setup if not yet initialized
@@ -16227,36 +20507,54 @@ class ConfigViewerApp:
 
             print(f"DEBUG: update_subgrid_layout_on_resize - num_columns: {num_columns}, h_padding: {h_padding}") # Print num_columns and h_padding BEFORE grid layout
 
-            if width > 0:
-                pass
-                # --- MODIFIED: Iterate over paged_data for LAYOUT ONLY (no new batch load) ---
-                #for idx, item in enumerate(paged_data): # Iterate over paged_data
-                #    row = idx // num_columns
-                #    col = idx % num_columns
-                #    container = tk.Frame(self.details_scrollable_frame, bg="#444444")
-                #    container.grid(row=row, column=col, padx=self.details_column_padding, pady=5, sticky="nw") # Dynamic padding here
-                #    # --- IMPORTANT: DO NOT CALL load_image_item_details HERE during resize ---
-                #    # We are RE-USING already loaded images/widgets, just re-laying them out
-                #    self.executor.submit(
-                #        self.load_image_item_details,
-                #        item,
-                #        container,
-                #        row,
-                #        col
-                #    )
-                # --- MODIFIED: Iterate over paged_data for LAYOUT ONLY (no new batch load) ---
+            self.details_column_padding = h_padding
+            print(f"DEBUG: update_subgrid_layout_on_resize - num_columns: {num_columns}, h_padding: {h_padding}")
 
-            # Update the scroll region
+            # --- ADD THIS LOGIC INSTEAD OF DELETION/RECREATION ---
+            print(f"  DEBUG: Re-gridding existing {len(self.details_scrollable_frame.winfo_children())} child frames...")
+            # Use winfo_children() as it's more likely the frames were added sequentially
+            current_grid_items = self.details_scrollable_frame.winfo_children()
+
+            for idx, frame_widget in enumerate(current_grid_items):
+                if not isinstance(frame_widget, tk.Frame): # Skip non-frame widgets if any exist
+                    # print(f"    Skipping non-frame widget at index {idx}: {type(frame_widget)}") # Optional debug
+                    continue
+                if not frame_widget.winfo_exists(): # Skip destroyed widgets
+                    # print(f"    Skipping destroyed widget at index {idx}") # Optional debug
+                    continue
+
+                new_row = idx // num_columns
+                new_col = idx % num_columns
+                try:
+                    # Use grid_configure to update position and padding
+                    frame_widget.grid_configure(
+                        row=new_row,
+                        column=new_col,
+                        padx=self.details_column_padding, # Use the calculated dynamic padding
+                        pady=5,
+                        sticky="nw"
+                    )
+                    # print(f"    Re-gridded item {idx} to row {new_row}, col {new_col}") # Optional Debug
+                except tk.TclError as e:
+                    print(f"    Error re-gridding widget {frame_widget}: {e}") # Handle potential errors if widget became invalid
+
+            print(f"  DEBUG: Re-gridding complete.")
+            # --- END ADDED LOGIC ---
+
+
+            # --- Keep scroll region update ---
             self.details_scrollable_frame.update_idletasks()
             self.details_canvas_sub.config(scrollregion=self.details_canvas_sub.bbox("all"))
 
         except Exception as e:
             print(f"Error in update_subgrid_layout_on_resize: {e}")
-        finally: # ADDED finally block to print AFTER function execution
-            print(f"DEBUG: update_subgrid_layout_on_resize - EXIT - current_details_batch_index: {getattr(self, 'current_details_batch_index', 'ATTRIBUTE_MISSING')}") # Debug - Exit
-            print("--- update_subgrid_layout_on_resize() EXIT ---\n") # Debug Exit
+            import traceback
+            traceback.print_exc() # Print full traceback for errors here
+        finally:
+            print(f"DEBUG: update_subgrid_layout_on_resize - EXIT - current_details_batch_index: {getattr(self, 'current_details_batch_index', 'ATTRIBUTE_MISSING')}")
+            print("--- update_subgrid_layout_on_resize() EXIT ---\n")
 
-
+        
 
     #@profile 
     def update_grid_layout(self):
@@ -16265,23 +20563,64 @@ class ConfigViewerApp:
         Implements category collapsing and hover effects.
         Makes the mouse cursor change on hover over any part of the category header.
         """
+
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- update_grid_layout CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+        print(f"--- update_grid_layout called by stack: ---")
+        # Limit the depth if it gets too long, e.g., inspect.stack(0, 10) for 10 levels
+        for frame_info in inspect.stack():
+            print(f"  File \"{frame_info.filename}\", line {frame_info.lineno}, in {frame_info.function}")
+            # Optional: print context code
+            if frame_info.code_context:
+                print(f"    Code: {frame_info.code_context[0].strip()}")
+        print("----------------------------------------")
+
+
+        if self.update_grid_layout_called_first_time:
+            self.update_grid_layout_called_first_time = False 
+            print("DEBUG: update_grid_layout SKIPPED ENTRY - self.update_grid_layout_called_first_time is true ")
+            return
+
+        print("DEBUG: update_grid_layout - self.pause_loading = False")
+              
+        self.pause_loading = False
+
+
+
         self._update_filters_label_status()
+
+
 
         if self.is_search_results_window_active:
             print("DEBUG: update_grid_layout - Search Results window is active. SKIPPING main grid layout update.")
             return
-
-        if self.is_search_results_window_active and self.filter_state == 0 and not self.search_var.get().strip() and not self.is_data_subset_active:
-            print("DEBUG: update_grid_layout - Early EXIT - View All, Empty Query, Global Filters OFF. Skipping layout update.")
-
-            self.is_search_results_window_active = False
-            return
+        
 
         try:
             # Show loading label and start pulsating animation
             self.start_loading_animation()
 
+            scanning_win = self.show_scanning_window(text="Updating UI data...")
+
+
             # Clear the existing grid
+            print("DEBUG: update_grid_layout - destroying widgets")
             for widget in self.scrollable_frame.winfo_children():
                 widget.destroy()
 
@@ -16342,7 +20681,7 @@ class ConfigViewerApp:
                     header_label = tk.Label(
                         header_frame,
                         text=header_text_with_count,
-                        font=("Segoe UI", 14, "bold"),
+                        font=("Segoe UI", 14+self.font_size_add, "bold"),
                         bg="#444444",
                         fg="lightgrey",
                         anchor="w",
@@ -16392,9 +20731,19 @@ class ConfigViewerApp:
 
             self.load_next_batch()
 
+
+
+
+
+
         except Exception as e:
             print(f"Error in update_grid_layout: {e}")
 
+
+        if scanning_win:
+            scanning_win.destroy()
+            
+        print("DEBUG: update_grid_layout - EXIT")
             
 
     def toggle_category_visibility(self, category):
@@ -16407,15 +20756,18 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot hide or unhide categories while there are pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
 
         self.category_hidden_states[category] = not self.category_hidden_states.get(category, False)
+        print("    toggle_category_visibility is calling self.update_grid_layout()")
         self.update_grid_layout() # Re-layout the grid to reflect changes
 
     def on_category_hover_enter(self, event, category, header_label, separator, count): # <--- ADDED count parameter
@@ -16585,7 +20937,7 @@ class ConfigViewerApp:
             wraplength=200, #label length, don't remove current
             justify="center",
             fg=label_color,
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 10+self.font_size_add, "bold"),
             cursor="hand2",
             bg="#444444", # MODIFIED HERE
             height=3,
@@ -16625,7 +20977,7 @@ class ConfigViewerApp:
             )
             # --- DEBOUNCED Tooltip ---
 
-
+            ''' # commented out 
             # --- DEBOUNCED sidebar update ---
             if self.details_sidebar_debounce_timer:
                 self.master.after_cancel(self.details_sidebar_debounce_timer)  # Cancel any existing timer
@@ -16634,7 +20986,7 @@ class ConfigViewerApp:
                 lambda: self.debounced_show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item=(picture_path, spawn_cmd, zip_file, info_data, folder_name))
             )
             # --- DEBOUNCED sidebar update ---
-
+            '''
 
         def on_hover_leave(event):
             # --- MODIFIED: Check if label should be highlighted yellow, otherwise restore default color ---
@@ -16661,31 +21013,54 @@ class ConfigViewerApp:
 
 
         # --- Click Bindings (similar to original, but on Labels now) ---
-        lbl_img.bind("<Button-1>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name:
-            (self.on_details_image_click(s, i_data, pic_path, z_file, f_name), ))
-        # --- ADDED BACK: Double-Click binding for lbl_img ---
+        lbl_img.bind("<Button-1>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, ind_path=individual_info_path:
+            (
+
+                self.on_details_image_click(s, i_data, pic_path, z_file, f_name), # Original action
+                # *** ADDED: Update details sidebar ***
+                self.update_details_sidebar_config_name(spawn_cmd),
+                self.update_details_sidebar_individual_info(ind_path, i_data) # Pass path and main_info
+
+                
+            )
+        )
 
 
 
-        # --- ADDED BACK: Double-Click binding for lbl_img ---
-        lbl_img.bind("<Button-3>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, z_base_name=zip_file_base_name, c_name=config_name:
-                 (self.clear_details_sidebar_content(),
-                     
-                  self.open_detail_info_window(s, i_data, pic_path, z_file, f_name, z_base_name, c_name),
-                  self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name=self.current_details_folder),
-                  self.update_details_sidebar_config_name(spawn_cmd)
-                  ))
-        lbl_name.bind("<Button-3>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, z_base_name=zip_file_base_name, c_name=config_name: # Changed lbl_info to lbl_name # <--- NEW BINDING FOR lbl_info
-                 (self.open_detail_info_window(s, i_data, pic_path, z_file, f_name, z_base_name, c_name),
-                  self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name=self.current_details_folder), # REVERTED - ADDED BACK
-                  self.update_details_sidebar_config_name(spawn_cmd) # REVERTED - ADDED BACK
-                  )) # Open config details on Right-Click <--- CORRECTED CALL
+
+        # === Button-3 (Right Click) - MODIFY THIS ===
+        lbl_img.bind("<Button-3>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, z_base_name=zip_file_base_name, c_name=config_name_extracted, ind_path=individual_info_path: # Use config_name_extracted
+                 (
+                     #self.clear_details_sidebar_content(), # Keep if desired
+                     self.open_detail_info_window(s, i_data, pic_path, z_file, f_name, z_base_name, c_name), # Keep
+
+                     self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name=self.current_details_folder),
+                     self.update_details_sidebar_config_name(spawn_cmd),
+                     # *** ADD the CORRECT call ***
+                     self.update_details_sidebar_individual_info(ind_path, i_data) # Add this
+                 )
+        )
+        lbl_name.bind("<Button-3>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, z_base_name=zip_file_base_name, c_name=config_name_extracted, ind_path=individual_info_path: # Use config_name_extracted
+                 (
+                     #self.clear_details_sidebar_content(), # Optional clear
+                     self.open_detail_info_window(s, i_data, pic_path, z_file, f_name, z_base_name, c_name), # Keep
+
+                     self.update_details_sidebar_content(info_data, picture_path, zip_file, folder_name=self.current_details_folder),
+                     self.update_details_sidebar_config_name(spawn_cmd),
+                     # *** ADD the CORRECT call ***
+                     self.update_details_sidebar_individual_info(ind_path, i_data) # Add this
+                 )
+        )
         
-        lbl_name.bind("<Button-1>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name: # Changed lbl_info to lbl_name # Text label click - copy and update sidebar - pass folder_name
-                      (self.on_details_image_click(s, i_data, pic_path, z_file, f_name),
-                       # --- ADDED BACK: update_sidebar_content call on label single-click ---
-                       self.update_sidebar_content(info_data, picture_path, zip_file, folder_name=self.current_details_folder))) # Corrected to update_sidebar_content
-                       # --- ADDED BACK: update_sidebar_content call on label single-click ---
+        lbl_name.bind("<Button-1>", lambda e, s=spawn_cmd, i_data=info_data, pic_path=picture_path, z_file=zip_file, f_name=folder_name, ind_path=individual_info_path:
+            (
+                self.on_details_image_click(s, i_data, pic_path, z_file, f_name), # Original action
+                self.update_sidebar_content(i_data, pic_path, z_file, folder_name=self.current_details_folder),
+                self.update_details_sidebar_config_name(spawn_cmd),
+                # *** ADDED: Update details sidebar ***
+                self.update_details_sidebar_individual_info(ind_path, i_data) # Pass path and main_info
+            )
+        )
 
 
         if not self.middle_click_settings:
@@ -16733,7 +21108,7 @@ class ConfigViewerApp:
         self.current_details_item_tooltip_window.tk.call('tk', 'scaling', 1.25)
         self.current_details_item_tooltip_window.attributes("-topmost", True) # Keep on top
 
-        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
+        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
         tooltip_label.pack(padx=1, pady=1)
 
         widget_width = widget.winfo_width()
@@ -16768,7 +21143,7 @@ class ConfigViewerApp:
         self.current_details_item_tooltip_window.tk.call('tk', 'scaling', 1.25)
         self.current_details_item_tooltip_window.attributes("-topmost", True) # Keep on top
 
-        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
+        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
         tooltip_label.pack(padx=1, pady=1)
 
         widget_width = widget.winfo_width()
@@ -16817,16 +21192,16 @@ class ConfigViewerApp:
         
     def on_details_item_double_click_to_queue(self, spawn_cmd, info_data, picture_path, zip_file, folder_name):
         """Handles double click on an item in the details subgrid to add it to the spawn queue."""
-        scanning_window = None # Initialize scanning_window outside try block
+
 
         if spawn_cmd: # Only proceed if spawn_cmd is successfully obtained (either from label or stored attribute)
             try:
 
 
+                scanning_win = None 
 
-                scanning_window = self.show_scanning_window(text="Added to Spawn Queue") # <-- SHOW SCANNING WINDOW HERE
+                scanning_win = self.show_scanning_window(text="Added to Spawn Queue") # <-- SHOW SCANNING WINDOW HERE
                 # Make the window visible
-                scanning_window.deiconify()
                 self.master.update_idletasks() # Force window to appear immediately
 
                 self.is_details_sidebar_sticky = True
@@ -16871,9 +21246,14 @@ class ConfigViewerApp:
                     print("DEBUG: Spawn Queue window content refreshed.")
                 #--- NEW: Refresh Spawn Queue Window if open (now refreshed later conditionally) ---
 
-                time.sleep(0.725)
-                if scanning_window:
-                    scanning_window.destroy()
+                if scanning_win:
+
+                    def close_scanning_window():
+
+                        scanning_win.destroy()
+
+                    scanning_win.after(3125, close_scanning_window)
+                return
 
                 # --- NEW: Re-open Spawn Queue Window if it was closed initially ---
 
@@ -16888,12 +21268,13 @@ class ConfigViewerApp:
 
 
 
-    def debounced_show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item):
+    def debounced_show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None):
         """
-        Debounced function to call show_main_sidebar_info after a delay.
+        Debounced function that NOW ALSO triggers details sidebar update.
         """
-        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item)
-        self.details_sidebar_debounce_timer = None # Reset timer after execution
+        # Call the actual function, passing ALL arguments along
+        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item, individual_path, main_info_for_details)
+        self.details_sidebar_debounce_timer = None # Reset timer
       
   
 
@@ -16981,7 +21362,6 @@ class ConfigViewerApp:
 
             self.rebuild_simple_details()
             self._update_details_pagination_bar()
-            self.start_debounce_details_search()
 
             
 
@@ -17003,58 +21383,69 @@ class ConfigViewerApp:
 
             self.rebuild_simple_details()
             self._update_details_pagination_bar()
-            self.start_debounce_details_search()
             
+
+
+
+
 
     def customize_color_config(self, spawn_cmd, folder_name):
         """
         Customizes the color configuration by checking for a .pc file in user vehicles
-        or extracting it from a mod zip file.
+        or extracting it from a mod zip file. Performs case-insensitive search in zip_structure.txt.
 
         Args:
             spawn_cmd (str): The spawn command string containing the vehicle config path.
-            folder_name (str): The folder name (likely redundant in this context, but included as per original function signature).
+            folder_name (str): The folder name (used for model_information.txt).
         """
         print(f"Starting customize_color_config with spawn_cmd: {spawn_cmd}, folder_name: {folder_name}")
 
-
-
-
-
-
         # 1. Extract the vehicle config path
-        config_path_start = spawn_cmd.find("{config = '") + len("{config = '")
-        config_path_end = spawn_cmd.find("'}")
-        vehicle_config_path = spawn_cmd[config_path_start:config_path_end]
-        print(f"Extracted vehicle config path: {vehicle_config_path}")
+        try:
+            config_path_start = spawn_cmd.index("{config = '") + len("{config = '")
+            config_path_end = spawn_cmd.index("'}", config_path_start)
+            vehicle_config_path = spawn_cmd[config_path_start:config_path_end]
+            print(f"Extracted vehicle config path: {vehicle_config_path}")
+        except ValueError:
+            print(f"Error: Could not parse vehicle config path from spawn_cmd: {spawn_cmd}")
+            return
 
         # 2. Define search folders
         data_folder = self.script_dir / "data"
         user_vehicles_folder_txt_path = data_folder / "user_vehicles_folder.txt"
-        script_parent_folder = self.script_dir.parent
-
-        print(f"Creating model_information.txt with {folder_name}")
-        model_info_file_path = data_folder / "model_information.txt"
-        try:
-            with open(model_info_file_path, 'w', encoding='utf-8') as f:  # 'w' mode will overwrite the file each time
-                f.write(folder_name + '\n')
-            print(f"Created/updated {model_info_file_path} with folder_name: {folder_name}")
-        except Exception as e:
-            print(f"Error writing to {model_info_file_path}: {e}")
-        print(f"Created model_information.txt with {folder_name}")
-
-
+        script_parent_folder = self.script_dir.parent # Assuming script_dir is defined in your class
 
         print(f"Data folder path: {data_folder}")
         print(f"User vehicles folder txt path: {user_vehicles_folder_txt_path}")
         print(f"Script parent folder path: {script_parent_folder}")
 
+        # Write model information (Consider if this overwrite logic is always desired)
+        print(f"Updating model_information.txt with {folder_name}")
+        model_info_file_path = data_folder / "model_information.txt"
+        try:
+            # Ensure data directory exists
+            data_folder.mkdir(parents=True, exist_ok=True)
+            with open(model_info_file_path, 'w', encoding='utf-8') as f:
+                f.write(folder_name + '\n')
+            print(f"Created/updated {model_info_file_path} with folder_name: {folder_name}")
+        except Exception as e:
+            print(f"Error writing to {model_info_file_path}: {e}")
+            # Decide if you should return here or continue
+
+        # 3. Get User Vehicles Folder Path
         user_vehicles_base_folder = None
         try:
             with open(user_vehicles_folder_txt_path, 'r', encoding='utf-8') as f:
                 user_vehicles_base_folder_str = f.readline().strip()
+                if not user_vehicles_base_folder_str:
+                    print(f"Error: {user_vehicles_folder_txt_path} is empty or contains only whitespace.")
+                    return
                 user_vehicles_base_folder = Path(user_vehicles_base_folder_str)
             print(f"User vehicles base folder read from file: {user_vehicles_base_folder}")
+            if not user_vehicles_base_folder.is_dir():
+                 print(f"Error: User vehicles path specified in {user_vehicles_folder_txt_path} is not a valid directory: {user_vehicles_base_folder}")
+                 return
+
         except FileNotFoundError:
             print(f"Error: {user_vehicles_folder_txt_path} not found.")
             return
@@ -17063,10 +21454,14 @@ class ConfigViewerApp:
             return
 
         # Construct paths for user vehicles folder check
-        vehicle_folder_name = vehicle_config_path.split('/')[1] # e.g., DOmirage from vehicles/DOmirage/4G63 Turbo.pc
-        pc_file_name = vehicle_config_path.split('/')[-1] # e.g., 4G63 Turbo.pc
-        user_vehicle_pc_path = user_vehicles_base_folder / vehicle_folder_name / pc_file_name
-        print(f"User vehicle .pc file path to check: {user_vehicle_pc_path}")
+        try:
+            vehicle_folder_name = Path(vehicle_config_path).parts[1] # e.g., DOmirage from vehicles/DOmirage/4G63 Turbo.pc
+            pc_file_name = Path(vehicle_config_path).name # e.g., 4G63 Turbo.pc
+            user_vehicle_pc_path = user_vehicles_base_folder / vehicle_folder_name / pc_file_name
+            print(f"User vehicle .pc file path to check: {user_vehicle_pc_path}")
+        except IndexError:
+            print(f"Error: Could not parse vehicle folder name from config path: {vehicle_config_path}")
+            return
 
         # 4. Check user_vehicles folder
         if user_vehicle_pc_path.exists():
@@ -17075,12 +21470,12 @@ class ConfigViewerApp:
             try:
                 shutil.copy2(user_vehicle_pc_path, destination_path)
                 print(f"Copied and renamed .pc file from {user_vehicle_pc_path} to {destination_path}")
-                self.color_picker()
+                self.color_picker() # Assuming self.color_picker() is defined
             except Exception as e:
                 print(f"Error copying .pc file from user vehicles: {e}")
-            return
+            return # Exit after successfully handling user vehicles file
 
-        print(f".pc file not found in user vehicles folder.")
+        print(f".pc file not found in user vehicles folder: {user_vehicle_pc_path}")
 
         # 5. Check zip_structure.txt
         zip_structure_txt_path = data_folder / "zip_structure.txt"
@@ -17090,82 +21485,132 @@ class ConfigViewerApp:
             print(f"Error: {zip_structure_txt_path} not found.")
             return
 
-        target_config_path_zip_txt = vehicle_config_path.replace('/', '\\') # for zip_structure.txt format
-        print(f"Target config path for zip_structure.txt: {target_config_path_zip_txt}")
+        # Prepare target path for comparison (lowercase and using backslashes like in zip_structure.txt)
+        target_config_path_zip_txt = vehicle_config_path.replace('/', '\\')
+        target_config_path_zip_txt_lower = target_config_path_zip_txt.lower() # <-- Lowercase version for comparison
+        print(f"Target config path for zip_structure.txt (case-insensitive): {target_config_path_zip_txt_lower}")
 
         zip_file_path = None
-        try:
-            with open(zip_structure_txt_path, 'r', encoding='utf-8') as f: # Added encoding for broader character support
-                lines = f.readlines()
-                found_config_line_index = -1
-                for index, line in enumerate(lines):
-                    if target_config_path_zip_txt in line:
-                        found_config_line_index = index
-                        print(f"Found config path in zip_structure.txt at line {index+1}: {line.strip()}")
-                        # Search upwards for zip path
-                        for i in range(found_config_line_index - 1, -2, -1): # -2 to include -1 and stop before going further
-                            if i == -1: # Reached the beginning of the file without finding zip path
-                                print("Zip path not found above the config path line in zip_structure.txt")
-                                break
-                            zip_line = lines[i].strip()
-                            print(f"Checking line {i+1} for zip path: {zip_line}")
-                            if ("\\mods\\" in zip_line or "\\content\\" in zip_line) and zip_line.lower().endswith(".zip"): # Case-insensitive zip check
+        found_config_line_index = -1 # Initialize outside the try block
 
-                                zip_file_path_str = zip_line.split(" = ")[1] if " = " in zip_line else zip_line # Handle different formats
-                                zip_file_path = Path(zip_file_path_str)
-                                print(f"Found zip file path: {zip_file_path}")
-                                break
-                        if zip_file_path:
-                            break # Exit the outer loop once zip_file_path is found
-                else: # else block for the for loop, executes if the loop completes without a 'break'
-                    print(f"Vehicle config path '{target_config_path_zip_txt}' not found in zip_structure.txt")
-                    return
+        try:
+            with open(zip_structure_txt_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            # --- Search for the config path case-insensitively ---
+            for index, line in enumerate(lines):
+                # Convert the current line to lowercase for comparison
+                if target_config_path_zip_txt_lower in line.lower(): # <-- CASE-INSENSITIVE CHECK
+                    found_config_line_index = index
+                    print(f"Found config path (case-insensitive) in zip_structure.txt at line {index+1}: {line.strip()}")
+                    break # Exit loop once found
+
+            # --- If found, search upwards for the zip file path ---
+            if found_config_line_index != -1:
+                for i in range(found_config_line_index - 1, -2, -1): # Search upwards
+                    if i == -1: # Reached the beginning of the file
+                        print("Zip path not found above the config path line in zip_structure.txt")
+                        break
+                    zip_line = lines[i].strip()
+                    print(f"Checking line {i+1} for zip path: {zip_line}")
+                    # Check if the line looks like a zip path (case-insensitive check for extension)
+                    # Also check if it likely contains a mod/content path structure
+                    zip_line_lower = zip_line.lower()
+                    if ("\\mods\\" in zip_line_lower or "\\content\\" in zip_line_lower or " = " in zip_line) and zip_line_lower.endswith(".zip"):
+                        # Try to extract path, handling "path = C:\..." and just "C:\..." formats
+                        potential_path_str = zip_line.split(" = ")[-1].strip() # Get part after last ' = ', or whole string if no ' = '
+                        try:
+                            # Basic validation if it looks like a path ending in .zip
+                            if Path(potential_path_str).name.lower().endswith(".zip"):
+                                zip_file_path = Path(potential_path_str)
+                                print(f"Found potential zip file path: {zip_file_path}")
+                                break # Exit inner loop once zip path is found
+                            else:
+                                print(f"Line {i+1} contains .zip but '{potential_path_str}' doesn't seem like a valid path.")
+                        except Exception as path_e: # Catch potential errors during Path() creation
+                             print(f"Could not interpret line {i+1} as a path: {zip_line}. Error: {path_e}")
+
+                if not zip_file_path:
+                     print("Could not definitively identify zip file path above the config line.")
+
+            else: # else block for the outer for loop (config path search)
+                print(f"Vehicle config path containing '{target_config_path_zip_txt_lower}' not found in zip_structure.txt")
+                return # Exit if config path not found
 
         except Exception as e:
             print(f"Error reading or processing zip_structure.txt: {e}")
-            return
+            return # Exit on error
 
+        # 6. Extract from Zip if found
         if zip_file_path:
-            if not zip_file_path.exists():
-                print(f"Error: Zip file not found at path specified in zip_structure.txt: {zip_file_path}")
-                return
+            if not zip_file_path.is_file(): # Use is_file() for better checking
+                print(f"Error: Zip file path found ('{zip_file_path}') does not point to an existing file.")
+                # Attempt to resolve relative to script parent if it's not absolute
+                if not zip_file_path.is_absolute():
+                    potential_path = script_parent_folder / zip_file_path
+                    print(f"Attempting to resolve relative path: {potential_path}")
+                    if potential_path.is_file():
+                        zip_file_path = potential_path
+                        print(f"Resolved relative zip path to: {zip_file_path}")
+                    else:
+                        print(f"Error: Relative zip file path could not be resolved or file doesn't exist: {potential_path}")
+                        return
+                else:
+                     return # Absolute path doesn't exist
 
-            zip_base_name = zip_file_path.name
-            zip_entry_path = vehicle_config_path # Keep forward slashes here - IMPORTANT CHANGE
-
-            full_zip_entry = f"{zip_base_name}\\{zip_entry_path}" # Construct full zip entry path
-
-            print(f"Zip file path: {zip_file_path}")
-            print(f"Zip entry path: {zip_entry_path}")
-            print(f"Full zip entry path to extract: {full_zip_entry}")
-
+            # Use the original vehicle_config_path with forward slashes for zip entry
+            # Zip files typically use forward slashes internally regardless of OS
+            zip_entry_path = vehicle_config_path
+            print(f"Zip file path to use: {zip_file_path}")
+            print(f"Zip entry path to extract: {zip_entry_path}")
 
             destination_path = data_folder / "customcarcol.pc"
             try:
                 with zipfile.ZipFile(zip_file_path, 'r') as zf:
-                    print("Contents of the zip file:")
-                    zf.printdir() # Print zip contents
+                    # Optional: List contents for debugging, might be slow for large zips
+                    # print("Contents of the zip file:")
+                    # zf.printdir()
 
-                    try:
-                        with zf.open(zip_entry_path) as source_file: # Use zip_entry_path directly here (backslashes should work in zipfile)
-                            with open(destination_path, 'wb') as dest_file:
-                                shutil.copyfileobj(source_file, dest_file)
-                        print(f"Extracted and renamed .pc file from zip '{zip_file_path}' entry '{zip_entry_path}' to '{destination_path}'")
-                    except KeyError:
-                        print(f"Error: .pc file '{zip_entry_path}' not found in zip '{zip_file_path}'.")
-                    except Exception as extract_e:
-                        print(f"Error extracting .pc file from zip: {extract_e}")
+                    # Get a list of all file names in the zip archive
+                    zip_contents = zf.namelist()
+                    # Normalize zip entry path (forward slashes, lowercase) for comparison
+                    zip_entry_path_normalized = zip_entry_path.replace('\\', '/').lower()
+
+                    # Find the actual entry path case-insensitively
+                    actual_zip_entry = None
+                    for name in zip_contents:
+                        if name.replace('\\', '/').lower() == zip_entry_path_normalized:
+                            actual_zip_entry = name # Use the original casing from the zip file
+                            print(f"Found matching entry in zip (case-insensitive): '{actual_zip_entry}'")
+                            break
+
+                    if actual_zip_entry:
+                        try:
+                            with zf.open(actual_zip_entry) as source_file:
+                                with open(destination_path, 'wb') as dest_file:
+                                    shutil.copyfileobj(source_file, dest_file)
+                            print(f"Extracted and renamed .pc file from zip '{zip_file_path}' entry '{actual_zip_entry}' to '{destination_path}'")
+                            self.color_picker() # Launch color picker after successful extraction
+                        except KeyError: # Should technically not happen due to the check above, but good practice
+                             print(f"Internal Error: Could not open validated zip entry '{actual_zip_entry}'.")
+                        except Exception as extract_e:
+                            print(f"Error extracting '{actual_zip_entry}' from zip: {extract_e}")
+                    else:
+                        print(f"Error: .pc file matching '{zip_entry_path}' (case-insensitive) not found within zip '{zip_file_path}'.")
+                        # Optional: Print available paths if list is not too long
+                        # if len(zip_contents) < 50:
+                        #    print("Available paths in zip:")
+                        #    for name in zip_contents: print(f"- {name}")
 
 
             except zipfile.BadZipFile:
-                print(f"Error: Invalid zip file: {zip_file_path}")
+                print(f"Error: Invalid or corrupted zip file: {zip_file_path}")
+            except FileNotFoundError: # Catch if zip file disappears between check and open
+                 print(f"Error: Zip file not found at the moment of opening: {zip_file_path}")
             except Exception as e:
-                print(f"General error processing zip file: {e}")
+                print(f"General error processing zip file '{zip_file_path}': {e}")
         else:
-            print("Could not determine zip file path from zip_structure.txt")
-
-        # launch the color picker GUI    
-        self.color_picker()
+            print("Could not determine zip file path from zip_structure.txt, cannot extract.")
 
 
 
@@ -17188,7 +21633,28 @@ class ConfigViewerApp:
 
         detail_win = tk.Toplevel(self.details_window)
         detail_win.title("Configuration Details")
-        detail_win.geometry("500x700") # Initial geometry, will be resized later
+
+
+
+        if self.font_size_add == 0:
+
+            detail_win.geometry("500x700")
+            print(f"Current font size add value: {self.font_size_add}")
+
+
+        elif self.font_size_add == 2:
+ 
+            detail_win.geometry("500x800")
+            print(f"Current font size add value: {self.font_size_add}")
+
+        elif self.font_size_add == 4:
+
+
+            detail_win.geometry("500x900") # Initial geometry, will be resized later
+            print(f"Current font size add value: {self.font_size_add}")
+
+
+
         detail_win.bind_all("<Control-f>", lambda event: self.color_picker1()) 
         #detail_win.attributes('-topmost', True)
         self.current_detail_window = detail_win
@@ -17213,7 +21679,17 @@ class ConfigViewerApp:
         dw_height = self.details_window.winfo_height()
         dw_x = self.details_window.winfo_rootx()
         dw_y = self.details_window.winfo_rooty()
-        win_width = 390 # Initial width
+
+
+        if self.font_size_add == 0:
+            win_width = 390 # Initial width
+
+        elif self.font_size_add == 2:
+            win_width = 410 # Initial width
+
+        elif self.font_size_add == 4:
+            win_width = 450 # Initial width
+
         win_height = 750 # Initial height, will be adjusted
         x = dw_x + (dw_width // 2) - (win_width // 2) # Center horizontally
         y = dw_y + (dw_height // 2) - (win_height // 2) # Center vertically
@@ -17227,10 +21703,10 @@ class ConfigViewerApp:
         brand_name_frame = tk.Frame(main_frame, bg="#333333") # Frame to hold brand and name
         brand_name_frame.pack(fill=tk.X, pady=(0, 5)) # Pack before image, with padding below
 
-        brand_label = tk.Label(brand_name_frame, text=info_data.get("Name", "Unknown Name"), font=("Segoe UI", 14, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333")
+        brand_label = tk.Label(brand_name_frame, text=info_data.get("Name", "Unknown Name"), font=("Segoe UI", 14+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333")
         brand_label.pack(side=tk.TOP, fill=tk.X) # Brand on top
 
-        name_label = tk.Label(brand_name_frame, text=info_data.get("Brand", "Unknown Brand"), font=("Segoe UI", 12, "bold", "italic"), anchor=tk.CENTER, justify=tk.CENTER, fg="lightgrey", bg="#333333")
+        name_label = tk.Label(brand_name_frame, text=info_data.get("Brand", "Unknown Brand"), font=("Segoe UI", 12+self.font_size_add, "bold", "italic"), anchor=tk.CENTER, justify=tk.CENTER, fg="lightgrey", bg="#333333")
         name_label.pack(side=tk.TOP, fill=tk.X) # Name below brand
         # --- NEW: Brand and Name Labels at the Top ---
 
@@ -17271,7 +21747,7 @@ class ConfigViewerApp:
                 config_display_name = "Error Loading Config Name"
 
         # --- MODIFIED: Removed fixed wraplength, set anchor and justify ---
-        config_name_label = tk.Label(info_frame, text=config_display_name, font=("Segoe UI", 13, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333") # REMOVED wraplength
+        config_name_label = tk.Label(info_frame, text=config_display_name, font=("Segoe UI", 13+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333") # REMOVED wraplength
         config_name_label.grid(row=row_num, column=0, sticky="ew", columnspan=2, pady=(0,5))
         row_num += 1
         self.config_name_label_detail_window = config_name_label # Store as instance attribute
@@ -17284,13 +21760,13 @@ class ConfigViewerApp:
             top_speed_display = "N/A"
 
         info_labels = [
-            ("Top Speed", top_speed_display),
-            ("Torque", individual_data.get("Torque", "N/A") or "N/A"),
-            ("Power", individual_data.get("Power", "N/A")or "N/A"),
-            ("0-100 km/h", individual_data.get("0-100 km/h", "N/A") or "N/A"),
-            ("100-0 km/h", individual_data.get("100-0 km/h", "N/A")or "N/A"),
+            #("Top Speed", top_speed_display),
+            #("Torque", individual_data.get("Torque", "N/A") or "N/A"),
+            #("Power", individual_data.get("Power", "N/A")or "N/A"),
+            #("0-100 km/h", individual_data.get("0-100 km/h", "N/A") or "N/A"),
+            #("100-0 km/h", individual_data.get("100-0 km/h", "N/A")or "N/A"),
             ("Propulsion", individual_data.get("Propulsion", "N/A")or "N/A"),
-            ("Fuel Type", individual_data.get("Fuel Type", "N/A")or "N/A"),
+            #("Fuel Type", individual_data.get("Fuel Type", "N/A")or "N/A"),
             ("Drivetrain", individual_data.get("Drivetrain", "N/A")or "N/A"),
             ("Transmission", individual_data.get("Transmission", "N/A")or "N/A"),
             ("Weight/Power", individual_data.get("Weight/Power", "N/A")or "N/A"),
@@ -17302,8 +21778,8 @@ class ConfigViewerApp:
         # --- MODIFIED: Dynamic wraplength and label creation with wraplength ---
         label_wraplength = win_width - 40  # Adjust padding as needed
         for label_text, value in info_labels: #unchanged
-            tk.Label(info_frame, text=f"{label_text}:", font=("Segoe UI", 12, "bold"), anchor=tk.E, justify=tk.RIGHT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=0, sticky="ne", padx=(0,15))
-            tk.Label(info_frame, text=value if value else "N/A", font=("Segoe UI", 12, "italic"), anchor=tk.W, justify=tk.LEFT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=1, sticky="nw")
+            tk.Label(info_frame, text=f"{label_text}:", font=("Segoe UI", 12+self.font_size_add, "bold"), anchor=tk.E, justify=tk.RIGHT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=0, sticky="ne", padx=(0,15))
+            tk.Label(info_frame, text=value if value else "N/A", font=("Segoe UI", 12+self.font_size_add, "italic"), anchor=tk.W, justify=tk.LEFT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=1, sticky="nw")
             row_num += 1
         # --- MODIFIED: Dynamic wraplength and label creation with wraplength ---
 
@@ -17332,9 +21808,9 @@ class ConfigViewerApp:
             delete_button_text = "Delete Config"
             delete_command = self.on_details_image_right_click
             delete_button_lambda = lambda s=spawn_cmd, p=picture_path, z=zip_file: delete_command(z, s, p)
-            delete_button = tk.Button(button_frame, text=delete_button_text, font=("Segoe UI", 12, "bold") , command=delete_button_lambda, fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
+            delete_button = tk.Button(button_frame, text=delete_button_text, font=("Segoe UI", 12+self.font_size_add, "bold") , command=delete_button_lambda, fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
         else:
-            delete_button = tk.Button(button_frame, text="Delete Mod", font=("Segoe UI", 12, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_delete_mod(z, win), fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
+            delete_button = tk.Button(button_frame, text="Delete Mod", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_delete_mod(z, win), fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
 
         if disable_delete_button:
             delete_button.config(state=tk.DISABLED, fg="grey", bg="#666666") # Grey out the button
@@ -17351,7 +21827,7 @@ class ConfigViewerApp:
 
         isolate_button = None # Initialize isolate_button to None
         if not found_double_basename and zip_file != "user_custom_configs":
-            isolate_button = tk.Button(button_frame, text="Isolate Mod", font=("Segoe UI", 12, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_isolate_mod(z, win), fg="white", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
+            isolate_button = tk.Button(button_frame, text="Isolate Mod", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_isolate_mod(z, win), fg="white", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
 
             def on_enter_isolate(event):
                 isolate_button.config(bg=self.global_highlight_color, fg="white") # Orange background, white text
@@ -17361,7 +21837,7 @@ class ConfigViewerApp:
             isolate_button.bind("<Enter>", on_enter_isolate)
             isolate_button.bind("<Leave>", on_leave_isolate)
 
-        customize_color_button = tk.Button(button_frame, text="Customize Color", font=("Segoe UI", 12, "bold"), command=lambda cmd=spawn_cmd, fn=folder_name: self.customize_color_config(cmd, fn), fg="white", bg="#555555", relief=tk.FLAT, bd=0)
+        customize_color_button = tk.Button(button_frame, text="Customize Color", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda cmd=spawn_cmd, fn=folder_name: self.customize_color_config(cmd, fn), fg="white", bg="#555555", relief=tk.FLAT, bd=0)
 
         def on_enter_customize(event):
             customize_color_button.config(bg=self.global_highlight_color, fg="white")
@@ -17410,42 +21886,7 @@ class ConfigViewerApp:
 
 
 
-    def on_config_details_favorites_click(self, vehicle_folder, pc_filename_base, button):
-        """Handles click on the 'Add to Favorites' button in Configuration Details window."""
-        pc_filename = pc_filename_base + '.pc'
-        if self.is_favorite(vehicle_folder, pc_filename):
-            self.remove_from_favorites(vehicle_folder, pc_filename)
-            button.config(text="Add to favorites")
-            response = messagebox.showinfo("Favorites Update", "Removed from Favorites", parent=self.current_detail_window)
-            action_type = "removed"
-        else:
-            self.add_to_favorites(vehicle_folder, pc_filename)
-            button.config(text="Remove from favorites")
-            response = messagebox.showinfo("Favorites Update", "Added to Favorites", parent=self.current_detail_window)
-            action_type = "added"
 
-
-
-        # --- Conditional Close Logic - MODIFIED to close CONFIGURATION DETAILS WINDOW ---
-        if response == "ok" and action_type == "removed" and self.details_window_is_favorites_filtered:
-            print("DEBUG: Closing Configuration Details Window due to favorite removal in Favorites mode.") # Debug
-            if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists():
-                
-                self.refresh_details_grid_after_favorite_change()
-                self.perform_search()                
-                self.current_detail_window.destroy()
-                self.current_detail_window = None
-
-        # --- NEW: Conditional Close Logic - DETAILS LIST WINDOW if only 1 config left ---
-        if response == "ok" and action_type == "removed" and self.details_window_is_favorites_filtered:
-            if len(self.details_filtered_data) < 1: # Check if filtered data has 1 or fewer items AFTER removal
-                print(f"DEBUG: Only {len(self.details_filtered_data)} config(s) left in Details List after favorite removal. Closing Details List Window.") # Debug
-                messagebox.showinfo("Favorites Update", "Closing Details List Window as only one or no favorites are left.", parent=self.details_window) # Optional message for Details List close
-                self.refresh_details_grid_after_favorite_change()
-                self.perform_search()
-
-                self.on_details_window_close() # Close the DETAILS LIST window
-        # --- End Conditional Close Logic ---
 
     def refresh_details_grid_after_favorite_change(self):
         """Refreshes the details grid after a favorite change, respecting the 'Favorites' filter."""
@@ -17461,15 +21902,9 @@ class ConfigViewerApp:
         if self.details_window_is_favorites_filtered:
             print("  DEBUG: refresh_details_grid_after_favorite_change - Favorites filter ACTIVE.") # Debug - Favorites Filter Active
             # Apply Favorites filter to details data
-            favorite_configs_set = self.read_favorites()
-            filtered_data = []
-            for item in self.details_data:
-                pic, spawn_cmd, zip_file_item, info_data, folder_name = item
-                config_name = self.extract_name_from_spawn_command(spawn_cmd)
-                fav_key = f"{folder_name}|{config_name}.pc"
-                if fav_key in favorite_configs_set:
-                    filtered_data.append(item)
-            current_subgrid_data = filtered_data # Use filtered data if Favorites filter is on
+
+            current_subgrid_data = self._apply_details_favorites_only_filter(self.details_data)
+            
             print(f"  DEBUG: refresh_details_grid_after_favorite_change - Data count AFTER Favorites filter: {len(current_subgrid_data)}") # Debug - Filtered Data Count
         else:
             print("  DEBUG: refresh_details_grid_after_favorite_change - Favorites filter NOT active, showing all data.") # Debug - Favorites Filter Inactive
@@ -17491,6 +21926,22 @@ class ConfigViewerApp:
 
     def confirm_delete_mod(self, zip_file, detail_win):
         """Asks for confirmation before deleting mod and closes detail window."""
+
+        if self.items_to_be_hidden:
+            print("--- self.items_to_be_hidden = True ---\n")
+
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text="Cannot perform this action while there are pending hidden vehicles.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
         confirm = messagebox.askyesno(
             "Confirm Delete",
             f"Are you sure you want to delete the mod '{zip_file}' and all related files?",
@@ -17557,6 +22008,22 @@ class ConfigViewerApp:
     def confirm_isolate_mod(self, zip_file, detail_win):
         """Asks for confirmation before isolating mod and closes detail window."""
 
+        if self.items_to_be_hidden:
+            print("--- self.items_to_be_hidden = True ---\n")
+
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text="Cannot perform this action while there are pending hidden vehicles.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
+
         userfolder_root = os.path.dirname(os.path.dirname(os.path.dirname(self.script_dir))) # Go up 3 levels
         isolated_folder_path = os.path.join(userfolder_root, "Isolated")
 
@@ -17597,7 +22064,7 @@ class ConfigViewerApp:
         self.details_sidebar_debounce_timer = None # Reset timer
 
     def on_details_image_click(self, spawn_cmd, info_data, picture_path, zip_file, folder_name):
-        """Handles single click on an image in the details subgrid.
+        """Handles single click on an image in the details subgrid. AND ALSO HANDLES setting the details sidebar initially
         MODIFIED: Now receives folder_name as argument and updates self.current_details_folder correctly.
         DEBUGGED: Added print statements to REALLY check received spawn_cmd and folder_name. <--- MORE DEBUGGING
         """
@@ -17606,6 +22073,7 @@ class ConfigViewerApp:
             self.current_detail_window.destroy()
             
         self.clear_details_sidebar_content() #clean up the sidebar before moving on    
+
 
         print("\n\n--- on_details_image_click() ENTRY ---")  # Debug Entry
         # --- DEBUGGING - ADDED EXTENSIVE DEBUGGING HERE ---
@@ -17650,13 +22118,18 @@ class ConfigViewerApp:
 
     def update_details_sidebar_config_name(self, spawn_cmd):
         """Updates the config name label at the bottom of the details sidebar to display ONLY CONFIG NAME."""
+        print("--- update_details_sidebar_config_name() ENTRY ---\n")
         pc_name = self.extract_name_from_spawn_command(spawn_cmd) # Extract ONLY the config name (PC filename)
         self.details_sidebar_config_name_label.config(text=f"({pc_name}.pc)") # Set label text to "Config: <config_name>"
         self.details_sidebar_config_name_label.spawn_command = spawn_cmd # NEW: Store the FULL spawn_command as an attribute of the label
+        self.current_details_sidebar_spawn_cmd = spawn_cmd 
+        print(f"self.current_details_sidebar_spawn_cmd is currently set as {spawn_cmd}.")
+        print("--- update_details_sidebar_config_name() EXIT ---\n")
 
     def on_details_image_double_click(self, spawn_cmd, info_data, picture_path, zip_file):
         """Handles double click on an image in the details subgrid."""
-        self.on_spawn_new_button_click() # Use same action as button click - which includes copy to clipboard
+        self.on_spawn_new_button_click(spawn_cmd, event=None) # Use same action as button click - which includes copy to clipboard
+        
 
     def show_details_sidebar_buttons(self):
         """Shows the action buttons in the details sidebar."""
@@ -17689,28 +22162,59 @@ class ConfigViewerApp:
             self.is_details_sidebar_showing_default = False # Hovering means not default anymore
 
     def hide_details_sidebar_info(self):
-        """Hides details sidebar info labels and clears all sidebar content."""
-        if not self.is_details_sidebar_sticky: # Only clear if not sticky
-             pass
-             #self.check_and_reset_details_sidebar()
-             #this function is not necessary, because there should always technically be something in the grid; check unused_functions.py
+        """Hides details sidebar info labels (within the scrollable frame)."""
+        if not self.is_details_sidebar_sticky:
+             # Use pack_forget() on labels within the scrollable frame
+             for widget in [
+                 self.details_sidebar_selected_config_label_cat, self.details_sidebar_selected_config_label_val,
+                 self.details_sidebar_config_name_label,
+                 self.details_sidebar_description_label_cat, self.details_sidebar_description_label_val,
+                 self.details_sidebar_zipfile_label_cat, self.details_sidebar_zipfile_label_val,
+                 self.details_sidebar_value_label_cat, self.details_sidebar_value_label_val,
+                 self.details_sidebar_brand_label_cat, self.details_sidebar_brand_label_val,
+                 self.details_sidebar_bodystyle_label_cat, self.details_sidebar_bodystyle_label_val,
+                 self.details_sidebar_weight_label_cat, self.details_sidebar_weight_label_val,
+                 self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val
+             ]:
+                 # Check if widget exists before calling pack_forget
+                 if widget and widget.winfo_exists():
+                    widget.pack_forget()
 
+             # Optionally, reset sidebar image and name label (outside scrollable area)
+             placeholder_image = Image.new("RGB", (280, 150), "#333333")
+             placeholder_photo = ImageTk.PhotoImage(placeholder_image)
+             if self.details_sidebar_car_name_label and self.details_sidebar_car_name_label.winfo_exists():
+                 self.details_sidebar_car_name_label.config(text="")
+             if self.details_sidebar_image_label and self.details_sidebar_image_label.winfo_exists():
+                 self.details_sidebar_image_label.config(image=placeholder_photo)
+                 self.details_sidebar_image_label.image = placeholder_photo
+
+             # Update scrollregion after hiding labels
+             if self.details_sidebar_text_scrollable_frame and self.details_sidebar_text_scrollable_frame.winfo_exists():
+                 self.details_sidebar_text_scrollable_frame.update_idletasks()
+                 if self.details_sidebar_text_canvas and self.details_sidebar_text_canvas.winfo_exists():
+                     self.details_sidebar_text_canvas.config(scrollregion=self.details_sidebar_text_canvas.bbox("all"))
+  
 
 
     def update_details_sidebar_content(self, info_data, picture_path, zip_file, folder_name=None):
         """
-        Updates details sidebar with car name, picture, and JSON details.
-        NOW also updates sidebar attributes: spawn_cmd, info_data, picture_path, zip_file.
-        Calls update_details_sidebar_favorites_button_text() at the end to refresh the button text.
+        Updates details sidebar content. Ensures instance state is updated correctly
+        BEFORE calling the individual info update and favorites button update.
+        Restores fallback logic: attempts individual info load, relies on callee
+        to use main_info_data if individual load fails.
         """
         print("\n--- update_details_sidebar_content() ENTRY ---")
         print(f"  DEBUG: update_details_sidebar_content - zip_file: {zip_file}, picture_path: {picture_path}")
-        print(f"  DEBUG: update_details_sidebar_content - info_data: {info_data.get('Name')}, {info_data.get('Brand')}")
+        print(f"  DEBUG: update_details_sidebar_content - info_data (Name, Brand): {info_data.get('Name')}, {info_data.get('Brand')}")
+        print(f"  DEBUG: update_details_sidebar_content - Received folder_name arg: {folder_name}")
 
-        # Car Name Label & Image Loading (unchanged)
+
+        # --- Car Name Label & Image Loading (Keep improved logic from new version) ---
         brand = info_data.get("Brand", "").strip()
         name = info_data.get("Name", "").strip()
         vehicle_type = info_data.get("Type", "").strip()
+        display_name_text = "Unknown" # Default
         if brand:
             if name:
                 display_name_text = f"{brand} {name}"
@@ -17722,101 +22226,329 @@ class ConfigViewerApp:
             display_name_text = name
         elif vehicle_type:
             display_name_text = vehicle_type
-        else:
-            display_name_text = "Unknown"
-        self.details_sidebar_car_name_label.config(text=display_name_text if display_name_text else "Unknown")
 
-        self.details_sidebar_loading_label.pack(pady=(0, 10), padx=10)
+        if hasattr(self, 'details_sidebar_car_name_label') and self.details_sidebar_car_name_label.winfo_exists():
+            self.details_sidebar_car_name_label.config(text=display_name_text)
+        if hasattr(self, 'details_sidebar_loading_label') and self.details_sidebar_loading_label.winfo_exists():
+             try:
+                 self.details_sidebar_loading_label.pack(pady=(0, 10), padx=10)
+             except tk.TclError: pass
+
         try:
+            # ... (Image loading logic remains the same as the 'new' version) ...
+            photo = None
             if picture_path and os.path.exists(picture_path):
                 img = Image.open(picture_path).convert("RGB")
                 img = img.resize((280, 157), self.RESAMPLE_FILTER)
                 photo = ImageTk.PhotoImage(img)
-                self.details_sidebar_image_label.config(image=photo)
+
+            if not photo:
+                 placeholder_image = Image.new("RGB", (280, 157), "#333333")
+                 photo = ImageTk.PhotoImage(placeholder_image)
+
+            if hasattr(self, 'details_sidebar_image_label') and self.details_sidebar_image_label.winfo_exists():
+                self.details_sidebar_image_label.config(image=photo, bg="#333333")
                 self.details_sidebar_image_label.image = photo
-                self.details_sidebar_image_label.config(bg="#555555")
-            else:
-                placeholder_image = Image.new("RGB", (280, 157), "lightgrey")
-                placeholder_photo = ImageTk.PhotoImage(placeholder_image)
-                self.details_sidebar_image_label.config(image=placeholder_photo)
-                self.details_sidebar_image_label.image = placeholder_photo
+
         except Exception as e:
             print(f"Error loading details sidebar image: {e}")
-            placeholder_image = Image.new("RGB", (280, 157), "lightgrey")
-            placeholder_photo = ImageTk.PhotoImage(placeholder_image)
-            self.details_sidebar_image_label.config(image=placeholder_photo)
-            self.details_sidebar_image_label.image = placeholder_photo
-            self.details_sidebar_car_name_label.config(text=f"Error Loading Image for: {display_name_text}")
+            # ... (Placeholder setting on error remains the same) ...
+            try:
+                placeholder_image = Image.new("RGB", (280, 157), "#333333")
+                placeholder_photo = ImageTk.PhotoImage(placeholder_image)
+                if hasattr(self, 'details_sidebar_image_label') and self.details_sidebar_image_label.winfo_exists():
+                    self.details_sidebar_image_label.config(image=placeholder_photo)
+                    self.details_sidebar_image_label.image = placeholder_photo
+                if hasattr(self, 'details_sidebar_car_name_label') and self.details_sidebar_car_name_label.winfo_exists():
+                     self.details_sidebar_car_name_label.config(text=f"Error Loading Image")
+            except Exception as placeholder_e:
+                 print(f"Error setting placeholder image: {placeholder_e}")
         finally:
-             self.details_sidebar_loading_label.pack_forget()
+             # ... (Hide loading label remains the same) ...
+             try:
+                 if hasattr(self, 'details_sidebar_loading_label') and self.details_sidebar_loading_label.winfo_exists():
+                    self.details_sidebar_loading_label.pack_forget()
+             except tk.TclError: pass
 
-        # --- MODIFIED: Set Zip File Label - ADDED DEBUGGING ---
-        print("  DEBUG: Setting Zip File Label...") # Debug - Zip File Label Setting Start
-        if zip_file == "folder_grouped": # Check for the flag we set in on_picture_click
+
+        print(f"  >>> SIDEBAR CHECK: Raw zip_file value received: '{zip_file}'")
+        print(f"  >>> SIDEBAR CHECK: Type of zip_file: {type(zip_file)}")
+        print(f"  >>> SIDEBAR CHECK: zip_file == 'user_custom_configs'? {zip_file == 'user_custom_configs'}")
+        print(f"  >>> SIDEBAR CHECK: zip_file.strip() == 'user_custom_configs'? {isinstance(zip_file, str) and zip_file.strip() == 'user_custom_configs'}") # Added isinstance check
+
+        # --- Determine Zip File Display Name (Keep logic from new version) ---
+        print("  DEBUG: Setting Zip File Label...")
+        # ... (zip_file_display_name logic remains the same) ...
+        if zip_file == "folder_grouped":
             zip_file_display_name = "Custom Configuration"
-            print("    DEBUG: zip_file is 'folder_grouped', setting Zip File Label to 'Custom Configuration'") # Debug - Custom Config Case
-        elif zip_file == "user_custom_configs": # Fallback for older logic if still somehow used
+            print("    DEBUG: zip_file is 'folder_grouped', setting Zip File Label to 'Custom Configuration'")
+        elif zip_file == "user_custom_configs":
             zip_file_display_name = "Custom Configuration"
-            print("    DEBUG: zip_file is 'user_custom_configs', setting Zip File Label to 'Custom Configuration' (fallback)") # Debug - Fallback Case
+            print("    DEBUG: zip_file is 'user_custom_configs', setting Zip File Label to 'Custom Configuration'")
+        elif not zip_file:
+            zip_file_display_name = "N/A"
+            print("    DEBUG: zip_file is missing, setting Zip File Label to 'N/A'")
         else:
-            zip_file_display_name = zip_file # Display normal zip file name
-            print(f"    DEBUG: zip_file is '{zip_file}', setting Zip File Label to zip_file name") # Debug - Normal Zip Case
-
-        print(f"    DEBUG: Setting details_sidebar_zipfile_label_val to: '{zip_file_display_name}'") # Debug - Label Value
-        self.details_sidebar_zipfile_label_val.config(text=zip_file_display_name) # Set Zip File label - MODIFIED
-        self.details_sidebar_zipfile_label_cat.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(5, 0)) # Pack Zip File label - MODIFIED
-        self.details_sidebar_zipfile_label_val.pack(in_=self.details_sidebar_frame, fill="x", padx=10, pady=(0, 5)) # Pack Zip File value - MODIFIED
-        # --- MODIFIED: Set Zip File Label - ADDED DEBUGGING ---
+            zip_file_display_name = os.path.basename(str(zip_file))
+            print(f"    DEBUG: zip_file is '{zip_file}', setting Zip File Label to '{zip_file_display_name}'")
 
 
-        # Extract individual info (unchanged)
+        if hasattr(self, 'details_sidebar_zipfile_label_val') and self.details_sidebar_zipfile_label_val.winfo_exists():
+             print(f"    DEBUG: Setting details_sidebar_zipfile_label_val text to: '{zip_file_display_name}'")
+             self.details_sidebar_zipfile_label_val.config(text=zip_file_display_name)
+        else:
+            print("  WARNING: details_sidebar_zipfile_label_val widget not found or destroyed.")
+
+
+        # --- Extract Info Needed for State and Display (Keep logic from new version) ---
         extracted_info = self.extract_info_from_sidebar_image(picture_path)
+        effective_folder_name = "UnknownFolder"
+        config_name_from_pic = None
+        zip_file_base_name_from_pic = None
+
         if extracted_info:
-            individual_info_path = self.find_individual_info_file(
-                extracted_info["folder_name"],
-                extracted_info["zip_file_base_name"],
-                extracted_info["config_name"]
-            )
-            print(f"  DEBUG: Determined individual_info_path: {individual_info_path}")
-            self.update_details_sidebar_individual_info(individual_info_path, main_info_data=info_data)
-        else:
-            print("  WARNING: Could not extract info from sidebar image filename. Info labels will not be updated.")
-
-        # --- UPDATE sidebar attributes in update_details_sidebar_content ---
-        # Get spawn_cmd from the currently highlighted item (assuming it's stored in the image label)
-        current_item_data = self.current_main_sidebar_item # Get the stored item data tuple
-        if current_item_data:
-            _, spawn_cmd, _, _, _ = current_item_data # Extract spawn_cmd from the tuple
-            self.current_details_sidebar_spawn_cmd = spawn_cmd # Update sidebar attribute
-            self.current_details_sidebar_info_data = info_data
-            self.current_details_sidebar_picture_path = picture_path
-            self.current_details_sidebar_zip_file = zip_file
-            print("  DEBUG: Sidebar attributes UPDATED in update_details_sidebar_content (from current_main_sidebar_item)")
-        else:
-            print("  WARNING: current_main_sidebar_item is NOT SET, cannot reliably update sidebar attributes in update_details_sidebar_content.")
-            # Fallback: Try to use data from the *first* item in details_data (less ideal, but might work in some cases)
-            if self.details_data:
-                first_item_spawn_cmd = self.details_data[0][1] # Get spawn_cmd from the first item in details_data
-                self.current_details_sidebar_spawn_cmd = first_item_spawn_cmd
-                self.current_details_sidebar_info_data = info_data # Still use current info_data
-                self.current_details_sidebar_picture_path = picture_path
-                self.current_details_sidebar_zip_file = zip_file
-                print("  DEBUG: Sidebar attributes UPDATED (FALLBACK - using first item's spawn_cmd from details_data)")
+            config_name_from_pic = extracted_info.get("config_name")
+            zip_file_base_name_from_pic = extracted_info.get("zip_file_base_name") # <<< Still likely returning '' due to bug
+            if folder_name:
+                effective_folder_name = folder_name
+                print(f"  DEBUG: Using explicitly passed folder_name: '{folder_name}'")
             else:
-                print("  ERROR: NO details_data available for fallback sidebar attribute update in update_details_sidebar_content.")
-                self.current_details_sidebar_spawn_cmd = None # Ensure it's None if no way to determine spawn_cmd
-                self.current_details_sidebar_info_data = None
-                self.current_details_sidebar_picture_path = None
-                self.current_details_sidebar_zip_file = None
-        # --- UPDATE sidebar attributes in update_details_sidebar_content ---
+                effective_folder_name = extracted_info.get("folder_name", "UnknownFolder")
+                print(f"  DEBUG: Using folder_name from extraction: '{effective_folder_name}'")
+        elif folder_name:
+             effective_folder_name = folder_name
+             print(f"  DEBUG: Using provided folder_name '{folder_name}' as effective_folder_name despite extraction failure.")
 
-        # --- NEW: Update Favorites Button Text on Sidebar Content Update ---
+        print(f"  DEBUG: Info derived: effective_folder='{effective_folder_name}', config_name='{config_name_from_pic}', zip_base='{zip_file_base_name_from_pic}'")
+
+        # --- Update INSTANCE sidebar attributes FIRST (Keep logic from new version) ---
+        print("  DEBUG: Updating instance state variables BEFORE individual info display AND favorite check...")
+        self.current_details_folder = effective_folder_name
+        print(f"    DEBUG: Set self.current_details_folder = '{self.current_details_folder}'")
+        self.current_details_sidebar_info_data = info_data
+        self.current_details_sidebar_picture_path = picture_path
+        self.current_details_sidebar_zip_file = zip_file
+        print(f"    DEBUG: Set self.current_details_sidebar_zip_file = '{self.current_details_sidebar_zip_file}' (original identifier)")
+
+        # --- Reconstruct spawn command (Keep logic from new version) ---
+        constructed_spawn_cmd = None
+        # ... (logic for constructing spawn_cmd remains the same) ...
+        if self.current_details_folder not in ["UnknownFolder", "folder_grouped", "user_custom_configs"] and config_name_from_pic:
+            constructed_spawn_cmd = f'core_vehicles.spawnNewVehicle("{self.current_details_folder}", {{config = \'vehicles/{self.current_details_folder}/{config_name_from_pic}.pc\'}})'
+            print(f"    DEBUG: Reconstructed standard spawn_cmd: '{constructed_spawn_cmd}'")
+        elif self.current_details_folder in ["folder_grouped", "user_custom_configs"] and config_name_from_pic:
+             constructed_spawn_cmd = f'core_vehicles.loadConfig("{config_name_from_pic}")'
+             print(f"    DEBUG: Reconstructed custom/grouped spawn_cmd: '{constructed_spawn_cmd}' (CHECK FORMAT!)")
+        else:
+             print("    WARN: Could not reliably reconstruct spawn_cmd based on available info.")
+        #self.current_details_sidebar_spawn_cmd = constructed_spawn_cmd
+        print(f"    DEBUG: Set self.current_details_sidebar_spawn_cmd = '{self.current_details_sidebar_spawn_cmd}'")
+        print(f"  DEBUG: Instance state updated: folder='{self.current_details_folder}', spawn='{self.current_details_sidebar_spawn_cmd}'")
+
+
+        # --- <<< MODIFIED SECTION: Always attempt individual info update >>> ---
+        print("  DEBUG: Attempting to find individual info file path...")
+        individual_info_path = None # Default to None
+        # Try to find the path only if we have seemingly valid components
+        if effective_folder_name != "UnknownFolder" and zip_file_base_name_from_pic and config_name_from_pic:
+             try:
+                 individual_info_path = self.find_individual_info_file(
+                     effective_folder_name,
+                     zip_file_base_name_from_pic, # Still likely '' here
+                     config_name_from_pic
+                 )
+                 print(f"  DEBUG: Determined potential individual_info_path: {individual_info_path}")
+             except Exception as find_err:
+                  print(f"ERROR during find_individual_info_file: {find_err}")
+                  individual_info_path = None # Ensure it's None on error
+        else:
+            # This case is hit if extraction failed to get required parts (like zip_base)
+             print("  WARN: Cannot determine individual info path due to missing extracted components (folder/zip_base/config).")
+             individual_info_path = None # Explicitly None
+
+        print("  DEBUG: Calling individual info update function REGARDLESS of path validity...")
+        # Always call the update function. It MUST handle None path or file loading errors internally
+        # and use main_info_data as a fallback to populate labels.
+        # Ensure self.update_details_sidebar_individual_info has this fallback logic.
+        self.update_details_sidebar_individual_info(individual_info_path, main_info_data=info_data)
+        # --- <<< END MODIFIED SECTION >>> ---
+
+
+        # --- Update Config Name Label (Keep logic from new version) ---
+        if self.current_details_sidebar_spawn_cmd:
+            self.update_details_sidebar_config_name(self.current_details_sidebar_spawn_cmd)
+        else:
+            # Ensure label exists before configuring
+            if hasattr(self, 'details_sidebar_config_name_label') and self.details_sidebar_config_name_label.winfo_exists():
+                self.details_sidebar_config_name_label.config(text="")
+
+
+        # --- Update Favorites Button Text (Keep logic from new version) ---
+        print(f"  DEBUG: Calling favorites button update. State should be set.")
         self.update_details_sidebar_favorites_button_text()
-        # --- NEW: Update Favorites Button Text on Sidebar Content Update ---
+
 
         print("--- update_details_sidebar_content() EXIT ---\n")
+
+
         
-        
+    def start_smooth_scroll_sidebar_text(self, delta_units):
+        """Starts smooth scrolling animation for the sidebar text canvas."""
+        canvas_sub = self.details_sidebar_text_canvas # Target the correct canvas
+
+        if not canvas_sub or not canvas_sub.winfo_exists():
+             print("DEBUG: start_smooth_scroll_sidebar_text - Canvas does not exist.")
+             return
+
+        if self.sidebar_text_scroll_animation_id:
+            # Cancel existing specific animation for this canvas
+            canvas_sub.after_cancel(self.sidebar_text_scroll_animation_id)
+
+        current_yview = canvas_sub.yview()
+        if not current_yview: # Check if yview returned valid data
+            print("DEBUG: start_smooth_scroll_sidebar_text - yview returned invalid data.")
+            return
+        current_pos = current_yview[0]
+
+        # --- Calculate scroll step (adjust scroll_fraction as needed) ---
+        canvas_height = canvas_sub.winfo_height()
+        scroll_bbox = canvas_sub.bbox("all")
+        scrollable_height = scroll_bbox[3] - scroll_bbox[1] if scroll_bbox else canvas_height
+        if scrollable_height <= canvas_height: # No scroll needed if content fits
+             return
+
+        scroll_fraction = 0.15 # Smaller fraction for potentially less content
+        scroll_step_normalized = (canvas_height / scrollable_height) * scroll_fraction * delta_units
+        target_y_normalized = current_pos - scroll_step_normalized # Correct direction
+        target_y_normalized = max(0.0, min(1.0, target_y_normalized)) # Clamp
+        # --- Calculation End ---
+
+        self.sidebar_text_scroll_target_y = target_y_normalized
+        self.sidebar_text_scroll_start_y = current_pos
+        self.sidebar_text_scroll_start_time = self.master.tk.call('clock', 'milliseconds')
+
+        # Start the new animation loop for this specific canvas
+        self.animate_scroll_sidebar_text(canvas_sub)
+
+
+    def animate_scroll_sidebar_text(self, canvas_sub):
+        """Animates the canvas scroll with ease-out for the sidebar text."""
+        if not canvas_sub or not canvas_sub.winfo_exists():
+             self.sidebar_text_scroll_animation_id = None # Ensure animation stops if canvas gone
+             return
+
+        current_time = self.master.tk.call('clock', 'milliseconds')
+        time_elapsed = current_time - self.sidebar_text_scroll_start_time
+        # Use the shared scroll_duration attribute
+        progress = min(1.0, time_elapsed / self.scroll_duration)
+
+        # Ease-out function (same as before)
+        ease_out_progress = self.ease_out_quintic_modified_speed(progress)
+
+        # Calculate current scroll position
+        current_y_normalized = self.sidebar_text_scroll_start_y + (self.sidebar_text_scroll_target_y - self.sidebar_text_scroll_start_y) * ease_out_progress
+
+        # Apply the scroll position
+        canvas_sub.yview_moveto(current_y_normalized)
+
+        # Continue animation if not finished
+        if progress < 1.0:
+            self.sidebar_text_scroll_animation_id = canvas_sub.after(10, lambda: self.animate_scroll_sidebar_text(canvas_sub))
+        else:
+            self.sidebar_text_scroll_animation_id = None # Animation finished
+
+
+
+    def custom_sidebar_text_scrollbar_set(self, *args):
+        """Custom scrollbar set command for sidebar text."""
+        if self.scrollbar_thumb_dragging_sidebar_text:
+            return # Prevent updates if dragging manually
+
+        start, end = float(args[0]), float(args[1])
+        canvas_sub = self.details_sidebar_text_canvas # The content canvas
+        scrollbar_canvas = self.custom_scrollbar_canvas_sidebar_text # The scrollbar canvas
+        thumb = self.scrollbar_thumb_sidebar_text # The thumb rectangle
+
+        if not canvas_sub or not scrollbar_canvas or not thumb: return # Safety check
+
+        canvas_height = scrollbar_canvas.winfo_height() # Height of the scrollbar track
+        scroll_range = canvas_sub.bbox("all") # Content size
+        scrollable_height = scroll_range[3] - scroll_range[1] if scroll_range else canvas_height
+
+        if scrollable_height <= canvas_height: # Content fits or less
+            scrollbar_canvas.itemconfig(thumb, fill="#555555") # Grey out thumb
+            # Hide the thumb by setting coords outside visible area (optional, makes it disappear)
+            # scrollbar_canvas.coords(thumb, -1, -1, -1, -1)
+        else: # Content requires scrolling
+            scrollbar_canvas.itemconfig(thumb, fill=self.global_highlight_color) # Ensure thumb is orange
+            thumb_height = max(20, canvas_height * (canvas_height / scrollable_height)) # Calculate thumb height
+            thumb_y_start = canvas_height * start
+            thumb_y_end = thumb_y_start + thumb_height
+            # Ensure thumb doesn't go beyond track boundaries
+            thumb_y_start = max(0, thumb_y_start)
+            thumb_y_end = min(canvas_height, thumb_y_end)
+            scrollbar_canvas.coords(thumb, 0, thumb_y_start, 15, thumb_y_end) # Update thumb position/size
+
+
+    def custom_sidebar_text_scrollbar_click(self, event):
+        """Start thumb dragging for sidebar text."""
+        scrollbar_canvas = self.custom_scrollbar_canvas_sidebar_text
+        thumb = self.scrollbar_thumb_sidebar_text
+        if not scrollbar_canvas or not thumb: return
+
+        # Only start drag if click is on the thumb itself
+        coords = scrollbar_canvas.coords(thumb)
+        if coords and coords[1] <= event.y <= coords[3]: # Check Y coordinate against thumb position
+             self.scrollbar_thumb_dragging_sidebar_text = True
+             self.scrollbar_thumb_start_y_sidebar_text = coords[1] # Use current thumb Y
+             self.scrollbar_mouse_start_y_sidebar_text = event.y
+        else:
+             # Optional: Handle clicks on the track (jump scrolling)
+             # Calculate position based on click y and canvas height
+             canvas_height = scrollbar_canvas.winfo_height()
+             click_fraction = event.y / canvas_height
+             self.details_sidebar_text_canvas.yview_moveto(click_fraction)
+
+
+    def custom_sidebar_text_scrollbar_drag(self, event):
+        """Drag thumb and update content canvas view for sidebar text."""
+        if not self.scrollbar_thumb_dragging_sidebar_text:
+            return
+
+        canvas_sub = self.details_sidebar_text_canvas # Content canvas
+        scrollbar_canvas = self.custom_scrollbar_canvas_sidebar_text # Scrollbar canvas
+        thumb = self.scrollbar_thumb_sidebar_text # Thumb
+
+        if not canvas_sub or not scrollbar_canvas or not thumb: return
+
+        mouse_y = event.y
+        delta_y = mouse_y - self.scrollbar_mouse_start_y_sidebar_text
+        new_thumb_y = self.scrollbar_thumb_start_y_sidebar_text + delta_y
+
+        canvas_height = scrollbar_canvas.winfo_height()
+        scroll_range = canvas_sub.bbox("all")
+        scrollable_height = scroll_range[3] - scroll_range[1] if scroll_range else canvas_height
+
+        if scrollable_height <= canvas_height:
+            return # No scrolling needed
+
+        coords = scrollbar_canvas.coords(thumb)
+        thumb_height = coords[3] - coords[1] if coords else 20 # Get current thumb height
+        max_thumb_y = canvas_height - thumb_height
+        new_thumb_y = max(0, min(max_thumb_y, new_thumb_y)) # Clamp thumb position
+
+        scrollbar_canvas.coords(thumb, 0, new_thumb_y, 15, new_thumb_y + thumb_height)
+
+        scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        canvas_sub.yview_moveto(scroll_fraction) # Update the content canvas view
+
+
+    def custom_sidebar_text_scrollbar_release(self, event):
+        """Stop thumb dragging for sidebar text."""
+        self.scrollbar_thumb_dragging_sidebar_text = False
+
+
+
 
 
     def find_default_config_item_details(self, details_data, zip_file):
@@ -17949,10 +22681,14 @@ class ConfigViewerApp:
             self.data = [d for d in self.data if d[2].lower() != zip_file.lower()]
             self.full_data.pop(zip_file, None)
             self.grouped_data = self.format_grouped_data(self.data)
+            self.is_search_results_window_active_bypass_flag = True
+
+            print("    delete_item is calling self.update_grid_layout()")
             self.update_grid_layout()
 
             if self.details_window and not self.details_window_closed:
                 self.refresh_details_window_after_deletion()
+                
             self.update_search_results_window_ui() # <----- ADD THIS LINE HERE # MODIFIED - Call update function here
 
 
@@ -18010,6 +22746,9 @@ class ConfigViewerApp:
             self.data = [d for d in self.data if d[2].lower() != zip_file.lower()]
             self.full_data.pop(zip_file, None)
             self.grouped_data = self.format_grouped_data(self.data)
+
+            self.is_search_results_window_active_bypass_flag = True
+            print("    isolate_item is calling self.update_grid_layout()")
             self.update_grid_layout()
 
             if self.details_window and not self.details_window_closed:
@@ -18085,6 +22824,9 @@ class ConfigViewerApp:
                         self.data.append(group_data['configs'][0])
 
         self.grouped_data = self.format_grouped_data(self.data)
+
+        self.is_search_results_window_active_bypass_flag = True    
+        print("    delete_specific_custom_config is calling self.update_grid_layout()")  
         self.update_grid_layout()
 
         # Refresh the details window if it's open
@@ -18291,6 +23033,8 @@ class ConfigViewerApp:
         print(f"details_window_closed: {self.details_window_closed}")
         print(f"details_window is None: {self.details_window is None}")
 
+
+
         if not self.details_window_closed and self.details_window:
             print("Details window is open, proceeding to close and potentially re-open.")
 
@@ -18334,15 +23078,36 @@ class ConfigViewerApp:
             self.details_deleting_label.config(text="")
         if self.details_is_deleting:
             self.details_is_deleting = False
-        print("--- on_details_window_close() EXIT ---\n")
+
         
         
-        if self.spawn_queue_window_was_open:
-            print("DEBUG: Re-opening Spawn Queue window because it was initially open.")
+        #if self.spawn_queue_window_was_open:
+        #    print("DEBUG: Re-opening Spawn Queue window because it was initially open.")
 
             #self.show_spawn_queue_window() # Re-open the Spawn Queue window # still keeping track of if it was open, but not re-opening at the moment
 
+        if self.details_window_intentionally_closed and self.window_size_changed_during_details_window:
+            print(" if self.details_window_intentionally_closed and self.window_size_changed_during_details_window: condition met")
 
+            self.details_window_intentionally_closed = False
+            print("  Resetting details_window_intentionally_closed to False.")
+
+            self.window_size_changed_during_details_window = False
+            print("  Resetting window_size_changed_during_details_window to False.")
+
+
+            if self.search_results_window_on_screen:
+                print("  DEBUG: Search results window should be on the screen, destroying and recreating it...")
+                self.destroy_search_results_window()
+                    
+                print("  DEBUG: creating new search results window.")
+                self.search_results_window = self.show_search_results_window(self.data)
+            
+            if not self.search_results_window_on_screen:
+                print("  DEBUG: Search results window should not be on the screen, running self.update_grid_layout()")
+                self.update_grid_layout()
+
+        print("--- on_details_window_close() EXIT ---\n")
 
 
     def on_rescan_all_button_click(self): # <--- NEW METHOD - Handles button click
@@ -18357,12 +23122,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Cannot perform this action due to pending hidden vehicles.")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-                self.search_var.set("")
-                print("\n--- canceling ConfigViewerApp.perform_search() ---")
-            return 
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
         print("\n--- ConfigViewerApp.on_rescan_all_button_click() ENTRY ---") # Debug Entry
         self.trigger_full_data_refresh_and_ui_update() # Trigger the full rescan
@@ -18370,17 +23137,235 @@ class ConfigViewerApp:
         print("--- ConfigViewerApp.on_rescan_all_button_click() EXIT ---\n") # Debug Exit
         
 
+    def on_rescan_all_button_click_handler(self):
+        """Asks for confirmation (Yes/No/Cancel) before deleting specific
+           files/folders and rescanning."""
+
+        data_folder = os.path.join(self.script_dir, "data")
+        backup_folder = os.path.join(data_folder, "backup") # Define backup folder path
+
+        # Files to potentially back up if 'Yes' is chosen
+
+
+
+        files_to_backup = [
+            "outputGOOD.txt",
+            "outputGOODcustom.txt",
+            "WatcherOutput.txt",
+            "zip_structure.txt",
+            "favorites.txt",
+            "Hidden.txt"
+        ]
+
+
+
+        relative_paths_to_delete = [
+
+            #Folders in /data
+            "ConfigInfo",
+            "ConfigPics",
+            "ConfigPicsCustom",
+
+            #Files inside Folders  in /data                     
+            "PicInfoExtractForNewMods/outputGOOD.txt",
+
+            #Files directly in /data
+            "NewMods.txt",
+            "WatcherOutput.txt",
+            "outputGOOD.txt",
+            "outputGOODcustom (Original).txt"
+            "outputGOODcustom.txt",
+            "outputBAD.txt",
+            "outputGOOD (Original).txt",
+            "zip_structure.txt",
+
+            "non_existent_item.xyz" # Example: safe to include non-existent items
+        ]
+        # --- End Configuration ---
+
+        confirm = messagebox.askyesnocancel(
+            "Rescan All Mods & Configs and/or Refresh UI",
+            f"Choose 'Yes' to restart the application, do a deep rescan, check for new mods/configs, and clean/sort the application data. This will take longer than the second option but is likely to fix more issues.\n\nChoose 'No' to do a soft scan and simply refresh the UI.\n\nChoose 'Cancel' to close this dialogue and do nothing.",
+            parent=self.master # Parent to master
+        )
+
+        # --- Handle User Choice ---
+        if confirm is True:
+            # --- User clicked Yes: Perform Backup FIRST, then Deletions ---
+            print(f"User chose Yes.")
+
+            # 1. --- Attempt Backup ---
+            print(f"\n--- Attempting Backup to '{backup_folder}' ---")
+            backup_errors = []
+            try:
+                # Ensure backup directory exists
+                if not os.path.exists(backup_folder):
+                    print(f"Backup directory not found. Creating: {backup_folder}")
+                    os.makedirs(backup_folder) # Use makedirs to create parent dirs if needed
+                    print(f"Successfully created backup directory.")
+                else:
+                    print(f"Backup directory already exists: {backup_folder}")
+
+                # Copy the files
+                for filename in files_to_backup:
+                    source_path = os.path.join(data_folder, filename)
+                    destination_path = os.path.join(backup_folder, filename)
+
+                    if os.path.isfile(source_path):
+                        try:
+                            print(f"Attempting to copy '{source_path}' to '{destination_path}'")
+                            shutil.copy2(source_path, destination_path) # copy2 preserves metadata
+                            print(f"Successfully backed up '{filename}'.")
+                        except Exception as e:
+                            error_msg = f"ERROR backing up '{filename}': {e}"
+                            print(error_msg)
+                            backup_errors.append((filename, str(e)))
+                    else:
+                        print(f"Source file not found, skipping backup for: {source_path}")
+                        # Optionally add to backup_errors if you want to track missing source files
+                        # backup_errors.append((filename, "Source file not found"))
+
+            except Exception as e:
+                # Error creating the backup directory itself
+                error_msg = f"CRITICAL ERROR preparing backup directory '{backup_folder}': {e}"
+                print(error_msg)
+                backup_errors.append(("Backup Directory Creation", str(e)))
+                # Optionally, ask the user if they want to continue without backup, or just stop.
+
+
+            # Summarize backup results
+            if backup_errors:
+                print(f"Backup process completed with {len(backup_errors)} error(s).")
+                for item, error in backup_errors:
+                     print(f" - FAILED Backup: {item} ({error})")
+            else:
+                print("Backup process completed successfully (or skipped missing files).")
+            print("-" * 20) # Separator
+
+            # 2. --- Proceed with Deletions ---
+            print(f"\n--- Attempting deletion of configured items in '{data_folder}'... ---")
+            scanning_win = self.show_scanning_window(text="Refreshing data and preparing for full rescan...")
+            time.sleep(2.125) # You might adjust or remove sleeps depending on user feedback
+
+            if not relative_paths_to_delete:
+                print("No items configured for deletion.")
+            else:
+                deletion_errors = [] # Keep track of errors
+
+                for relative_path in relative_paths_to_delete:
+                    full_path = os.path.join(data_folder, relative_path)
+                    item_type = "Item" # Default for logging
+
+                    try:
+                        if os.path.isdir(full_path):
+                            item_type = "directory"
+                            print(f"Attempting to delete directory: {full_path}")
+                            shutil.rmtree(full_path)
+                            print(f"Successfully deleted directory: {full_path}")
+                        elif os.path.isfile(full_path):
+                            item_type = "file"
+                            print(f"Attempting to delete file: {full_path}")
+                            os.remove(full_path)
+                            print(f"Successfully deleted file: {full_path}")
+                        elif os.path.lexists(full_path): # Use lexists to catch broken symlinks too
+                             # Path exists but isn't a file or directory we can handle, or is a link
+                             print(f"Path exists but is not a regular file or directory we can delete (skipped): {full_path}")
+                             # Optionally add to errors if you need to know about these cases
+                             # deletion_errors.append((relative_path, "Not a standard file/directory or is a link"))
+                        else:
+                            # Only print if you want verbose logging for non-existent items
+                            # print(f"Path not found, skipping: {full_path}")
+                            pass # Silently skip non-existent items
+
+                    except OSError as e:
+                        error_msg = f"ERROR deleting {item_type} '{full_path}': {e}"
+                        print(error_msg) # Log error to console only
+                        deletion_errors.append((relative_path, str(e)))
+                    except Exception as e: # Catch any other unexpected errors during deletion
+                        error_msg = f"UNEXPECTED ERROR processing '{full_path}': {e}"
+                        print(error_msg) # Log error to console only
+                        deletion_errors.append((relative_path, f"Unexpected: {e}"))
+
+                # --- Summarize Deletion Results (Console Output Only) ---
+                print("-" * 20) # Separator
+                if not deletion_errors:
+                    print("Deletion process completed for all specified items (check logs above for details).")
+                else:
+                    print(f"Deletion process completed with {len(deletion_errors)} error(s) logged:")
+                    for path, error in deletion_errors:
+                        print(f" - FAILED Deletion: {os.path.join('data', path)} ({error})")
+                print("-" * 20) # Separator
+
+            # --- Proceed with next steps (rescan/restart) ---
+            print("Proceeding with rescan/restart actions...")
+
+            scanning_win = None  # Initialize scanning_win
+
+
+            if scanning_win:
+                scanning_win.destroy()
+
+            scanning_win = self.show_scanning_window(text="Restarting...")
+            time.sleep(1.125)
+            if scanning_win:
+                scanning_win.destroy()
+
+            self.restart_script_and_save_settings()
+
+
+            
+        elif confirm is False:
+            # --- User clicked No: Refresh UI Only ---
+            print("User chose No. Refreshing UI only.")
+            self.on_rescan_all_button_click() # Call the UI refresh method
+
+        else: # confirm is None
+            # --- User clicked Cancel ---
+            print("Rescan/Deletion Cancelled by user.")
+
+
+
+
+
+
+
+    def delete_backup_folder_on_startup(self):
+
+        backup_folder_path = self.script_dir / "data/backup"
+
+        print(f"Checking for deletion target: {backup_folder_path}")
+
+        # Check if the path exists AND it is actually a directory
+        if backup_folder_path.is_dir():
+            print(f"Folder '{backup_folder_path}' found. Attempting to delete...")
+            try:
+                # shutil.rmtree deletes the directory and ALL its contents recursively
+                shutil.rmtree(backup_folder_path)
+                print(f"Successfully deleted folder: {backup_folder_path}")
+            except OSError as e:
+                # Catch potential errors during deletion (e.g., permissions, file in use)
+                print(f"Error deleting folder {backup_folder_path}: {e}")
+                # You might want to handle specific errors differently or log them
+            except Exception as e:
+                # Catch any other unexpected errors
+                print(f"An unexpected error occurred while deleting {backup_folder_path}: {e}")
+        else:
+            # If it doesn't exist, or exists but isn't a directory (e.g., it's a file)
+            if backup_folder_path.exists():
+                print(f"Path '{backup_folder_path}' exists but is not a directory. Skipping deletion.")
+            else:
+                print(f"Folder '{backup_folder_path}' not found. No deletion needed.")
+
+
+
 
     def restart_script_and_save_settings(self):
         """Saves settings and Restarts the application."""
 
         print("Restarting application...")
 
-        width = self.master.winfo_width()
-        height = self.master.winfo_height()
-        x = self.master.winfo_rootx()
-        y = self.master.winfo_rooty()
-        self.save_window_geometry(width, height, x, y) # Call save_window_geometry
+
+        self.save_window_geometry() # Call save_window_geometry
         self.save_settings()
         self.restart_script()
 
@@ -18409,10 +23394,9 @@ class ConfigViewerApp:
 
 
             self.destroy_search_results_window()
-            self.search_var.set("")
-            self.perform_search()
+
             print("\n--- ConfigViewerApp.trigger_full_data_refresh_and_ui_update() ENTRY - DEBUG CHECK ---") # Debug - Entry Point - FULL_DATA_REFRESH_AND_UI_UPDATE
-            scanning_win = self.show_scanning_window(text="Checking for changes, scanning and refreshing data...") # Modified text
+            self.trigger_refresh_scanning_win = self.show_scanning_window(text="Checking for changes, scanning and refreshing data...") # Modified text
 
             # --- NEW: Clear main grid image cache BEFORE refresh ---
             print("Clearing Main Grid Cache before refresh...") # Debug Print
@@ -18422,6 +23406,7 @@ class ConfigViewerApp:
             # --- NEW: Close details window if it's open (as before) ---
             if self.details_window and not self.details_window_closed:
                 print("Closing Details Window before refresh...")
+                self.details_window_intentionally_closed = True
                 self.on_details_window_close()
                 print("Details Window Closed.")
 
@@ -18443,7 +23428,7 @@ class ConfigViewerApp:
 
 
                 # Refresh the UI (perform search to re-filter/re-group)
-                print("Calling self.perform_search() ...") # Debug - Before Perform Search
+                print("    trigger_full_data_refresh_and_ui_update is calling self.perform_search() - and clearing the search bar") # Debug - Before Perform Search
 
 
                 self.destroy_search_results_window()
@@ -18456,7 +23441,9 @@ class ConfigViewerApp:
             except Exception as e:
                 messagebox.showerror("Error", f"Error during full data scanning: {e}")
             finally:
-                scanning_win.destroy()
+
+                print("--trigger_full_data_refresh_and_ui_update is calling self.update_grid_layout()")
+                self.update_grid_layout()
                 print("--- ConfigViewerApp.trigger_full_data_refresh_and_ui_update() EXIT ---\n") # Debug - Exit Point
 
     def update_new_mods_txt_with_new_zips(self, newly_detected_zip_files):
@@ -18525,8 +23512,7 @@ class ConfigViewerApp:
 
 
 
-  
-  
+
 # ------------------------------------------------------------
 #------MAIN------MAIN------MAIN------MAIN------MAIN------MAIN-
 # ------------------------------------------------------------
@@ -18537,17 +23523,6 @@ class ConfigViewerApp:
       
 
 def main():
-    #script_dir_str = os.path.dirname(os.path.abspath(__file__))
-    #script_dir = Path(script_dir_str)
-
-    #script_dir_str = os.path.dirname(sys.executable)  # Get the directory of the script when running as .exe
-    
-    
-    #script_dir = Path(script_dir_str)
-
-
-    #script_dir = Path(__file__).parent # Get the directory of the script when running as .py
-
     
     if getattr(sys, 'frozen', False): # Check if running as a frozen executable (PyInstaller)
         script_dir = Path(os.path.dirname(sys.executable)) # Directory of the .exe
@@ -18555,6 +23530,52 @@ def main():
         script_dir = Path(__file__).parent # Directory of the .py script
     
     script_dir_str = str(script_dir) # Keep script_dir_str for existing parts of your code if needed
+
+
+
+
+    # --- NEW: Parent Directory Check ---
+    parent_dir = script_dir.parent
+    parent_dir_name = parent_dir.name # Get the name of the parent directory
+
+    print(f"DEBUG: Script directory: {script_dir}")
+    print(f"DEBUG: Parent directory: {parent_dir}")
+    print(f"DEBUG: Parent directory name: '{parent_dir_name}'")
+
+    # Using lower() for case-insensitive comparison
+    if parent_dir_name.lower() != "mods":
+        print(f"ERROR: The script's parent folder ('{parent_dir_name}') is not named 'mods'.")
+
+        # Create a temporary root for the messagebox
+        temp_root_error = tk.Tk()
+        temp_root_error.withdraw()
+
+        # Attempt to set the icon for the error message
+        icon_path_error = script_dir / "data" / "icon_converted.ico" # Use the specific icon
+        if icon_path_error.is_file():
+            try:
+                temp_root_error.iconbitmap(str(icon_path_error.resolve()))
+            except tk.TclError as e:
+                print(f"Warning: Could not set icon for error messagebox: {e}")
+
+        # Show the error message
+        messagebox.showerror(
+            "Incorrect Folder Location",
+            f"The EllexiumModManager folder has not been copied to the mods folder.\n\n"
+            f"The correct folder path resembles:\n\n '.../BeamNG.drive/0.35/mods/EllexiumModManager'\n\n"
+            f"Please ensure the folder path is set up like above and run the EllexiumModmanagerlauncher.bat file again.\n",
+            parent=temp_root_error
+        )
+
+        # Clean up the temporary root and exit
+        temp_root_error.destroy()
+        return # Exit the main function
+
+    # --- END Parent Directory Check ---
+
+    # --- If the check passes, continue with the rest of the main function ---
+    print("Parent directory is 'mods'. Proceeding with initialization.")
+
 
 
     root = tk.Tk()
@@ -18600,7 +23621,7 @@ def main():
 
     ##############################################
 
-    # Create the lua file with the deletion commands if it doesn't already exist
+    # Create the lua file with the deletion commands if it doesn't already exist NEW - binding confirmation command
 
     delete_lua_path = script_dir / "data/Delete.lua"
 
@@ -18612,6 +23633,18 @@ def main():
         print(f"Created Delete.lua file at: {delete_lua_path}")
     else:
         print(f"Delete.lua file already exists at: {delete_lua_path}")
+
+
+    binding_lua_path = script_dir / "data/switcher_binding_bridge.lua"
+
+    if not os.path.exists(binding_lua_path):
+        with open(binding_lua_path, "w") as f:
+            f.write("local file = io.open(\"mods/EllexiumModManager/data/switcher_binding_confirmation_file.txt\", \"w\")\n")
+
+        print(f"Created binding lua file at: {binding_lua_path}")
+    else:
+        print(f"binding lua file already exists at: {binding_lua_path}")
+
 
     ##############################################
 
@@ -18627,7 +23660,7 @@ def main():
         with open(hidden_txt, "w") as f:
             print(f"Created Hidden.txt file at: {hidden_txt}")
     else:
-        print(f"Delete.lua file already exists at: {hidden_txt}")
+        print(f"hidden file already exists at: {hidden_txt}")
 
     
     ##############################################
@@ -18640,8 +23673,310 @@ def main():
     config_info_folder = os.path.join(script_dir, "data/ConfigInfo")
     config_pics_custom_folder = os.path.join(script_dir, "data/ConfigPicsCustom")
     hidden_txt_file = os.path.join(script_dir, "data/Hidden.txt")
+
     
-    
+
+    first_time_run_check_folder = os.path.join(script_dir, "data/empty_folder_check")
+
+    initial_scan_win_txt_file = os.path.join(script_dir, "data/initial_scan_win_text.txt")
+
+    if not os.path.exists(first_time_run_check_folder):
+        try:
+            with open(initial_scan_win_txt_file, "w", encoding='utf-8') as f:
+                f.write("Loading Stage: Launching Ellexium Mod Manager for the first time...")
+            print(f"Successfully wrote initial content: Loading Stage: Launching Ellexium Mod Manager for the first time...'")
+        except Exception as e:
+            print(f"Error writing initial content to file: {e}")
+
+        #----------------------------------------------#
+        #----------------------------------------------#
+        print("REMOVING old files if they exist.")
+
+
+
+        data_folder = os.path.join(script_dir, "data")
+        backup_folder = os.path.join(data_folder, "backup") # Define backup folder path
+
+
+
+        files_to_backup = [
+            "outputGOOD.txt",
+            "outputGOODcustom.txt",
+            "WatcherOutput.txt",
+            "zip_structure.txt",
+            "favorites.txt",
+            "Hidden.txt"
+        ]
+
+        relative_paths_to_delete = [
+
+            #Folders in /data
+            "ConfigInfo",
+            "ConfigPics",
+            "ConfigPicsCustom",
+
+            #Files inside Folders  in /data                     
+            "PicInfoExtractForNewMods/outputGOOD.txt",
+
+            #Files directly in /data
+            "NewMods.txt",
+            "WatcherOutput.txt",
+            "outputGOOD.txt",
+            "outputGOODcustom (Original).txt"
+            "outputGOODcustom.txt",
+            "outputBAD.txt",
+            "outputGOOD (Original).txt",
+            "zip_structure.txt",
+
+            "non_existent_item.xyz" # Example: safe to include non-existent items
+        ]
+
+
+        # 1. --- Attempt Backup ---
+        print(f"\n--- Attempting Backup to '{backup_folder}' ---")
+        backup_errors = []
+        try:
+            # Ensure backup directory exists
+            if not os.path.exists(backup_folder):
+                print(f"Backup directory not found. Creating: {backup_folder}")
+                os.makedirs(backup_folder) # Use makedirs to create parent dirs if needed
+                print(f"Successfully created backup directory.")
+            else:
+                print(f"Backup directory already exists: {backup_folder}")
+
+            # Copy the files
+            for filename in files_to_backup:
+                source_path = os.path.join(data_folder, filename)
+                destination_path = os.path.join(backup_folder, filename)
+
+                if os.path.isfile(source_path):
+                    try:
+                        print(f"Attempting to copy '{source_path}' to '{destination_path}'")
+                        shutil.copy2(source_path, destination_path) # copy2 preserves metadata
+                        print(f"Successfully backed up '{filename}'.")
+                    except Exception as e:
+                        error_msg = f"ERROR backing up '{filename}': {e}"
+                        print(error_msg)
+                        backup_errors.append((filename, str(e)))
+                else:
+                    print(f"Source file not found, skipping backup for: {source_path}")
+                    # Optionally add to backup_errors if you want to track missing source files
+                    # backup_errors.append((filename, "Source file not found"))
+
+        except Exception as e:
+            # Error creating the backup directory itself
+            error_msg = f"CRITICAL ERROR preparing backup directory '{backup_folder}': {e}"
+            print(error_msg)
+            backup_errors.append(("Backup Directory Creation", str(e)))
+            # Optionally, ask the user if they want to continue without backup, or just stop.
+
+
+        # Summarize backup results
+        if backup_errors:
+            print(f"Backup process completed with {len(backup_errors)} error(s).")
+            for item, error in backup_errors:
+                    print(f" - FAILED Backup: {item} ({error})")
+        else:
+            print("Backup process completed successfully (or skipped missing files).")
+        print("-" * 20) # Separator
+
+        # 2. --- Proceed with Deletions ---
+        print(f"\n--- Attempting deletion of configured items in '{data_folder}'... ---")
+
+
+        if not relative_paths_to_delete:
+            print("No items configured for deletion.")
+        else:
+            deletion_errors = [] # Keep track of errors
+
+            for relative_path in relative_paths_to_delete:
+                full_path = os.path.join(data_folder, relative_path)
+                item_type = "Item" # Default for logging
+
+                try:
+                    if os.path.isdir(full_path):
+                        item_type = "directory"
+                        print(f"Attempting to delete directory: {full_path}")
+                        shutil.rmtree(full_path)
+                        print(f"Successfully deleted directory: {full_path}")
+                    elif os.path.isfile(full_path):
+                        item_type = "file"
+                        print(f"Attempting to delete file: {full_path}")
+                        os.remove(full_path)
+                        print(f"Successfully deleted file: {full_path}")
+                    elif os.path.lexists(full_path): # Use lexists to catch broken symlinks too
+                            # Path exists but isn't a file or directory we can handle, or is a link
+                            print(f"Path exists but is not a regular file or directory we can delete (skipped): {full_path}")
+                            # Optionally add to errors if you need to know about these cases
+                            # deletion_errors.append((relative_path, "Not a standard file/directory or is a link"))
+                    else:
+                        # Only print if you want verbose logging for non-existent items
+                        # print(f"Path not found, skipping: {full_path}")
+                        pass # Silently skip non-existent items
+
+                except OSError as e:
+                    error_msg = f"ERROR deleting {item_type} '{full_path}': {e}"
+                    print(error_msg) # Log error to console only
+                    deletion_errors.append((relative_path, str(e)))
+                except Exception as e: # Catch any other unexpected errors during deletion
+                    error_msg = f"UNEXPECTED ERROR processing '{full_path}': {e}"
+                    print(error_msg) # Log error to console only
+                    deletion_errors.append((relative_path, f"Unexpected: {e}"))
+
+            # --- Summarize Deletion Results (Console Output Only) ---
+            print("-" * 20) # Separator
+            if not deletion_errors:
+                print("Deletion process completed for all specified items (check logs above for details).")
+            else:
+                print(f"Deletion process completed with {len(deletion_errors)} error(s) logged:")
+                for path, error in deletion_errors:
+                    print(f" - FAILED Deletion: {os.path.join('data', path)} ({error})")
+            print("-" * 20) # Separator
+
+        #----------------------------------------------#
+        #----------------------------------------------#
+
+
+
+
+
+
+    target_line_start = "Loading Stage: Launching Ellexium Mod Manager for the first time..."
+    # The content to write if the file needs to be created/reset
+    initial_write_content = "Loading Stage: Initializing Ellexium Mod Manager..."
+
+    # --- Logic ---
+    needs_initial_write = False
+    file_existed = False
+
+    print(f"Checking file: {initial_scan_win_txt_file}")
+
+    if os.path.exists(initial_scan_win_txt_file):
+        file_existed = True
+        print("File exists. Checking content...")
+        special_line_found = False
+        try:
+            with open(initial_scan_win_txt_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    # Check if the line starts with the target text after stripping whitespace
+                    if line.strip().startswith(target_line_start):
+                        special_line_found = True
+                        print(f"Found target line: '{target_line_start}'")
+                        break # Stop reading once found
+
+            if special_line_found:
+                print("Target line found indicating first launch.")
+
+
+
+                # --- FIRST TIME ACTIONS START ---
+                print("Attempting first-time shortcut creation using pywin32...")
+
+                # Create a temporary Tkinter root for the messagebox
+                temp_root_shortcut = tk.Tk()
+                temp_root_shortcut.withdraw() # Hide the temporary window
+
+                # Define shortcut parameters
+                bat_file = "EllexiumModManagerLauncher.bat" # Your BAT file name
+                shortcut_name = "Ellexium Mod Manager"     # Name on the desktop
+                icon_file_relative = "data/icon_converted.ico" # Relative path from script_dir
+                description = "Launch Ellexium Mod Manager"     # Optional description
+
+                # --- NEW: Set Icon for the Temporary Root Window ---
+                print(f"Attempting to set icon for temporary messagebox parent...")
+                icon_full_path = script_dir / icon_file_relative
+                if icon_full_path.is_file():
+                    try:
+                        # Use iconbitmap for .ico files on Windows
+                        temp_root_shortcut.iconbitmap(str(icon_full_path.resolve()))
+                        print(f"Successfully set icon for temporary root: {icon_full_path}")
+                    except tk.TclError as e:
+                        print(f"Warning: Could not set icon for temporary root window (TclError): {e}")
+                    except Exception as e:
+                        print(f"Warning: Could not set icon for temporary root window (Other Error): {e}")
+                else:
+                    print(f"Warning: Icon file not found at {icon_full_path}, messageboxes will use default icon.")
+                # --- End NEW ---
+
+                # Ask the user if they want the shortcut (messagebox will inherit icon from temp_root_shortcut)
+                create_shortcut = messagebox.askyesno(
+                    "Create Desktop Shortcut?",
+                    f"Thanks for trying out the Ellexium Mod Manager.\n\n"
+                    f"Would you like to create a shortcut on the desktop "
+                    f"to quickly launch the manager?",
+                    parent=temp_root_shortcut # Parent to the temporary window
+                )
+
+                if create_shortcut:
+                    print("User chose Yes. Creating shortcut...")
+                    # Call the pywin32 version of the function
+                    success = create_desktop_shortcut_pywin32(
+                        script_dir,
+                        bat_file,
+                        shortcut_name,
+                        icon_file_relative, # Pass the relative path
+                        description
+                    )
+                    if success:
+                        # This messagebox will also inherit the icon
+                        messagebox.showinfo("Success", "Desktop shortcut created successfully! Proceeding with first time initialization.\n\nPlease note that first time initialization may take a couple more minutes than normal and the application may appear to be unresponsive during this time.\n\nIf you experience bugs, face any other issues, or would just like talk about the manager, you may leave a message on the forum post. Your feedback is welcome!", parent=temp_root_shortcut)
+                    # Error message is shown within the function (parented correctly)
+                else:
+                    print("User chose No. Shortcut not created.")
+                    # This messagebox will also inherit the icon
+                    messagebox.showinfo("Skipped", "Shortcut creation skipped. Proceeding with first time initialization.\n\nnPlease note that first time initialization may take a couple more minutes than normal and the application may appear to be unresponsive during this time.\n\nIf you experience bugs, face any other issues, or would just like talk about the manager, you may leave a message on the forum post. Your feedback is welcome!", parent=temp_root_shortcut)
+
+                # --- IMPORTANT: Destroy the temporary Tkinter root ---
+                temp_root_shortcut.destroy()
+                print("Temporary Tk root for shortcut prompt destroyed.")
+
+
+                # --- FIRST TIME ACTIONS END ---
+
+
+
+
+            else:
+                print(f"Target line NOT found in the existing file.")
+                # Line not found, so remove the incorrect/outdated file
+                try:
+                    os.remove(initial_scan_win_txt_file)
+                    print(f"Removed existing file because target line was missing: {initial_scan_win_txt_file}")
+                    needs_initial_write = True # Mark that we need to write the initial content now
+                except Exception as e:
+                    print(f"Error removing existing file: {e}")
+                    # Decide if you want to proceed or stop if removal fails
+                    # For now, we'll prevent writing if removal failed
+                    needs_initial_write = False
+
+        except Exception as e:
+            print(f"Error reading file {initial_scan_win_txt_file}: {e}")
+            # If we can't read it, maybe best not to touch it? Or try to overwrite?
+            # Let's prevent writing if reading failed.
+            needs_initial_write = False
+
+    else:
+        # File doesn't exist initially
+        print("File does not exist.")
+        needs_initial_write = True # Mark that we need to write the initial content
+
+    # --- Perform Write if Necessary ---
+    if needs_initial_write:
+        print(f"Proceeding to write initial content to: {initial_scan_win_txt_file}")
+        try:
+
+
+            with open(initial_scan_win_txt_file, "w", encoding='utf-8') as f:
+                f.write(initial_write_content)
+            print(f"Successfully wrote initial content: '{initial_write_content}'")
+        except Exception as e:
+            print(f"Error writing initial content to file: {e}")
+    else:
+        if file_existed:
+            print("No write needed as the target line was found in the existing file.")
+        # No message needed if file didn't exist AND writing failed previously due to errors
+
+
     app = ConfigViewerApp(
         master=root, # Use the hidden root window - no GUI needed for this step
         script_dir=script_dir,
@@ -18652,7 +23987,8 @@ def main():
         vehicles_content_folder="",
         user_folder="",
         config_pics_custom_folder="",
-        hidden_txt_file =""
+        hidden_txt_file ="",
+        final_instantiation=False
     )
 
     root.withdraw()
@@ -18664,8 +24000,32 @@ def main():
     mods_folder = script_dir.parent
 
 
+    #IMPORTANT --- remove the old modmanagerinput.zip --- start
+    file_to_delete_name = "EllexiumModManagerInput.zip"
+    file_to_delete_path = mods_folder / file_to_delete_name # Pathlib combines paths easily
 
-    def get_beamng_vehicles_path():
+    print(f"Checking for file in mods folder: {file_to_delete_path}")
+
+    # Check if the file exists and is actually a file (not a directory)
+    if file_to_delete_path.is_file():
+        print(f"Found '{file_to_delete_name}'. Attempting to delete...")
+        try:
+            file_to_delete_path.unlink() # Use unlink() to delete a file with pathlib
+            print(f"Successfully deleted: {file_to_delete_path}")
+        except OSError as e:
+            # Catch potential errors like permission denied
+            print(f"Error deleting file {file_to_delete_path}: {e}")
+        except Exception as e:
+            # Catch any other unexpected errors
+            print(f"An unexpected error occurred during deletion: {e}")
+    else:
+        print(f"File not found or is not a regular file: {file_to_delete_path}")
+
+    #IMPORTANT --- remove the old modmanagerinput.zip --- end
+
+
+
+    def get_beamng_vehicles_path(app_instance):
         process_name = 'BeamNG.drive.x64.exe'
         print(f"Checking if process '{process_name}' is running...")
         for proc in psutil.process_iter(['name', 'exe']): # Request 'exe' in process info
@@ -18689,14 +24049,16 @@ def main():
         print(f"Process '{process_name}' is not running.")
         root = tk.Tk()
         root.withdraw() # Hide the main tkinter window
-        messagebox.showerror("Error", "Please ensure BeamNG.drive is running before launching the application.")
+        app_instance.show_scanning_window(text="BeamNG.drive is not running. Please start the game and try again.")
+        time.sleep(6) # Wait for a moment to show the message
+        #messagebox.showerror("Error", "Please ensure BeamNG.drive is running before launching the application.")
         root.destroy() # Clean up tkinter
         return None # Indicate process not running and failure
 
     # --- Example of how to use it in your main script ---
     vanilla_vehicles_path_file = script_dir / "data/beamng_VANILLA_vehicles_folder.txt"
 
-    vehicles_folder_path = get_beamng_vehicles_path()
+    vehicles_folder_path = get_beamng_vehicles_path(app)
 
     if vehicles_folder_path: # Check if a valid path was returned
         with open(vanilla_vehicles_path_file, 'w', encoding="utf-8") as f: # Use 'w' to write (or create if not exists)
@@ -18766,6 +24128,14 @@ def main():
     if current_zip_count > last_zip_count:
         run_mod_scan_on_startup = True
         print(f"New zip files detected ({current_zip_count} > {last_zip_count}). Running mod scan.")
+
+
+        scanning_win = None  # Initialize scanning_win
+
+        scanning_win = app.show_scanning_window(text="Updating mod display data and previews...")
+
+
+
         print(f"DEBUG: RUNNING MOD_COMMAND_LINE_CONFIG_GEN.py DIRECTLY (no subprocess)") # Modified log message
 
         # --- START: Call mod_command_line_config_gen.main() directly ---
@@ -18783,6 +24153,11 @@ def main():
         spec = importlib.util.spec_from_file_location(module_name, module_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+
+
+        if scanning_win:
+            scanning_win.destroy()
+
 
         try:
             write_watcher_output(
@@ -18805,6 +24180,19 @@ def main():
             print(f"DEBUG: Calling module.main() DIRECTLY from guitest.py...") # Debug - Direct Call
             module.main()  # Call the main() function directly
             print(f"DEBUG: module.main() RETURNED successfully (DIRECT CALL).") # Debug - Direct Call Return
+
+
+            # *** ADD CACHE DELETION HERE ***
+            cache_file_path = script_dir / "data" / "config_processing_cache.json"
+            if cache_file_path.exists():
+                try:
+                    cache_file_path.unlink()
+                    print(f"DEBUG: Deleted cache file due to mod scan: {cache_file_path}")
+                except OSError as e:
+                    print(f"Warning: Failed to delete cache file {cache_file_path}: {e}")
+
+
+
         except Exception as e:
             print(f"Error: Error running main() function from '{module_name}.py' directly: {e}") # Error during direct call
             # messagebox.showerror("Script Error", f"Error running {python_script}: {e}") # No messagebox in main
@@ -18955,15 +24343,28 @@ def main():
 
 
     if run_mod_scan_on_startup and check_mods: # Only run if new zips and check_mods is true
-        wait_window = tk.Toplevel()
-        wait_window.title("Scanning Mods")
-        wait_window.geometry("300x100")
-        tk.Label(wait_window, text="Scanning mods, please wait...\nPlease try not to click anything until this notification disappears.", font=("Segoe UI", 14)).pack(padx=20, pady=20)
-        wait_window.update()
+
 
         try:
+
+            if os.path.exists(initial_scan_win_txt_file):
+                
+                try:
+                    os.remove(initial_scan_win_txt_file) # Remove the file if it exists
+                    print(f"Removed existing initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+                except Exception as e:
+                    print(f"Error removing initial_scan_win.txt: {e}")
+
+            try:
+                with open(initial_scan_win_txt_file, "w") as f:
+                    print(f"Writing Stage 2 to initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+                    f.write("Loading Stage: New mods possibly detected, updating data...")
+            except Exception as e:
+                print(f"Error writing to initial_scan_win.txt: {e}")
+
+
             temp_app = ConfigViewerApp(
-                master=wait_window,
+                master="",
                 script_dir=script_dir,
                 input_file="",
                 config_pics_folder="",
@@ -18972,27 +24373,38 @@ def main():
                 vehicles_content_folder="",
                 user_folder="",
                 config_pics_custom_folder="",
-                hidden_txt_file =""
+                hidden_txt_file ="",
+                final_instantiation=False
             )
             temp_app.run_ahk_scripts_mods()
         except Exception as e:
             messagebox.showerror("Error", f"Error running AHK scripts for mods: {e}")
-            wait_window.destroy()
             root.destroy()
             sys.exit(1)
 
-        wait_window.destroy()
-
     if check_configs and user_vehicles_folder:
-        wait_window = tk.Toplevel()
-        wait_window.title("Scanning Custom Configs")
-        wait_window.geometry("300x100")
-        tk.Label(wait_window, text="Scanning custom configs, please wait...\nPlease try not to click anything until this notification disappears.", font=("Segoe UI", 14)).pack(padx=20,
-                                                                                                    pady=20)
-        wait_window.update()
+
+
+
+        if os.path.exists(initial_scan_win_txt_file):
+            
+            try:
+                os.remove(initial_scan_win_txt_file) # Remove the file if it exists
+                print(f"Removed existing initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+            except Exception as e:
+                print(f"Error removing initial_scan_win.txt: {e}")
+
+        try:
+            with open(initial_scan_win_txt_file, "w") as f:
+                print(f"Writing Stage 3 to initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+                f.write("Loading Stage: Updating vehicle configuration data...")
+        except Exception as e:
+            print(f"Error writing to initial_scan_win.txt: {e}")
+
+
 
         temp_app = ConfigViewerApp(
-            master=wait_window,
+            master="",
             script_dir=script_dir,
             input_file="",
             config_pics_folder=config_pics_folder,
@@ -19001,11 +24413,11 @@ def main():
             vehicles_content_folder="",
             user_folder=user_vehicles_folder,
             config_pics_custom_folder=config_pics_custom_folder,
-            hidden_txt_file=hidden_txt_file
+            hidden_txt_file=hidden_txt_file,
+            final_instantiation=False
         )
         temp_app.run_python_scripts_custom()
 
-        wait_window.destroy()
 
     if orphaned_files_detected: # Check the boolean return value
         print("DEBUG: Orphaned files detected by cleanup_orphaned_mod_files_simplified(). Calling run_ahk_scripts_mods() ...") # Debug
@@ -19062,6 +24474,25 @@ def main():
 
     root_main.withdraw()
     
+
+
+
+    if os.path.exists(initial_scan_win_txt_file):
+        
+        try:
+            os.remove(initial_scan_win_txt_file) # Remove the file if it exists
+            print(f"Removed existing initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+        except Exception as e:
+            print(f"Error removing initial_scan_win.txt: {e}")
+
+    try:
+        with open(initial_scan_win_txt_file, "w") as f:
+            print(f"Writing Stage 4 to initial_scan_win.txt file at: {initial_scan_win_txt_file}")
+            f.write("Loading Stage: Finalizing initialization process...")
+    except Exception as e:
+        print(f"Error writing to initial_scan_win.txt: {e}")
+
+
     app = ConfigViewerApp(
         master=root_main,
         script_dir=script_dir,
@@ -19072,7 +24503,8 @@ def main():
         vehicles_content_folder=vehicles_content_folder,
         user_folder=user_vehicles_folder,
         config_pics_custom_folder=config_pics_custom_folder,
-        hidden_txt_file=hidden_txt_file
+        hidden_txt_file=hidden_txt_file,
+        final_instantiation=True
     )
 
     app.setup_sidebar_filter_dropdowns(app.sidebar_bottom_frame, 10)
@@ -19105,7 +24537,9 @@ def main():
 
     def on_closing():
         app.show_scanning_window(text="Saving settings...")
-        
+        app._stop_keyboard_diff_monitoring()
+        app._stop_switcher_monitoring()
+
         new_mods_file = os.path.join(script_dir, "data/NewMods.txt")
         if os.path.exists(new_mods_file):
             try:
@@ -19166,11 +24600,8 @@ def on_close_extended(app, watcher_output_file):
 
         # --- NEW: Save window geometry before closing ---
         print("  on_close_extended: Saving window geometry to MMSelectorSize.txt...")
-        width = app.master.winfo_width()
-        height = app.master.winfo_height()
-        x = app.master.winfo_rootx()
-        y = app.master.winfo_rooty()
-        app.save_window_geometry(width, height, x, y) # Call save_window_geometry
+
+        app.save_window_geometry() # Call save_window_geometry
         print("  on_close_extended: Window geometry saved.")
         # --- NEW: Save window geometry before closing ---
 
