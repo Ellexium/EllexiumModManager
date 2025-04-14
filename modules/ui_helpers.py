@@ -2,6 +2,15 @@ import os
 import tkinter as tk
 from tkinter import messagebox
 
+import win32gui
+import win32con
+import win32api
+
+import win32process
+import pywintypes
+import psutil
+import time
+
 def on_floating_window_unmapped(app, event=None):
         """Called when the floating window becomes invisible (including minimize)."""
         print("Floating window Unmapped (Hidden/Minimized)") # Debug print
@@ -40,12 +49,241 @@ def show_floating_window(app):
         # if hasattr(app, 'show_switcher_button'): # Example - you'd need to store the button as app.show_switcher_button
         #     app.show_switcher_button.config(text="Hide Switcher") # Change text to "Hide Switcher"
 
-def focus_config_viewer_from_floating_button(app):
-    """Focuses the Config Viewer window when button in floating window is clicked."""
-    app.master.deiconify()
-    app.master.focus_force()
-    app.on_details_window_close()
-    print("Focus switched to Config Viewer (from floating button)")
+
+
+ 
+
+#ATTEMPT 2
+#'''   
+def focus_config_viewer_from_floating_button(app): # 'app' is 'self' if called from within the class
+    """
+    Finds the application's main window based on its title and process name
+    (python.exe or pythonw.exe) and brings it to the foreground.
+
+    Args:
+        app: The application instance (presumably 'self').
+
+    Returns:
+        True if the window was found and focus was attempted, False otherwise.
+    """
+    app.skip_perform_search = True
+    print("skip_perform_search set to TRUE, perform search should NOT GET EXECUTED")
+
+
+    print(f"DEBUG: Focus request successful. Activating KeyRelease ignore period for {app.ignore_keyrelease_after_focus_msec}ms.")
+
+    if app._ignore_keyrelease_timer_id:
+        app.master.after_cancel(app._ignore_keyrelease_timer_id)
+        print("DEBUG: Cancelled previous ignore timer.")
+        # Ensure entry is re-enabled if a previous timer was cancelled prematurely
+        try:
+            if app.search_entry.cget('state') == tk.DISABLED:
+                    print("DEBUG: Re-enabling search entry due to timer cancellation.")
+                    app.search_entry.config(state=tk.NORMAL)
+        except AttributeError:
+                print("WARN: search_entry might not exist yet during early timer cancel.")
+
+
+    # --- Disable the search entry ---
+    try:
+        print("DEBUG: Disabling search entry.")
+        app.search_entry.config(state=tk.DISABLED)
+    except AttributeError:
+        print("ERROR: app.search_entry does not exist when trying to disable.")
+        # Handle error appropriately, maybe return or log more severely
+
+    # Start the timer to clear the flag AND re-enable the entry
+    app._ignore_keyrelease_timer_id = app.master.after(
+        app.ignore_keyrelease_after_focus_msec,
+        app._clear_ignore_state # Rename callback for clarity
+    )
+
+
+
+
+    config_viewer_handle = None # Renamed for clarity
+    window_title = app.main_window_title # Get the exact title from the app instance
+    process_name_check_w = 'pythonw.exe'
+    process_name_check_regular = 'python.exe'
+    target_process_names = {process_name_check_w, process_name_check_regular} # Use a set for efficient lookup
+    
+    try:
+        app.master.attributes("-topmost", True)
+        
+        
+        def window_enum_handler(hwnd, _): # Second argument (wildcard) is not used
+            nonlocal config_viewer_handle
+
+            # 1. Check Visibility
+            if not win32gui.IsWindowVisible(hwnd):
+                return True # Skip invisible windows
+
+            # 2. Get Process ID using pywin32
+            try:
+                # GetWindowThreadProcessId returns tuple: (threadId, processId)
+                _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+                if process_id == 0: # Check for invalid process ID
+                     return True # Skip if PID is invalid
+            except pywintypes.error as e:
+                # Handle potential errors getting PID (e.g., invalid handle)
+                # print(f"Debug: Error getting PID for HWND {hwnd}: {e}") # Optional debug print
+                return True # Skip this window
+            except Exception as e_pid:
+                # print(f"Debug: Unexpected error getting PID for HWND {hwnd}: {e_pid}") # Optional debug print
+                return True # Skip this window
+
+            # 3. Get Process Name using psutil
+            process_name = None
+            try:
+                current_process = psutil.Process(process_id)
+                process_name = current_process.name()
+            except psutil.NoSuchProcess:
+                # Process might have terminated between getting PID and getting name
+                return True # Skip this window
+            except (psutil.AccessDenied, OSError) as e_psutil:
+                # Handle errors accessing process info (permissions etc.)
+                # print(f"Debug: Error getting process info for PID {process_id}: {e_psutil}") # Optional debug print
+                return True # Skip this window
+            except Exception as e_process_get:
+                # Catch any other unexpected psutil error
+                # print(f"Debug: Unexpected error getting process name for PID {process_id}: {e_process_get}") # Optional debug print
+                return True # Skip this window
+
+            # 4. Check Process Name
+            # Ensure the process name is one of the expected python executables
+            if process_name not in target_process_names:
+                # print(f"Debug: Skipping HWND {hwnd}, process '{process_name}' != expected") # Optional
+                return True # Not the right process type, continue enumeration
+
+            # 5. Check Window Title (Exact Match) - Only if process name matched
+            try:
+                current_window_title = win32gui.GetWindowText(hwnd)
+            except pywintypes.error as e:
+                 # Handle potential errors getting title (rare for visible windows)
+                 # print(f"Debug: Error getting title for HWND {hwnd}: {e}") # Optional
+                 return True # Skip this window
+
+            # Perform an exact match against the title stored in the app instance
+            if current_window_title == window_title:
+                # Found the matching window!
+                config_viewer_handle = hwnd
+                # print(f"Debug: Found matching window! HWND: {hwnd}, Title: '{current_window_title}', Process: '{process_name}'") # Optional
+                return False # Stop enumeration
+
+            # print(f"Debug: Skipping HWND {hwnd}, title '{current_window_title}' != '{window_title}'") # Optional
+            return True # Continue enumeration if title doesn't match
+
+        # --- EnumWindows Call with Retry Logic ---
+        attempts = 3  # Increased attempts slightly for robustness
+        for attempt in range(attempts):
+            try:
+                win32gui.EnumWindows(window_enum_handler, None)
+                # If EnumWindows completes without error OR the handler returned False, break
+                if config_viewer_handle is not None: # Check if found within the handler
+                     break
+                # If EnumWindows finished but didn't find it, still break (no need to retry)
+                if attempt == attempts -1 and config_viewer_handle is None:
+                     print(f"Warning: EnumWindows completed but did not find window '{window_title}' from process '{process_name_check_regular}' or '{process_name_check_w}'.")
+                break # Exit loop if EnumWindows ran successfully (found or not found)
+            except pywintypes.error as e:
+                # Specific error code 1400 (Invalid window handle) can sometimes occur during enumeration
+                # Error code 2 (File not Found - sometimes related to system state)
+                # Error code 8 (Not enough storage - rare)
+                # We retry primarily for transient issues like error code 2
+                if e.winerror in [2] and attempt < attempts - 1:
+                    print(f"Warning: EnumWindows failed on attempt {attempt + 1} with error {e.winerror}: {e}. Retrying in 0.1s...")
+                    time.sleep(0.1)
+                else:
+                    print(f"Error: EnumWindows failed definitively after {attempt + 1} attempts with error {e.winerror}: {e}. Cannot find window.")
+                    config_viewer_handle = None # Ensure handle is None if EnumWindows failed badly
+                    break # Stop trying
+            except Exception as e_enum:
+                 print(f"Error: An unexpected error occurred during EnumWindows: {e_enum}")
+                 config_viewer_handle = None
+                 break # Stop trying
+
+
+        # --- Window Focusing Logic (Bottom Part) ---
+        if config_viewer_handle:
+            try:
+                is_minimized = win32gui.IsIconic(config_viewer_handle)
+
+                if is_minimized:
+                    print(f"Window '{window_title}' is minimized. Restoring...")
+                    # SW_RESTORE activates and displays the window. If minimized/maximized,
+                    # it restores to original size/position.
+                    win32gui.ShowWindow(config_viewer_handle, win32con.SW_RESTORE)
+                    time.sleep(0.05) # Short pause after restore, sometimes helps SetForegroundWindow
+
+                # Attempt to bring the window to the foreground.
+                # This is needed even if restored, to ensure it gets focus over other windows.
+                try:
+                    win32gui.SetForegroundWindow(config_viewer_handle)
+                    print(f"Successfully focused window: '{window_title}' (HWND: {config_viewer_handle})")
+                except pywintypes.error as e_fg:
+                    # SetForegroundWindow can fail (often error 0 or 5) if another app
+                    # is preventing it or if the calling process doesn't have foreground rights.
+                    print(f"Warning: Could not set foreground window (Error: {e_fg.winerror} - {e_fg}). Attempting SW_SHOW.")
+                    # Fallback: Ensure the window is at least shown and activated,
+                    # even if not guaranteed to be the top foreground window.
+                    # SW_SHOW activates the window and displays it in its current size/position.
+                    if not is_minimized: # Only use SW_SHOW if it wasn't originally minimized (SW_RESTORE already handled that)
+                        try:
+                             win32gui.ShowWindow(config_viewer_handle, win32con.SW_SHOW)
+                        except pywintypes.error as e_show:
+                             print(f"Error: Fallback ShowWindow failed: {e_show}")
+
+
+                # This line's purpose depends on your application's logic.
+                # It might close the floating button's own window, etc.
+                # Keep it if it's required for your workflow after focusing the main window.
+                print("Debug: Calling app.on_details_window_close() after focusing main window...") # Optional Debug Print
+                app.on_details_window_close() # Call your function regardless of focus success if window handle was found
+
+                return True # Indicate that the window was found and focus was attempted
+
+            except pywintypes.error as e_main_op:
+                print(f"Error operating on found window handle {config_viewer_handle}: {e_main_op}")
+                return False # Indicate failure operating on the handle
+            except Exception as e_general:
+                 print(f"Error during window focusing logic: {e_general}")
+                 return False
+
+        else:
+            # This executes if EnumWindows completed but config_viewer_handle is still None
+            # or if EnumWindows failed critically.
+            print(f"Window '{window_title}' associated with '{process_name_check_regular}' or '{process_name_check_w}' not found.")
+            return False
+        
+
+
+    finally:
+        # Keep topmost for longer
+        app.master.after(500, lambda: reset_topmost(app))
+        print("Scheduling -topmost attribute reset (longer delay)...")
+
+
+
+
+
+
+def reset_topmost(app): # 'app' is 'self' if called from within the class
+    """Helper function to reset the topmost attribute."""
+    try:
+        if app.master.winfo_exists(): # Check if window still exists
+             app.master.attributes("-topmost", False)
+             print("-topmost attribute reset.")
+             # We don't touch the focus flags here. They are managed by events
+             # and the update_main_focus_flag function.
+             app.focus_config_viewer_from_floating_button_layer_2()
+
+    except tk.TclError as e:
+         print(f"Error resetting topmost (window likely destroyed): {e}")
+    except Exception as e:
+        print(f"Unexpected error resetting topmost: {e}")
+
+
+
 
 def remember_floating_window_position(app, event):
         """Remembers the floating window's last position."""
