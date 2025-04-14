@@ -2,11 +2,22 @@
 
 
 
-- Essentially a completely, scratch built concept showcasing a re-imagination of the in-game vehicle selector UI
+- Essentially a completely, scratch built concept showcasing a re-imagination of the in-game vehicle selector UI.
 
-Featuring:
 
-- Basically no wait time between switching between the game and the selector.
+# How to Install?
+
+- Copy the EllexiumModManager folder from the EllexiumModManager zip attached to this post and put it in your Mods folder.
+
+
+- Don't take the contents out of the folder. Put the folder in the mods directory as is. After that, double click the EllexiumModManager.bat file to run it.
+
+- Ensure that BeamNG.drive is always running before you run the EllexiumModManager.bat file. You don't have to be loaded into a map or anything, the game just needs to be running so the application can look through the game's files and properly display default vehicle configurations. It does not modify any of the game's files. The first launch will be very slow as it copies the files initially, but subsequent runs will be faster since the files will be copied already.
+
+
+# Some features include:
+
+- Seamless and much faster than default switching between the game and the selector using a customizable shortcut or the switcher window.
 
 - Spawning multiple vehicles at once quickly and easily through a graphical list
 
@@ -27,31 +38,11 @@ Featuring:
 
 
 
-# How to Install?
-
-Copy the EllexiumModManager folder and the EllexiumModManagerInput.zip file from the EllexiumModManager zip provided and put it in your Mods folder.
-
-This means that the mod folder will now contain 2 or more folders:
-
-
-- repo
-
-- unpacked mods if you have any
-
-- EllexiumModManager
-
-Don't take the contents out of the folder. Put the folder in the mods directory as is. EllexiumModManagerInput.zip should be placed in the mods folder just like any other mod (important).
-
-
-Ensure that BeamNG.drive is always running before you run the EllexiumModManager.bat file. You don't have to be loaded into a map or anything, the game just needs to be running so the application can look through the game's files and properly display default vehicle configurations. It does not modify any of the game's files. The first launch will be very slow as it copies the files initially, but subsequent runs will be faster since the files will be copied already.
-
-
-
 # Disclaimer
 
-This is more of an experiment born out of me being tired of waiting forever to switch between playing the game and choosing a new vehicle, and it has a few bugs here and there and a few quirks as well (such as the Unpacked Mods filter not being finished). It was made completely with Python/Tkinter and all the source code is provided in the download. Technically you could just run the included python files if you wanted to but launching it from a .bat makes it easy for anyone to run.
+This is more of an experiment born out of me being tired of waiting forever to switch between playing the game and choosing a new vehicle, and it may have a few bugs here and there and a few quirks as well (such as the Unpacked Mods filter not being finished). It was made completely with Python/Tkinter and all the source code is provided in the download. Technically you could just run the included python files if you wanted to but launching it from a .bat makes it easy for anyone to run.
 
-There’ll likely be a "Security Warning" from windows when running it for the first time, and Windows Defender or other antivirus software may incorrectly flag it as a virus. All the code is provided in human readable form as a .py file and the .bat file isn't much more than a simple text file with to lines of code to start the mod, so if if raises your suspicions feel free to inspect them. If for some reason this mod appears available for download somewhere else, avoid downloading from other sites/sources, and only download it from this thread on the BeamNG.drive forums.
+There’ll likely be a "Security Warning" from windows when running it for the first time, and Windows Defender or other antivirus software may incorrectly flag it as a virus. All the code is provided in human readable form as a .py file and the .bat file isn't much more than a simple text file with to lines of code to start the mod, so if it raises your suspicions feel free to inspect them. If for some reason this mod appears available for download somewhere else, avoid downloading from other sites/sources, and only download it from this thread on the BeamNG.drive forums.
 
 
 
@@ -64,11 +55,11 @@ Copying Specific Files
 
 Swapping Between the selector and BeamNG.drive
 
-- The application simply runs alongside BeamNG, and allows you to switch between them quickly by offering a little unobtrusive transparent button styled like a BeamNG UI app (accessed through the "Show Switcher" button) that stays on top of both the selector and the BeamNG window. It does not replace the BeamNG vehicle selector or UI components. You can very easily use the regular in-game selector at the same time as it does not alter the functionality of the game or alters its files in any way. If you would like to delete the app, just go into your mods folder and delete the provided ModManager folder - that's it. Be aware that that this comes at the cost of RAM, but it’s very minor compared to the amount of RAM BeamNG uses, and there's little to no GPU or CPU impact by having it sitting in the background.
+- The application simply runs alongside BeamNG, and allows you to switch between them quickly by offering both a customizable binding (Ctrl+Y by default) or a little unobtrusive transparent button styled like a BeamNG UI app (accessed through the "Show Switcher" button) that stays on top of both the selector and the BeamNG window. It does not replace the BeamNG vehicle selector or UI components. You can very easily use the regular in-game selector at the same time as it does not alter the functionality of the game or alters its files in any way. If you would like to delete the app, just go into your mods folder and delete the provided EllexiumModManager folder - that's it. Be aware that this comes at the cost of a small amount of RAM, but it’s very minor compared to the amount of RAM BeamNG uses, and there's little to no GPU or CPU impact by having the application sitting in the background.
 
 Spawning/Deleting Vehicles
 
-- When you spawn or replace a vehicle/traffic, the app detects whether the game is running or not, and switches to it, uses the shortcut binding from EllexiumModManagerInput.zip, and runs appropriate commands from dynamically updated lua files in the /data folder. Originally it used to be clunkier and open the console, but this new method makes it more robust, faster, more reliable, and much closer looking (visually) to the default vehicle selector, with the added benefit that comes from the snappiness of the ModManager.
+- When you spawn or replace a vehicle/traffic, the app detects whether the game is running or not, and switches to it, uses the shortcut binding from EllexiumModManagerInput.zip, and runs appropriate commands from dynamically updated lua files in the /data folder. Originally it used to be clunkier and open the console, but this new method makes it more robust, faster, more reliable, and much closer looking (visually) to the default vehicle selector, with the added benefit that comes from the snappiness of the Mod Manager.
 
 
 
@@ -99,7 +90,45 @@ Hope you enjoy if you give it a try!
 
 # Update History (from newest to oldest)
 # ---------------------------------------
-# Version: 0.1.7.3 (Public Experimental Snapshot - 12th Release | March 18, 2025)
+# Version: 0.1.9 (Public Experimental Snapshot - 14th Release | April 13, 2025)
+
+
+- Added a new customizable shortcut (Ctrl+Y by default) to the Mod Manager that makes it feel more seamless with the game. No need to use the Switcher button to switch back and forth (unless you'd like to. The shortcut can be found in game in the Menu Navigation section if you'd like to change it.
+
+- Added an option to the settings menu that allows you to set the UI scale to the either Small Medium or Large.
+
+- Added the ability to freely resize/maximize the application and change the window dimensions without having to go through the process of restarting as the code for resizing has been completely reworked.
+
+- Added an option to display the Jump to page button on the bottom of the configuration list view instead of the top.
+
+- Added an Esc shortcut to the different views and menus. Pressing Escape generally clears a search or goes back to the previous list or closes the modal window being used (for eg. the Hidden Vehicles Window or the Color customization window).
+
+- Added scrolling to the sidebar information in detailed configuration list so that when descriptions and other data gets too long to fit on the sidebar, it's possible to scroll through it instead of having it get cut off.
+
+- Completely reworked the settings menu to make it easier to understand what everything does and changes and made the settings saving mechanisms more robust so they persist through different sessions.
+
+- Partially reworked the data structures to better identify JSON information to prevent vehicles from showing up under the "Unknown" category unnecessarily. 
+
+- Fixed and refactored the code for opening configuration lists and swapping between Favorites and View all is now significantly faster and more robust. This should eliminate recovery restarting occasionally happening when opening a configurations details as well. 
+
+- Fixed a case where the color picker would fail to load some of the values properly and produce an error message.
+
+- Fixed cases where the folder names within the zips could have been improperly separated causing one vehicle to show up under multiple vehicle previews.
+
+- Fixed cases where favorites could sometimes appear duplicated in the favorites view of the configuration list
+
+- Loading time before and after the first run has been reduced significantly. An post first time run initialization sequence has essentially been cut down to a 1/4 of what it used to be before through the introduction of new data caching mechanisms.
+
+- The installation process has been simplified and now only requires copying one folder (EllexiumModManager) to the mods folder.
+
+- The download size for zip has been reduced.
+
+- Many other bugs/issues and other quirks have been fixed and addressed. However, this list would get very long if they were all stated here. Essentially, the manager should be several times more stable and free from bugs than it was before in a general sense.
+
+
+
+
+# Version: 0.1.7.3 (Public Experimental Snapshot - 13th Release | March 18, 2025)
 
 
 - Made the spawning/replacing/saving/deleting processes more reliable by running a check to make sure the commands have actually been run. If this check fails, it will attempt to run the commands a few more times. This should help with cases where the buttons meant to interact with the game seemingly don't do anything sometimes. 
