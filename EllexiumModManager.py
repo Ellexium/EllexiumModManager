@@ -1,6 +1,9 @@
 # -----------------------------------------------------------------------------------
-# Version: 0.1.9 (Public Experimental Snapshot - 14th Release | April 13, 2025)
+# Version: 0.2.0 (Public Experimental Snapshot - 15th Release | May 17, 2025)
 # -----------------------------------------------------------------------------------
+
+
+
 
 import builtins
 
@@ -10,6 +13,8 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import font
 from tkinter import messagebox, filedialog
+from tkinter import scrolledtext
+
 from PIL import Image, ImageTk
 import concurrent.futures
 import threading
@@ -30,6 +35,7 @@ import zipfile
 import gc
 import inspect
 import random
+import traceback
 
 #from memory_profiler import profile  
 
@@ -63,7 +69,8 @@ from modules.config_processors import (
     run_configpicextractor_custom_integrated,
     run_mod_command_line_config_gen_custom_integrated,
     run_modify_output_good_integrated,
-    process_lines
+    process_lines,
+    reorder_output_good
 )
 
 from modules.event_handlers import (
@@ -93,6 +100,7 @@ from modules.resize_and_scroll import (
     ease_out_quintic_modified_speed,
     start_scroll_debounce_timer_main_grid,
     on_scroll_debounce_complete_main_grid,
+    on_scroll_debounce_complete_main_grid_unhide_mouse,
     is_descendant_of,
     start_smooth_scroll_main,
     start_smooth_scroll_details,
@@ -817,28 +825,30 @@ class ConsoleWindow(tk.Toplevel):
     def __init__(self, master=None):
         super().__init__(master)
 
-
         if getattr(sys, 'frozen', False): # Check if running as a frozen executable (PyInstaller)
-            script_dir = Path(os.path.dirname(sys.executable)) # Directory of the .exe
+            self.script_dir = Path(os.path.dirname(sys.executable)) # Directory of the .exe
         else: # Running as a normal .py script
-            script_dir = Path(__file__).parent # Directory of the .py script
+            self.script_dir = Path(__file__).parent # Directory of the .py script
 
 
         self.title("Console Output")
         self.geometry("1074x532")
-        #self.overrideredirect(True)  # Remove window decorations
-        #self.config(highlightthickness=12, highlightbackground="#555555") # Blue border
 
-        icon_path = script_dir / "data/icon.png"
+        self.icon_path_str = str(self.script_dir / "data/icon.png")
+        self.icon_image_ref = None # To hold PhotoImage reference to prevent GC
 
-        if os.path.exists(icon_path):
-            icon_image = tk.PhotoImage(file=icon_path)
-            self.iconphoto(False, icon_image)
+        if os.path.exists(self.icon_path_str):
+            try:
+                self.icon_image_ref = tk.PhotoImage(file=self.icon_path_str)
+                self.iconphoto(False, self.icon_image_ref)
+            except tk.TclError as e: 
+                print(f"TclError setting icon for console window: {e}. Icon path: {self.icon_path_str}")
+            except Exception as e: # Catch other potential errors during icon loading
+                print(f"Error setting icon for console window: {e}. Icon path: {self.icon_path_str}")
         else:
-            print(f"Icon file not found: {icon_path}")
+            print(f"Icon file not found: {self.icon_path_str}")
 
 
-        # Create a Scrollbar
         self.scrollbar = tk.Scrollbar(self)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -846,27 +856,24 @@ class ConsoleWindow(tk.Toplevel):
             self,
             wrap="word",
             bg="black",          # Set background color to black
-            fg="white",         # Set text color to white
+            fg="#FFFFFF",         # Set text color to white
             font=("Cascadia Mono", 12), # Set font to Courier New, size 12 (adjust size as needed)
             highlightthickness=0 # Remove highlight from inside the text area
         )
         self.text_area.pack(expand=True, fill="both")
         self.text_area.config(state=tk.DISABLED) # Make it read-only
 
-        # Configure Scrollbar to work with Text widget
+
         self.scrollbar.config(command=self.text_area.yview)
 
+        # ---- New code for shortcuts ----
+        self.shortcuts = []
+        self.shortcuts_window_instance = None
+        self.load_shortcuts()
 
-        # Draggable window variables
-        self.is_dragging = False
-        self.drag_start_x = 0
-        self.drag_start_y = 0
-        self.border_width = 5  # Width of the draggable border in pixels
-
-        # Bind mouse events for dragging
-        #self.bind("<ButtonPress-1>", self.start_drag)
-        #self.bind("<B1-Motion>", self.on_drag)
-        #self.bind("<ButtonRelease-1>", self.stop_drag)
+        # Bind click on text_area to show shortcuts window
+        self.text_area.bind("<Button-3>", self.show_shortcuts_window)
+        # ---- End new code ----
 
 
     def write(self, text):
@@ -875,31 +882,183 @@ class ConsoleWindow(tk.Toplevel):
         self.text_area.see(tk.END) # Autoscroll to the bottom
         self.text_area.config(state=tk.DISABLED) # Disable editing again
 
-    def start_drag(self, event):
-        """Start window dragging if click is on the border."""
-        x, y = event.x, event.y
-        width = self.winfo_width()
-        height = self.winfo_height()
+    # ---- New methods ----
+    def load_shortcuts(self):
+        self.shortcuts = []
+        mod_manager_filename = "EllexiumModManager.py"
+        mod_manager_path = self.script_dir / mod_manager_filename
+        
+        if not mod_manager_path.exists():
+            print(f"{mod_manager_filename} not found at {mod_manager_path}")
+            return
 
-        # Check if click is within the border region
-        if (x <= self.border_width or x >= width - self.border_width or
-            y <= self.border_width or y >= height - self.border_width):
-            self.is_dragging = True
-            self.drag_start_x = event.x_root - self.winfo_rootx()
-            self.drag_start_y = event.y_root - self.winfo_rooty()
+        parsing_shortcuts = False
+        try:
+            with open(mod_manager_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    stripped_line = line.strip()
+                    if "### SHORTCUTS START HERE ###" in stripped_line:
+                        parsing_shortcuts = True
+                        continue
+                    
+                    if not parsing_shortcuts:
+                        continue
+                    
+                    # Regex for lines like: self.master.bind_all("<Control-j>", lambda event: self.show_hidden_vehicles_window()) #debug
+                    # It captures the key combination (e.g., "Control-j") and the function call part (e.g., "show_hidden_vehicles_window()")
+                    match = re.search(r'self\.master\.bind_all\("<(.*?)>",\s*lambda\s+\w+:\s*self\.(.*?)\)\s*(?:#.*)?$', stripped_line)
+                    if match:
+                        key_combo_str = match.group(1)
+                        function_call_part = match.group(2) 
+                        function_call_display_str = f"self.{function_call_part}"
+                        self.shortcuts.append((key_combo_str, function_call_display_str))
+        except FileNotFoundError: # Should be caught by .exists(), but as a fallback.
+             print(f"{mod_manager_filename} not found during open at {mod_manager_path}")
+        except Exception as e:
+            print(f"Error reading or parsing {mod_manager_filename}: {e}")
+
+    def show_shortcuts_window(self, event=None): # event is passed from bind
+        if self.shortcuts_window_instance and self.shortcuts_window_instance.winfo_exists():
+            self.shortcuts_window_instance.destroy()
+            self.shortcuts_window_instance = None 
+        
+        if not self.shortcuts:
+            print("No shortcuts loaded or found to display.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Debug Shortcuts")
+        self.shortcuts_window_instance = win 
+
+        if os.path.exists(self.icon_path_str):
+            try:
+                # Ensure the PhotoImage object for the shortcut window's icon is stored
+                # on an attribute of 'win' to prevent garbage collection if 'win' is passed around.
+                win.shortcut_icon_image_ref = tk.PhotoImage(file=self.icon_path_str)
+                win.iconphoto(False, win.shortcut_icon_image_ref)
+            except tk.TclError as e:
+                print(f"TclError setting icon for shortcuts window: {e}. Icon path: {self.icon_path_str}")
+            except Exception as e:
+                print(f"Error setting icon for shortcuts window: {e}. Icon path: {self.icon_path_str}")
         else:
-            self.is_dragging = False  # Not dragging if clicked inside window (non-border)
+            print(f"Icon file not found for shortcuts window (expected at {self.icon_path_str})")
+        
+        win.geometry("600x450") 
 
-    def on_drag(self, event):
-        """Move window while dragging."""
-        if self.is_dragging:
-            x = event.x_root - self.drag_start_x
-            y = event.y_root - self.drag_start_y
-            self.geometry(f"+{x}+{y}")
+        canvas = tk.Canvas(win)
+        scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas)
 
-    def stop_drag(self, event):
-        """Stop window dragging."""
-        self.is_dragging = False
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")
+            )
+        )
+
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        def on_canvas_configure(event_canvas): 
+            canvas.itemconfig(canvas_window, width=event_canvas.width)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        # --- MOUSEWHEEL SCROLLING START ---
+        def _on_mousewheel_shortcuts(event_mw):
+            """Handles mousewheel scrolling for the shortcuts list canvas."""
+            if sys.platform == "linux":
+                if event_mw.num == 4: # Scroll up
+                    canvas.yview_scroll(-1, "units")
+                elif event_mw.num == 5: # Scroll down
+                    canvas.yview_scroll(1, "units")
+            elif sys.platform == "darwin": # macOS
+
+                canvas.yview_scroll(-1 * event_mw.delta, "units")
+            else: # Windows (and other platforms that might use delta)
+
+                if event_mw.delta != 0: # Avoid division by zero if delta is 0 for some reason
+                    canvas.yview_scroll(int(-1 * (event_mw.delta / 120)), "units")
+        
+        # Bind mousewheel events to the canvas and the scrollable frame
+        # This allows scrolling when the mouse is over empty parts of the canvas or frame.
+        for widget_to_bind in [canvas, scrollable_frame]:
+            widget_to_bind.bind("<MouseWheel>", _on_mousewheel_shortcuts) # For Windows and MacOS
+            widget_to_bind.bind("<Button-4>", _on_mousewheel_shortcuts)   # For Linux (scroll up)
+            widget_to_bind.bind("<Button-5>", _on_mousewheel_shortcuts)   # For Linux (scroll down)
+        # --- MOUSEWHEEL SCROLLING END ---
+
+        for key_combo, func_call_display in self.shortcuts:
+            btn_text = f"{key_combo}: {func_call_display}"
+            button = tk.Button(scrollable_frame, text=btn_text, 
+                               command=lambda k=key_combo: self.trigger_shortcut_action(k), 
+                               anchor="w", justify="left")
+            button.pack(pady=2, padx=5, fill="x")
+            # --- Bind mousewheel to buttons as well ---
+            # This ensures scrolling works when the mouse is directly over a button.
+            button.bind("<MouseWheel>", _on_mousewheel_shortcuts)
+            button.bind("<Button-4>", _on_mousewheel_shortcuts)
+            button.bind("<Button-5>", _on_mousewheel_shortcuts)
+            # --- End button bind ---
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        win.protocol("WM_DELETE_WINDOW", self.on_shortcuts_window_close)
+
+    def on_shortcuts_window_close(self):
+        if self.shortcuts_window_instance:
+            self.shortcuts_window_instance.destroy()
+            self.shortcuts_window_instance = None
+
+    def trigger_shortcut_action(self, key_combo_str):
+        try:
+            import pydirectinput
+        except ImportError:
+            print("FATAL: pydirectinput is not installed. This functionality requires it.")
+            return
+
+        modifiers_to_activate = []
+        action_key_target = None
+        
+        key_parts = key_combo_str.split('-')
+        
+        action_key_raw = key_parts[-1] 
+
+        for current_part_str in key_parts[:-1]: 
+            part_lower = current_part_str.lower()
+            if part_lower in ['control', 'ctrl']:
+                modifiers_to_activate.append('ctrl')
+            elif part_lower == 'alt':
+                modifiers_to_activate.append('alt')
+            elif part_lower == 'shift':
+                modifiers_to_activate.append('shift')
+            # Unknown modifier parts are silently ignored
+
+        if len(action_key_raw) == 1 and action_key_raw.isupper(): 
+            if 'shift' not in modifiers_to_activate: 
+                modifiers_to_activate.append('shift')
+            action_key_target = action_key_raw.lower() 
+        else: 
+            action_key_target = action_key_raw.lower()
+
+        if not action_key_target: 
+            print(f"Error: Could not determine valid action key for '{key_combo_str}'.")
+            return
+
+        try:
+            for mod_key in modifiers_to_activate:
+                pydirectinput.keyDown(mod_key)
+            
+            pydirectinput.press(action_key_target) # .press() is keyDown then keyUp
+
+            for mod_key in reversed(modifiers_to_activate): # Release in reverse order
+                pydirectinput.keyUp(mod_key)
+            
+        except Exception as e:
+            print(f"Error during pydirectinput execution for '{key_combo_str}': {e}")
+
+
+
 
 
 
@@ -1021,6 +1180,168 @@ class SwitcherConfirmationHandler(FileSystemEventHandler):
 
 
 
+
+class FadingToplevel(tk.Toplevel):
+    def __init__(self, parent, app_instance,
+                 fade_in_duration_ms=30, fade_in_steps=15,
+                 fade_out_duration_ms=30, fade_out_steps=15,
+                 fade_in_delay_ms=0, end_alpha=1.0,
+                 **kwargs):
+        """
+        Initialize a Toplevel window with automatic fade-in (with optional delay)
+        and fade-out on destroy.
+
+        Args:
+            parent: The parent widget (usually root).
+            app_instance: A reference to the main application instance
+                          that contains the _fade_window method.
+            fade_in_duration_ms: Duration for the fade-in animation.
+            fade_in_steps: Number of steps for the fade-in animation.
+            fade_out_duration_ms: Duration for the fade-out animation.
+            fade_out_steps: Number of steps for the fade-out animation.
+            fade_in_delay_ms: Delay in milliseconds before the fade-in starts. # --- NEW ARG ---
+            **kwargs: Arbitrary keyword arguments for tk.Toplevel.
+        """
+        super().__init__(parent, **kwargs)
+
+        self._app_instance = app_instance
+        self._original_destroy = super().destroy
+        self._fade_in_duration = fade_in_duration_ms
+        self._fade_in_steps = fade_in_steps
+        self._fade_out_duration = fade_out_duration_ms
+        self._fade_out_steps = fade_out_steps
+        self._fade_in_delay_ms = fade_in_delay_ms
+        self._faded_in = False
+        self._fade_in_scheduled_job = None # To keep track of the after() job
+        self.end_alpha = end_alpha
+
+        try:
+            self.wm_attributes('-alpha', 0.0)
+        except tk.TclError as e:
+            print(f"Warning: Could not set initial alpha to 0.0. Fading might not work: {e}")
+            self._faded_in = True # Mark as faded in to skip the auto-fade-in
+
+        if not self._faded_in:
+            # Bind to the first <Configure> event which happens after geometry is set and window starts mapping
+            # Use after_idle delays the bind slightly, sometimes helps ensure window is ready
+            self.after_idle(lambda: self.bind('<Configure>', self._on_first_configure, add='+'))
+
+
+    def _on_first_configure(self, event=None):
+         """
+         Handler for the first Configure event to trigger the fade-in process.
+         Unbinds itself afterwards.
+         """
+         # Check if window still exists and fade-in hasn't been triggered yet
+         if self.winfo_exists() and not self._faded_in:
+              # Don't set _faded_in = True yet, it's set just before starting the fade/delay
+              # Schedule the start of the fade-in process (could be immediate or delayed)
+              self.after_idle(self._start_fade_in_process)
+
+         # Unbind immediately after the first configure event occurs
+         try:
+             self.unbind('<Configure>', self._on_first_configure)
+         except Exception:
+             pass # Ignore if unbind fails
+
+
+    def _start_fade_in_process(self):
+        """Handles the delay before starting the actual fade-in animation."""
+        if self.winfo_exists() and not self._faded_in:
+            self._faded_in = True # Mark as triggered now to prevent double-starting
+
+            if self._fade_in_delay_ms > 0:
+                # --- SCHEDULE THE ACTUAL FADE AFTER THE DELAY ---
+                self._fade_in_scheduled_job = self.after(self._fade_in_delay_ms, self._perform_actual_fade_in)
+            else:
+                # --- NO DELAY, PERFORM FADE IMMEDIATELY ---
+                self._perform_actual_fade_in()
+        # else: window was destroyed before this could run, or it already ran
+
+
+    def _perform_actual_fade_in(self):
+        """Starts the actual fade-in animation after any delay."""
+        # Check again in case the window was destroyed during the delay
+        if self.winfo_exists():
+             # print(f"DEBUG: Starting actual fade-in for {self}...") # DEBUG
+             # Start the fade-in animation from current alpha (should be 0.0) to 1.0
+             self._app_instance._fade_window(
+                 window=self,
+                 start_alpha=self.attributes('-alpha'), # Start from current alpha
+                 end_alpha=self.end_alpha,                         # Fade to opaque
+                 duration_ms=self._fade_in_duration,
+                 steps=self._fade_in_steps
+             )
+        # else: window was destroyed during the delay, nothing to fade
+
+
+    def destroy(self, callback_after_fade=None):
+        """
+        Intercepts the destroy call to make the window topmost, fade it out,
+        then call the original destroy method.
+        """
+        # If the window doesn't exist, just try to call the original destroy (might fail)
+        if not self.winfo_exists():
+            # If the window was destroyed before the fade-in delay or animation started,
+            # make sure to cancel any scheduled job.
+            if self._fade_in_scheduled_job:
+                 self.after_cancel(self._fade_in_scheduled_job)
+                 self._fade_in_scheduled_job = None
+
+            try:
+                self._original_destroy()
+            except tk.TclError:
+                pass
+            if callback_after_fade:
+                 try: callback_after_fade()
+                 except Exception: pass
+            return
+
+        # --- Cancel any pending fade-in animation if destroy is called ---
+        if self._fade_in_scheduled_job:
+            # print("DEBUG: Destroy called during fade-in delay/animation, canceling job.") # DEBUG
+            self.after_cancel(self._fade_in_scheduled_job)
+            self._fade_in_scheduled_job = None
+        # --- END: Cancel pending fade-in ---
+
+        # --- Make the window topmost just before starting the fade-out ---
+        try:
+            self.wm_attributes('-topmost', True)
+        except tk.TclError:
+             pass
+
+
+        def call_original_destroy_and_callback():
+            if self.winfo_exists():
+                try: self._original_destroy()
+                except tk.TclError: pass
+            if callback_after_fade:
+                 try: callback_after_fade()
+                 except Exception: pass
+
+        # Start the fade-out animation
+        # Ensure we start fade-out from the current alpha value
+        current_alpha = 0.0
+        try:
+            current_alpha = self.attributes('-alpha')
+        except tk.TclError:
+            # If we can't get alpha, window might be shutting down, proceed assuming 0.0
+            pass # Keep default 0.0 if attribute fails
+
+
+        self._app_instance._fade_window(
+            window=self,
+            start_alpha=current_alpha, # Start from the actual current alpha
+            end_alpha=0.0,
+            duration_ms=self._fade_out_duration,
+            steps=self._fade_out_steps,
+            callback=call_original_destroy_and_callback
+        )
+        # The original self.destroy() is NOT called directly here.
+        # It is called by the callback *after* the fade animation finishes.
+
+
+
 # ------------------------------------------------------------
 # ConfigViewerApp Class
 # ------------------------------------------------------------
@@ -1062,10 +1383,21 @@ class ConfigViewerApp:
         self.cache_file_path = os.path.join(self.script_dir, "data", "config_processing_cache.json")
 
 
-        self.main_window_title = "Ellexium's Mod Manager/Vehicle Selector (ver. 0.1.9)"
+        self.main_window_title = "Ellexium's Advanced Vehicle Selector (ver. 0.2)"
 
         self.DEFAULT_IMAGE_PATH = os.path.join("data/MissingZipConfigPic.png")
 
+
+        self.dev_mode_check = self.script_dir / "dev_mode.txt"
+        
+        if os.path.exists(self.dev_mode_check):
+            self.dev_mode = True
+
+            #if os.path.exists(self.cache_file_path):
+            #    os.remove(self.cache_file_path)
+            #    print(f"deleting cache on start due to dev mode being enabled")
+        else:
+            self.dev_mode = False
 
 
 
@@ -1079,8 +1411,8 @@ class ConfigViewerApp:
 
         self.ZIP_BASE_NAMES = [] 
 
-        if final_instantiation:
-            self.setup_zip_base_names()
+        #if final_instantiation:
+        self.setup_zip_base_names()
 
 
         scanning_win = None  # Initialize scanning_win
@@ -1088,12 +1420,12 @@ class ConfigViewerApp:
 
 
 
-        #scanning_win = self.show_scanning_window(text="Loading Mod Manager...")
+
             
             
         self.SPAWN_QUEUE_FILE = "data/spawn_queue.lua"
         self.SPAWN_QUEUE_TRANSIENT_FILE = "data/Spawn_Queue_Transient.lua"
-
+        self._last_spawned_brands = []
 
         self.repo_folder = repo_folder
         self.vehicles_content_folder = vehicles_content_folder
@@ -1155,13 +1487,13 @@ class ConfigViewerApp:
                 "relief": tk.FLAT, # Flat buttons
                 "borderwidth": 0,
                 "bg": "#555555", # Default button background color (dark grey)
-                "fg": "white",    # Default text color
-                "activebackground": "white", # Clicked background - will be set dynamically
+                "fg": "#FFFFFF",    # Default text color
+                "activebackground": "#FFFFFF", # Clicked background - will be set dynamically
                 "activeforeground": "black", # Clicked text color - will be set dynamically
                 "highlightthickness": 0 # Remove highlight
             }
 
-            self.restart_button_active_fg_color = "white"
+            self.restart_button_active_fg_color = "#FFFFFF"
 
             self.warning_color_sidebar = "#ff4747" # Store the warning colors
             self.warning_color_restart_button = "#ffa1a1"
@@ -1172,6 +1504,8 @@ class ConfigViewerApp:
             self.default_sidebar_color = "#ffffff"  # Changed to hex code for white
             self.default_restart_color = "#ffffff"
 
+            self.avoid_hiding_sidebar_temporarily = False
+            self.cursor_landed_on_item = False
 
             self.pause_loading = False  # Initialize the pause_loading flag
 
@@ -1180,6 +1514,10 @@ class ConfigViewerApp:
             self.debounce_timer = None  # Initialize debounce timer attribute
             self.is_debouncing = False
             self.details_debounce_timer = None
+
+
+
+
 
             # Define resampling filter
             try:
@@ -1190,8 +1528,13 @@ class ConfigViewerApp:
 
             self.main_grid_widget_cache = {}  # NEW: Cache for main grid item widgets - State-Aware Cache
 
-            self.image_cache_capacity = 50 # Example capacity - adjust as needed
+            self.image_cache_capacity = 1500 # Example capacity - adjust as needed
             self.image_cache = OrderedDict() # Using OrderedDict for LRU
+
+            self.image_load_locks = {} # To store locks per image path
+            self._dict_lock = threading.Lock() # To protect access to image_load_locks dictionary
+            self.cache_access_lock = threading.Lock() # New lock for image_cache
+
 
             # --- NEW: Eviction Batching ---
             self.eviction_count = 0
@@ -1225,9 +1568,27 @@ class ConfigViewerApp:
                 os.makedirs(self.disk_image_cache_dir) # Create directory if it doesn't exist
             #disabling cache
 
-            self.disk_image_cache_dir = os.path.join(self.script_dir, "data/empty_folder_check")
-            if not os.path.exists(self.disk_image_cache_dir):
-                os.makedirs(self.disk_image_cache_dir) 
+
+
+
+
+            # Define the full path to the check file
+            self.first_run_check_file_path = os.path.join(self.script_dir, "data/first_time_run_check_file.txt")
+
+            if not os.path.exists(self.first_run_check_file_path):
+
+
+                try:
+                    with open(self.first_run_check_file_path, "w") as f:
+                        f.write("CheckPassed")
+
+                except IOError as e:
+                    print(f"Error: Could not write to first run check file: {e}")
+
+
+            else:
+
+                print(f"Not first time run: {self.first_run_check_file_path} already exists.")
 
             # Details Window state
             self.details_window_closed = True
@@ -1288,15 +1649,16 @@ class ConfigViewerApp:
 
             self.is_search_results_window_active_bypass_flag = False
             
-            self.is_search_results_window_closing = False
+            self.is_search_results_window_closing = False #?? nothing uses this flag
             
             self.all_filters_all = True
             
             self.is_constraints_results_window_active = False 
 
-            self.delayed_sort_by_install_date = False
+            self.delayed_sort_by_install_date_or_favorites_category_toggle = False
             
-            
+        
+
             
 
             self.search_results_data = []          # Initialize data for search results window
@@ -1304,6 +1666,23 @@ class ConfigViewerApp:
             self.search_results_grouped_data = {}   # Initialize grouped data for search results
             
             
+            self.widget_original_colors = {} # Example: {widget: {'bg': '#555555', 'fg': 'white'}}
+
+            # --- Animation Parameters ---
+            self.transition_duration_sec = 0.15 # Duration in seconds
+
+            # --- General Animation State Tracking ---
+            # Key: widget object, Value: dictionary of state info
+            self.animation_states = {}
+
+            #
+            self.widget_animation_configs = {} # NEW: To store revert-to state and check_state
+            self.actively_hovered_widgets = set()
+
+
+            # init animation code
+
+            self.loading_search_results_window = False
 
             # For pagination & searching in details
             self.details_data = []
@@ -1339,14 +1718,27 @@ class ConfigViewerApp:
             self.editing_color_flag = True
             self.editing_label = None
 
-            # Categorization mode
-            self.categorization_mode = 'Type'  # Default
+
 
             # Sort by install date
             self.sort_by_install_date = False
 
 
-            self.global_highlight_color = "orange" # you can swap this out for other stuff in the future, like for eg making this a setting, but not right now
+            self.global_highlight_color = "#FFA500" # Hex code for orange  # you can swap this out for other stuff in the future, like for eg making this a setting, but not right now
+                                   
+
+            self.conwin = None
+
+            # NEW: Define contrasting text color for persistent highlight
+            self.PERSISTENT_TEXT_COLOR_ON_GLOBAL_HIGHLIGHT = "#FFFFFF" # White text on orange
+
+            # NEW: Attributes to track last clicked items
+            self.last_clicked_main_item_frame = None
+            self.last_clicked_search_item_frame = None
+            
+            # Categorization mode
+            self.categorization_mode = 'Type'  # Default
+
 
             # Switcher - Initialize settings_file_path **BEFORE loading settings**
             self.settings_file_path = os.path.join(script_dir, "data/MMSelectorSettings.txt") # <--- INITIALIZE settings_file_path HERE - CORRECT ORDER
@@ -1355,12 +1747,17 @@ class ConfigViewerApp:
             self.floating_window_last_position = None # Initialize to None, will be loaded or centered
 
 
-            self.placeholder_settings = False
-            self.middle_click_settings = False
+            self.show_switcher_on_startup = False
+            self.sort_by_install_date = False
+            self.placeholder_settings = False                   # false means it should not show configs without their previews
+            self.middle_click_settings = False                  # false means it should be added to the spawn queue by double clicking, true means middle clicking does that
             self.show_folder_settings = False
-            self.jump_to_page_button_should_be_bottom = False
-            self.collapse_categories_by_default = False # Initialize to False (Off) by default
+            self.jump_to_page_button_should_be_bottom = True    # true keeps the button at the bottom of the screen
+            self.leave_config_window_open = False
+            self.collapse_categories_by_default = False         # Initialize to False (Off) by default
+            self.show_pinned_favorites_category = True
 
+            self.default_categorization_mode = 'Type'
 
             # --- NEW: Font Size Setting ---
             # Stores the numeric value to add (0 for Default, 2 for Medium, 4 for Large)
@@ -1373,9 +1770,17 @@ class ConfigViewerApp:
             self.load_settings() # Load settings AFTER initializations, BEFORE GUI setup - CORRECTED CALL ORDER
             print("DEBUG-INIT: load_settings() RETURNED.") # Debug - Call Order - BEFORE
 
+            # --- Favorites Functionality --- called before format group data so the sorting works
 
+            self.favorites_file_path = os.path.join(script_dir, "data/favorites.txt")
+            self.favorite_configs = self.read_favorites()
+
+
+            self.current_favorites_amount = 0
+        
+            self.unique_favorite_folder_count = self._count_unique_folders_in_favorites()
+            print(f"DEBUG-INIT: Initial unique favorite folder count: {self.unique_favorite_folder_count}")
  
-
 
 
             self.original_data, self.original_full_data = self.load_data() # Load data NOW
@@ -1409,16 +1814,28 @@ class ConfigViewerApp:
 
 
 
+            self.current_item_offset_in_category = 0
+            self.total_items_for_display = 0
             # --------------------------------------
-            # NEW: Subgrid (details window) batch loading config
+            # batch loading config
             # --------------------------------------
             # You can adjust these two variables to change how big each batch is
             # and how many milliseconds to wait between loading batches in the subgrid.
-            self.details_batch_size = 10 # batches of
-            self.default_batch_size = 10 # make sure these numbers stay the same, they work together to controls the details window batch size
+            self.details_batch_size = 25 # batches of
+
+            self.details_batch_delay = 150 # schedule - time taken between each batch
 
 
-            self.details_batch_delay = 15 # schedule
+
+
+            #self.main_grid_batch_sizes = [30, 30, 30, 30]
+            self.main_grid_batch_sizes = [50]
+
+            self.default_batch_size = 50 # this is after the last number specified in self.main_grid_batch_sizes
+
+            self.grid_layout_split_value = 0 # number of widgets to be displayed on one page depending on the number of columns
+            self.update_grid_layout_run = False
+
 
             # Flag for details "Loading..." animation
             self.details_loading_animation_running = False
@@ -1432,15 +1849,35 @@ class ConfigViewerApp:
 
             self.auto_reopen_details_after_change = False # Initialize flag for auto-reopen (this doesn't work properly right now)
 
+
+
+
+            self.min_throttle_ms = 16  # For slow drag (e.g., ~60 FPS updates)
+            self.max_throttle_ms = 100 # For fast drag (e.g., ~10 FPS updates)
+
+            self.speed_threshold_low = 50.0  # Pixels per second: below this, use min_throttle_ms SLOW 
+            #MEDIUM IS BETWEEN THESE 
+            self.speed_threshold_high = 300.0 # Pixels per second: above this, use max_throttle_ms FAST 
+            self.min_delta_t_for_speed_calc = 0.001 # Seconds: minimum time diff for speed calc to avoid div by zero
+
+            # For throttling scroll updates (you might already have these)
+            self._scroll_pending = False
+            self._throttled_after_id = None
+            self._scroll_throttle_ms = self.min_throttle_ms # Initial throttle value
+
+
             # --- NEW: Dynamic Batch Sizes ---
-            self.main_grid_batch_sizes = [30, 10, 10, 10]  # Initial 30, then 3x 10
-            #self.details_grid_batch_sizes = [30, 10, 10, 10] # You can customize these separately THIS IS NOT USED 
 
 
             self.current_main_batch_index_in_sequence = 0
-            self.current_details_batch_index_in_sequence = 0
 
 
+
+            #self.details_grid_batch_sizes = [30, 10, 10, 10] # You can customize these separately THIS IS NOT USED ?
+            #self.current_details_batch_index_in_sequence = 0
+
+
+            #this appears to be for the filter dropdowns
             self.scroll_animation_id = None
             self.scroll_target_y = 0
             self.scroll_start_y = 0
@@ -1456,6 +1893,8 @@ class ConfigViewerApp:
             self.sidebar_text_scroll_start_y = 0.0
             self.sidebar_text_scroll_start_time = 0
 
+
+            
             # --- NEW: State variables for sidebar text CUSTOM scrollbar ---
             self.custom_scrollbar_canvas_sidebar_text = None # Canvas for the scrollbar itself
             self.scrollbar_thumb_sidebar_text = None       # The rectangle (thumb)
@@ -1464,6 +1903,25 @@ class ConfigViewerApp:
             self.scrollbar_mouse_start_y_sidebar_text = 0
             ####################
 
+            self._scroll_throttle_ms = 60  # Adjust this value (e.g., 50ms = 20 FPS, 100ms = 10 FPS)
+            self._scroll_pending = False
+            self._throttled_after_id = None
+            self._last_drag_y = 0 # Store the last mouse Y during drag
+            self._last_thumb_y = 0 # Store the last thumb Y during drag
+
+
+
+            self._cursor_controlled_by_us = False # Flag to track if we moved the cursor
+            self._original_cursor_pos_screen = None # Stores (x, y) screen coordinates before we moved it
+            self._cursor_lock_job_id = None        # Stores the ID of the after job that maintains the lock
+            self._cursor_lock_target_pos_screen = None # Stores (x, y) screen coordinates where we moved the cursor
+            
+            self._interaction_blocked_by_us = False
+            self._overlay_window = None
+            self._original_master_focus = None # To restore focus
+
+            self.cursor_restore_timer_id = None
+            self.CURSOR_RESTORE_DELAY_MS = 300
 
 
             # --- NEW: Highlight Pause Debounce Timer ---
@@ -1482,16 +1940,18 @@ class ConfigViewerApp:
             self.scroll_debounce_delay = 600 # milliseconds for debounce delay (600ms after scroll stop)
             self.scroll_debounce_timer_id = None # To keep track of the debounce timer
 
- 
+            self.scroll_mouse_unhide_delay = 150
+            self.scroll_mouse_unhide_timer_id = None
 
             self.matches_config_data = self.load_matches_config_data()
 
             self.details_pause_counter = 0
 
-            # --- Favorites Functionality ---
+
+
+
             self.filter_state = 0
-            self.favorites_file_path = os.path.join(script_dir, "data/favorites.txt")
-            self.favorite_configs = self.read_favorites()
+
             self.filter_options = [
                 "View All",
                 "Items with Config Preview Images [debug]",
@@ -1529,6 +1989,7 @@ class ConfigViewerApp:
             self.DEFAULT_SWITCH_BINDING = "<Control-y>"
 
 
+            self.disable_hover_temporarily = False
             self.resizing_window = False
             self.window_was_resized = False
             self.window_was_resized_2 = False
@@ -1543,6 +2004,10 @@ class ConfigViewerApp:
             self.details_window_intentionally_closed = False
             self.window_size_changed_during_details_window = False
             self.search_results_window_on_screen = False
+
+            self.favorites_amount_changed = False
+
+            self.update_grid_after_size_rechange = False
 
 
             self.master.after_idle(self._store_initial_minsize)
@@ -1566,10 +2031,14 @@ class ConfigViewerApp:
 
             print("    ConfigViewerApp __init__ is calling setup_gui()")
             self.setup_gui() 
+
+            self.category_list_button_clicked = False
+
+
             #setup_gui has initialize_data_and_grid, which calls  self.grouped_data = self.format_grouped_data and then populate_initial_grid()
             #-> popiulate_initial_grid calls perform_search, and then update grid layoutm and then  self.all_main_grid_images_cached = self.are_all_main_grid_images_cached()
 
-            self.read_favorites()
+            #self.read_favorites()
 
 
             self.details_sidebar_debounce_timer = None # Initialize debounce timer for details sidebar
@@ -1649,7 +2118,7 @@ class ConfigViewerApp:
             self.hidden_window_scroll_duration = 200  # ms for smooth scroll animation - can be global if needed
 
 
-            self.hidden_window_hidden_window_restart_button_active_fg_color = "white"
+            self.hidden_window_hidden_window_restart_button_active_fg_color = "#FFFFFF"
             self.hidden_window_warning_color_hidden_window_restart_button = "#ffa1a1"
             self._hidden_window_fade_animation_running_restart = False
             self.hidden_window_default_restart_color = "#ffffff"
@@ -1662,6 +2131,7 @@ class ConfigViewerApp:
         self.scanning_window = scanning_win  # Initialize scanning_window attribute
 
         self.trigger_refresh_scanning_win = None
+        self.warning_scanning_win = None
 
         # --------------------------------------------------------------------------------
         # --- Delete the stale backup folder that - final step
@@ -1995,7 +2465,7 @@ class ConfigViewerApp:
     def toggle_deleting_text(self):
         if not self.is_deleting or not self.deleting_label:
             return
-        self.deleting_label.config(fg="red" if self.deleting_color_flag else "black")
+        self.deleting_label.config(fg="#FF0000" if self.deleting_color_flag else "black")
         self.deleting_color_flag = not self.deleting_color_flag
         self.master.after(500, self.toggle_deleting_text)
 
@@ -2003,7 +2473,7 @@ class ConfigViewerApp:
         if not self.details_is_deleting or not self.details_deleting_label:
             return
         if self.details_deleting_label.winfo_exists(): # Check if label exists
-            self.details_deleting_label.config(fg="red" if self.details_deleting_color_flag else "black")
+            self.details_deleting_label.config(fg="#FF0000" if self.details_deleting_color_flag else "black")
             self.details_deleting_color_flag = not self.details_deleting_color_flag
             if self.details_window and not self.details_window_closed:
                 self.details_window.after(500, self.toggle_details_deleting_text)
@@ -2042,21 +2512,33 @@ class ConfigViewerApp:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        original_working_directory = os.getcwd()  # 1. Get current working directory
+        original_working_directory = os.getcwd()
         try:
-            os.chdir(self.script_dir)  # 2. Change working directory to guitest.py's dir
-            print(f"DEBUG: Changed working directory to: {os.getcwd()}") # Debug - Verify directory change
+            os.chdir(self.script_dir)
+            print(f"DEBUG: Changed working directory to: {os.getcwd()}")
 
-            module.main()  # 3. Call module.main() - relative paths will be resolved from guitest.py's dir
-            print(f"Successfully executed main() function from '{module_name}.py' in adjusted working directory.") # Success message
+            # --- Call module.main() FIRST to generate/update outputGOOD.txt ---
+            module.main()
+            print(f"Successfully executed main() function from '{module_name}.py'.")
+
+            # --- >>> NEW: Call the reordering function <<< ---
+            output_good_path = self.script_dir / "data" / "outputGOOD.txt"
+            # Ensure ZIP_BASE_NAMES is ready (it should be from __init__)
+            if hasattr(self, 'ZIP_BASE_NAMES'):
+                reorder_output_good(output_good_path, self.ZIP_BASE_NAMES)
+            else:
+                print("WARNING: self.ZIP_BASE_NAMES not found, cannot reorder outputGOOD.txt.")
+            # --- >>> END NEW CALL <<< ---
 
         except Exception as e:
-            messagebox.showerror("Script Error", f"Error running main() function from '{module_name}.py': {e}")
-            self.master.destroy()
-            return
+            messagebox.showerror("Script Error", f"Error running main() function from '{module_name}.py' OR reordering outputGOOD.txt: {e}")
+            self.master.destroy() # Consider if destroy is appropriate here
+            return # Exit on error
         finally:
-            os.chdir(original_working_directory)  # 4. Restore original working directory
-            print(f"DEBUG: Restored working directory to: {os.getcwd()}") # Debug - Verify directory restoration
+            os.chdir(original_working_directory)
+            print(f"DEBUG: Restored working directory to: {os.getcwd()}")
+
+
 
             if self.final_instantiation:
 
@@ -2159,6 +2641,8 @@ class ConfigViewerApp:
     # ------------------------------------------------------------
     # Extract Fallback Info from JSON
     # ------------------------------------------------------------
+
+
     def extract_fallback_info(self, filepath):
         """
         Extracts fallback information from a JSON file, now including "Author".
@@ -2193,6 +2677,11 @@ class ConfigViewerApp:
             print(f"Error processing {filepath}: {e}")
         return extracted_info
         
+
+
+
+
+
     # ------------------------------------------------------------
     # Find Fallback Info - THIS IS USED BY PROCESS LINES
     # ------------------------------------------------------------
@@ -2259,81 +2748,105 @@ class ConfigViewerApp:
 
 
 
-        
-
 
     def _finalize_data_processing(self, full_data):
         """
         Takes the complete full_data dictionary and generates the final 'data'
         dictionary containing representative images for the main grid.
+        NEW Prioritization: 1. Default Config, 2. First with Main Info, 3. Absolute First.
+        ADDED: Debug print for expected main info path check.
         """
-        print("\n--- _finalize_data_processing() STARTING ---")
-        data = {} # Initialize the final dictionary
+        print("\n--- _finalize_data_processing() STARTING (NEW Prioritization + Path Debug) ---") # Added Path Debug note
+        data = {}
         missing_custom_pic_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
         missing_zip_pic_path = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
 
         for folder_name, config_list in full_data.items():
             representative_image_path = None
+            item_to_represent = None
 
-            # Filter out any potentially invalid items first
             valid_config_list = [item for item in config_list if isinstance(item, (list, tuple)) and len(item) == 5]
 
             if not valid_config_list:
-                print(f"Warning: No VALID configs found for folder '{folder_name}' during finalization.")
-                # Use placeholder if no valid configs exist for this folder
-                representative_image_path = missing_zip_pic_path # Or decide based on context if possible
-                data[folder_name] = [
-                    representative_image_path,
-                    f"Missing/Invalid config for {folder_name}",
-                    "unknown",
-                    {"Name": "Unknown", "Value": 0},
-                    folder_name
-                ]
+                print(f"Warning: No VALID configs found for folder '{folder_name}' during finalization. Skipping.")
                 continue
 
-            # Determine context using the first VALID item
-            first_valid_item = valid_config_list[0]
-            item_source_zip = first_valid_item[2] # Get the source (zip name or 'user_custom_configs')
-
-            # Find the default config item within the valid list
-            default_config_item = self.find_default_config_item_details(valid_config_list, item_source_zip) # Pass source as context
+            # Step 1: Check for Default Config
+            first_valid_item_context = valid_config_list[0]
+            item_source_zip_context = first_valid_item_context[2]
+            default_config_item = self.find_default_config_item_details(valid_config_list, item_source_zip_context)
 
             if default_config_item:
                 representative_image_path = default_config_item[0]
-                # print(f"  Finalize - Folder: {folder_name} - Using DEFAULT config image: {os.path.basename(representative_image_path)}")
+                item_to_represent = default_config_item
+                #print(f"  Finalize - Folder: {folder_name} - Using DEFAULT config image: {os.path.basename(representative_image_path)}")
             else:
-                # Fallback to the first valid item's image if no default found
-                representative_image_path = first_valid_item[0]
-                # print(f"  Finalize - Folder: {folder_name} - Using FIRST config image (no default): {os.path.basename(representative_image_path)}")
+                # Step 2: Find First Config with Existing Main Info File
+                #print(f"  Finalize - Folder: {folder_name} - Default config not found. Searching for first config with Main Info JSON...")
+                found_with_main_info = False
+                for item in valid_config_list:
+                    pic_path, spawn_cmd, zip_file, info_data_item, folder_name_item = item
 
-            # Final check for representative image path validity
-            if not representative_image_path or not os.path.exists(representative_image_path):
-                    is_item_custom = item_source_zip == "user_custom_configs"
-                    representative_image_path = missing_custom_pic_path if is_item_custom else missing_zip_pic_path
-                    print(f"  Finalize - Folder: {folder_name} - Using PLACEHOLDER image (image missing/invalid): {os.path.basename(representative_image_path)}")
+                    if zip_file == "user_custom_configs":
+                        continue
 
-            # Use data from the first valid config item for the main grid entry
-            _, line_clean, current_zip_file_from_config, info_data, folder_name_from_config = first_valid_item
+                    expected_main_info_filename = f"vehicles--{folder_name_item}_{zip_file}--info.json"
+                    expected_main_info_path = os.path.join(self.config_info_folder, expected_main_info_filename)
 
-            # Ensure info_data is valid
-            if not isinstance(info_data, dict):
-                print(f"ERROR: Finalize - info_data in first_valid_item for '{folder_name}' is not a dict. Using default.")
-                info_data = {"Name": "Data Error", "Value": 0}
-            if 'Value' not in info_data or not isinstance(info_data.get('Value'), (int, float)):
-                info_data['Value'] = 0
+                    # --- >>> ADDED DEBUG PRINT HERE <<< ---
+                    #print(f"    Checking for Main Info: '{expected_main_info_path}'")
+                    # --- >>> END ADDED DEBUG PRINT <<< ---
 
-            # Populate the final 'data' dictionary
-            data[folder_name] = [
-                representative_image_path,
-                line_clean,
-                current_zip_file_from_config,
-                info_data,
-                folder_name_from_config
-            ]
+                    if os.path.exists(expected_main_info_path):
+                        representative_image_path = pic_path
+                        item_to_represent = item
+                        found_with_main_info = True
+                        #print(f"  Finalize - Folder: {folder_name} - Found FIRST config with Main Info JSON: '{expected_main_info_filename}'. Using image: {os.path.basename(representative_image_path)}")
+                        break
 
-        print("--- _finalize_data_processing() FINISHED ---")
+                # Step 3: Fallback to Absolute First Config
+                if not found_with_main_info:
+                    print(f"  Finalize - Folder: {folder_name} - No default found, in addition to No config with Main Info JSON found. Falling back to ABSOLUTE FIRST config.")
+                    first_valid_item = valid_config_list[0]
+                    representative_image_path = first_valid_item[0]
+                    item_to_represent = first_valid_item
+
+            # Final Check and Data Population (logic remains the same)
+            if representative_image_path is None or not os.path.exists(representative_image_path):
+                print(f"  Finalize - Folder: {folder_name} - Representative image path missing or invalid ('{representative_image_path}'). Using PLACEHOLDER.")
+                item_source_for_placeholder = "unknown_source"
+                if item_to_represent:
+                    item_source_for_placeholder = item_to_represent[2]
+                elif valid_config_list:
+                     item_source_for_placeholder = valid_config_list[0][2]
+
+                is_item_custom = item_source_for_placeholder == "user_custom_configs"
+                representative_image_path = missing_custom_pic_path if is_item_custom else missing_zip_pic_path
+                print(f"  Finalize - Folder: {folder_name} - Selected placeholder: {os.path.basename(representative_image_path)}")
+                if item_to_represent is None and valid_config_list:
+                    item_to_represent = valid_config_list[0]
+
+            if item_to_represent:
+                _, line_clean, current_zip_file_from_config, info_data, folder_name_from_config = item_to_represent
+
+                if not isinstance(info_data, dict):
+                    print(f"ERROR: Finalize - info_data in chosen representative item for '{folder_name}' is not a dict. Using default.")
+                    info_data = {"Name": "Data Error", "Value": 0}
+                if 'Value' not in info_data or not isinstance(info_data.get('Value'), (int, float)):
+                    info_data['Value'] = 0
+
+                data[folder_name] = [
+                    representative_image_path,
+                    line_clean,
+                    current_zip_file_from_config,
+                    info_data,
+                    folder_name_from_config
+                ]
+            else:
+                print(f"ERROR: Finalize - Could not determine a representative item for folder '{folder_name}'. Skipping.")
+
+        print("--- _finalize_data_processing() FINISHED (NEW Prioritization + Path Debug) ---")
         return data
-
 
 
 
@@ -2821,7 +3334,7 @@ class ConfigViewerApp:
     def setup_gui(self):
         self.setup_main_window()
         self.setup_top_frame()
-        self.setup_bottom_frame(scale_changed=False)
+        self.setup_bottom_frame()
         self.setup_main_frame()
         self.setup_canvas_and_scrollbar()
         self.setup_scrollable_frame()
@@ -2888,7 +3401,7 @@ class ConfigViewerApp:
         else:
             self.create_settings_button(self.bottom_frame, scale_changed=False)
 
-        self.create_resize_button(self.bottom_frame)
+
         self.create_restart_button(self.bottom_frame)
         self.create_hidden_vehicles_button(self.bottom_frame)
         self.create_isolated_mods_button(self.bottom_frame)
@@ -2898,9 +3411,12 @@ class ConfigViewerApp:
 
     def setup_main_window(self):
         self.master.title(self.main_window_title)
-        #self.master.geometry("2920x1080")
-        #self.master.resizable(False, False)
-        #self.master.attributes("-topmost", True)
+
+        min_width = 967
+        min_height = 647
+
+        self.master.minsize(min_width, min_height)
+
 
         icon_path = self.script_dir / "data/icon.png"
 
@@ -2917,58 +3433,27 @@ class ConfigViewerApp:
 		
     def create_search_bar(self, top_frame):
         """Creates the search bar with updated styling to match the dark theme and light grey background."""
-        #search_label = tk.Label(top_frame, text="Search:", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add)) # MODIFICATION: REMOVE Search: label
-        #search_label.pack(side="left", padx=(10, 5)) # MODIFICATION: REMOVE Search: label
         self.search_var = tk.StringVar()
-        self.search_entry = search_entry = tk.Entry(top_frame, textvariable=self.search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="lightgrey", fg="black", insertbackground="black") # <-- UPDATED bg to "lightgrey", fg to "black", insertbackground to "black"
+        self.search_entry = search_entry = tk.Entry(top_frame, textvariable=self.search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="#d9d9d9", fg="black", insertbackground="black") # <-- UPDATED bg to "#d9d9d9", fg to "black", insertbackground to "black"
 
         # --- COPY BUTTON STYLES FROM TOP/BOTTOM FRAME BUTTONS ---
-        button_style_args = {
-            "bg": "#555555",
-            "fg": "white", # MODIFICATION: Change search icon emoji to white
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            #"font":("Segoe UI", 12+self.font_size_add, "bold") # NO BOLD FONT for search icon button
+        self.search_button_style_args = {
+            "bg": "#333333",
+            "fg": "#FFFFFF", # MODIFICATION: Change search icon emoji to white
+
         }
         # --- COPY BUTTON STYLES FROM TOP/BOTTOM FRAME BUTTONS ---
 
-        search_button = tk.Button(
+        search_button = tk.Label(
             top_frame,
             text="🔍",
-            font=("Segoe UI", 12+self.font_size_add), # Font for the icon, keep it non-bold
-            command=self.perform_search,
-            **button_style_args # <--- APPLY BUTTON STYLES
+            font=("Segoe UI", 14+self.font_size_add), # Font for the icon, keep it non-bold
+            **self.search_button_style_args # <--- APPLY BUTTON STYLES
         )
 
-        def on_search_icon_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
 
-        def on_search_icon_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_search_icon_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_search_icon_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_search_icon_hover_leave(e, bg, fg))
-
-
-        search_button.bind("<Enter>", on_search_icon_hover_enter)
-        search_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_search_icon_hover_leave(event, bg, fg))
-        search_button.bind("<Button-1>", on_search_icon_click)
-
-
-        search_button.pack(side="left", padx=(10, 10)) # MODIFICATION: Put search icon on the LEFT side of search bar, increased padx on the right to 5 for space
-        search_entry.pack(side="left", padx=(0, 10)) # MODIFICATION: Put search bar to the RIGHT of the search icon, added padx on the right
-
-
-        #search_entry.bind("<Return>", lambda event: self.perform_search())
-        
-        #search_entry.bind("<KeyRelease>", lambda event: self.start_debounce_highlighting()) # <--- MODIFIED: Bind KeyRelease to start_debounce_highlighting
-        #search_entry.bind("<KeyRelease>", lambda event: self.lift_search_results_window())
+        search_button.pack(side="left", padx=(4, 2)) 
+        search_entry.pack(side="left", padx=(0, 10)) 
 
         search_entry.bind("<KeyRelease>", self._handle_main_search_key_release)
 
@@ -3231,8 +3716,8 @@ class ConfigViewerApp:
         on_button_hover_enter, on_button_hover_leave, on_button_click = self._create_button_event_handlers()
 
         self._initialize_search_mode()
-        self._create_search_mode_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self._create_filters_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
+        self._create_search_mode_button(top_frame, button_style_args, on_button_click)
+        self._create_filters_button(top_frame, button_style_args, on_button_click)
         self._create_subset_data_button(top_frame, button_style_args, on_button_click) # click is different for this button
 
         # --- NEW: Dropdown Buttons ---
@@ -3243,8 +3728,8 @@ class ConfigViewerApp:
         # --- NEW: Dropdown Buttons ---
 
         #self._create_resize_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self._create_show_switcher_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self._create_switch_to_beamng_button(top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click)
+        self._create_show_switcher_button(top_frame, button_style_args, on_button_click)
+        self._create_switch_to_beamng_button(top_frame, button_style_args, on_button_click)
 
         self.create_loading_label(top_frame) # Keep loading label creation here, assuming it's related to top frame
 
@@ -3254,16 +3739,20 @@ class ConfigViewerApp:
         self._show_dropdown_menu(self.remove_vehicles_button, [
             ("Remove Current Vehicle", self.on_delete_single_button_click),
             ("Remove All Other Vehicles", self.on_delete_all_other_vehicles_button_click),
-            ("Remove Moving Traffic Vehicles", self.on_delete_traffic_vehicles_button_click),
+            ("Remove Traffic Vehicles", self.on_delete_traffic_vehicles_button_click),
             ("Remove Parked Vehicles", self.on_delete_parked_vehicles_button_click),
             ("Remove Parked and Traffic Vehicles", self.on_delete_parked_and_traffic_vehicles_button_click),
         ], 'remove_vehicles_dropdown_window')
 
     def show_add_vehicles_dropdown(self):
         self._show_dropdown_menu(self.add_vehicles_button, [
-            ("Spawn Traffic/Parked Vehicles", self.on_spawn_traffic_vehicles_button_click),
+            ("Spawn Traffic and Parked Vehicles", lambda: self.on_spawn_traffic_vehicles_button_click(type="Both")),
+            ("Spawn Traffic Vehicles", lambda: self.on_spawn_traffic_vehicles_button_click(type="Traffic")),
+            ("Spawn Parked Vehicles", lambda: self.on_spawn_traffic_vehicles_button_click(type="Parked")),
             ("Spawn Queue", self.show_spawn_queue_window),
-            ("Spawn Random Vehicle", self.spawn_random_vehicle),
+            ("Spawn Random Vehicle", lambda: self.spawn_random_vehicle(vehicle_type=None, replace_current=False)),
+            ("Spawn Random Car", lambda: self.spawn_random_vehicle(vehicle_type="car", replace_current=False)),
+            ("Spawn Random Bus/Van/Truck", lambda: self.spawn_random_vehicle(vehicle_type="truck", replace_current=False)),
         ], 'add_vehicles_dropdown_window')
 
     def show_player_vehicle_dropdown(self):
@@ -3271,6 +3760,9 @@ class ConfigViewerApp:
             ("Spawn Default Vehicle", self.on_spawn_default_button_click),
             ("Replace Current with Default Vehicle", self.on_replace_with_default_button_click),
             ("Save Current Vehicle as Default", self.on_save_current_as_default_button_click),
+            ("Replace with Random Vehicle", lambda: self.spawn_random_vehicle(vehicle_type=None, replace_current=True)),
+            ("Replace with Random Car", lambda: self.spawn_random_vehicle(vehicle_type="car", replace_current=True)),
+            ("Replace with Random Bus/Van/Truck", lambda: self.spawn_random_vehicle(vehicle_type="truck", replace_current=True)),
         ], 'player_vehicle_dropdown_window')
         
 
@@ -3282,7 +3774,7 @@ class ConfigViewerApp:
         button_x = parent_button.winfo_rootx()
         button_y = parent_button.winfo_rooty() + parent_button.winfo_height()
 
-        setattr(self, dropdown_name, tk.Toplevel(self.master))
+        setattr(self, dropdown_name, FadingToplevel(self.master, self))
         dropdown_window = getattr(self, dropdown_name)
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
@@ -3296,22 +3788,53 @@ class ConfigViewerApp:
             setattr(self, dropdown_name, None)
 
         for option_text, command in options:
+            # --- Define Colors for these dropdown items ---
+            original_bg = "#555555"
+            original_fg = "#FFFFFF"
+
+            # Specific hover colors for these action options
+            item_hover_bg = "#d9d9d9"
+            item_hover_fg = "black"
+
+            # --- Button Creation (initial bg/fg will be set by _bind_animated_hover) ---
             dropdown_button = tk.Button(
-                dropdown_window,
+                dropdown_window, # Ensure this window/frame exists
                 text=option_text,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda cmd=command: on_dropdown_option_click(cmd),
-                borderwidth=1,
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command lambda captures the specific command for this button
+                command=lambda cmd=command: on_dropdown_option_click(cmd), # Ensure on_dropdown_option_click is defined
+                borderwidth=1,      # Keep specific styling for dropdown items
                 relief="solid",
-                anchor="w",
+                anchor="w",         # Align text to the West (left)
                 padx=10,
-                pady=5,
-                bg="#555555",
-                fg="white"
+                pady=5
+                # bg and fg are now set by _bind_animated_hover
             )
+            # Set active colors (for instant click flash) to match hover
+            dropdown_button.config(
+                activebackground=item_hover_bg,
+                activeforeground=item_hover_fg
+            )
+
             dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button: btn.config(bg="#555555", fg="white")) # Default style
+
+            # --- Apply Smooth Hover Animation ---
+            self._bind_animated_hover(
+                button=dropdown_button,
+                original_bg=original_bg,
+                original_fg=original_fg,
+                hover_target_bg=item_hover_bg, # Custom hover BG
+                hover_target_fg=item_hover_fg, # Custom hover FG
+                check_state=False,             # Assuming these items are not disabled
+                # No persistent selected state for these action buttons
+                is_selected_initial=False,
+                selected_bg=None,
+                selected_fg=None,
+                # No extra tooltip commands needed
+                on_enter_extra_command=None,
+                on_leave_extra_command=None
+            )
+
 
         dropdown_window.bind("<FocusOut>", lambda event: self.destroy_dropdown_menu(dropdown_name))
 
@@ -3330,9 +3853,9 @@ class ConfigViewerApp:
             'player_vehicle_dropdown_window'
         ]
         for dropdown_name in dropdowns_to_close:
-            print(f"Attempting to destroy dropdown: {dropdown_name}")
+            #print(f"Attempting to destroy dropdown: {dropdown_name}")
             self.destroy_dropdown_menu(dropdown_name)
-            print(f"Dropdown {dropdown_name} (if open) should now be destroyed.")
+            #print(f"Dropdown {dropdown_name} (if open) should now be destroyed.")
         
    
     def create_player_vehicle_dropdown_button(self, top_frame):
@@ -3370,13 +3893,13 @@ class ConfigViewerApp:
         # --- MODIFIED: Store default text color as attribute ---
         self.remove_vehicles_button.default_fg_color = "#ffa1a1"
         # --- MODIFIED: Store default text color as attribute ---
-        self._bind_button_events_custom_fg(self.remove_vehicles_button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg="red") # Passing default_fg
+        self._bind_button_events_custom_fg(self.remove_vehicles_button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg="#ffa1a1") # Passing default_fg
         self.remove_vehicles_button.pack(side="left", padx=(0, 10))
 
     def create_add_vehicles_dropdown_button(self, top_frame):
         button_style_args = self._create_button_style()
         # --- MODIFIED: Set default text color to green ---
-        button_style_args["fg"] = "lightgreen"
+        button_style_args["fg"] = "#90ee90"
         # --- MODIFIED: Set default text color to green ---
         on_button_hover_enter, on_button_hover_leave, on_button_click = self._create_button_event_handlers()
 
@@ -3387,20 +3910,12 @@ class ConfigViewerApp:
             **button_style_args
         )
         # --- MODIFIED: Store default text color as attribute ---
-        self.add_vehicles_button.default_fg_color = "lightgreen"
+        self.add_vehicles_button.default_fg_color = "#90ee90"
         # --- MODIFIED: Store default text color as attribute ---
-        self._bind_button_events_custom_fg(self.add_vehicles_button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg="green") # Passing default_fg
+        self._bind_button_events_custom_fg(self.add_vehicles_button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg="#90ee90") # Passing default_fg
         self.add_vehicles_button.pack(side="left", padx=(0, 10))
 
 
-
-    def _bind_button_events_custom_fg(self, button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg):
-        """Binds common events to a button, now with custom default foreground color."""
-        button.bind("<Enter>", on_button_hover_enter)
-        # --- MODIFIED: Pass custom default_fg to on_button_hover_leave ---
-        button.bind("<Leave>", lambda event, bg="#555555", fg=default_fg: on_button_hover_leave(event, bg, fg)) # Use custom default_fg
-        # --- MODIFIED: Pass custom default_fg to on_button_hover_leave ---
-        button.bind("<Button-1>", on_button_click)
 
 
 
@@ -3409,31 +3924,31 @@ class ConfigViewerApp:
         """Defines the common style arguments for buttons."""
         return {
             "bg": "#555555",
-            "fg": "white",
+            "fg": "#FFFFFF",
             "relief": tk.FLAT,
             "bd": 0,
             "highlightbackground": "#555555",
             "activebackground": "#666666",
-            "activeforeground": "white",
+            "activeforeground": "#FFFFFF",
             "font": ("Segoe UI", 12+self.font_size_add,)
         }
 
     def _create_button_event_handlers(self):
         """Creates and returns button event handler functions."""
         def on_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
+            event.widget.config(bg=self.global_highlight_color, fg="#FFFFFF")
 
-        def on_button_hover_leave(event, original_bg="#555555", original_fg="white"): # original_fg is now generic
+        def on_button_hover_leave(event, original_bg="#555555", original_fg="#FFFFFF"): # original_fg is now generic
             # --- MODIFIED: Use event.widget.default_fg_color to restore custom default fg ---
-            original_fg_dynamic = getattr(event.widget, 'default_fg_color', "white") # Fallback to "white" if not set
+            original_fg_dynamic = getattr(event.widget, 'default_fg_color', "#FFFFFF") # Fallback to "#FFFFFF" if not set
             event.widget.config(bg=original_bg, fg=original_fg_dynamic) # Use dynamic original_fg
             # --- MODIFIED: Use event.widget.default_fg_color to restore custom default fg ---
 
         def on_button_click(event):
-            event.widget.config(bg="white", fg="black")
+            event.widget.config(bg="#FFFFFF", fg="black")
             # Revert to hover style on enter, default on leave after click effect
             event.widget.bind("<Enter>", on_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_button_hover_leave(e, bg, fg))
+            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="#FFFFFF": on_button_hover_leave(e, bg, fg))
         return on_button_hover_enter, on_button_hover_leave, on_button_click
 
  
@@ -3444,27 +3959,8 @@ class ConfigViewerApp:
             print("Warning: self.search_mode attribute not initialized. Defaulting to 'General'.")
             self.search_mode = "General"
 
-    def _create_search_mode_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
-        """Creates and packs the Search Mode button."""
-        self.search_mode_button = tk.Button(
-            top_frame,
-            text=f"Search Mode: {self.search_mode}",
-            command=self.show_search_mode_options_dropdown,
-            **button_style_args
-        )
-        self._bind_button_events(self.search_mode_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self.search_mode_button.pack(side="left", padx=(0, 10))
 
-    def _create_filters_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
-        """Creates and packs the Filters button."""
-        self.filters_button = tk.Button(
-            top_frame,
-            text="Vehicle Filters:",
-            command=self.show_filters_window,
-            **button_style_args
-        )
-        self._bind_button_events(self.filters_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
-        self.filters_button.pack(side="left", padx=(0, 0))
+
 
     def _create_subset_data_button(self, top_frame, button_style_args, on_button_click):
         """Creates and packs the Subset Data button."""
@@ -3482,6 +3978,9 @@ class ConfigViewerApp:
 
 
 
+
+
+    # unused, don't modify
     def _create_resize_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
         """Creates and packs the Resize Window button."""
         self.resize_button = tk.Button(
@@ -3495,28 +3994,85 @@ class ConfigViewerApp:
 
 
 
-    def _create_switch_to_beamng_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
-        """Creates and packs the Show Switcher button."""
-        # Initialize with default text
+        
 
-        if not self.new_button_label:
-            initial_text = f"Switch to BeamNG ({self.DEFAULT_SWITCH_DISPLAY_TEXT})"
-        else:
-            initial_text = self.new_button_label
+    def _create_search_mode_button(self, top_frame, button_style_args, on_button_click): # No on_button_hover_enter/leave
+        """Creates and packs the Search Mode button."""
+        self.search_mode_button = tk.Button(
+            top_frame,
+            text=f"Search Mode: {getattr(self, 'search_mode', 'Default')}",
+            command=self.show_search_mode_options_dropdown, # Use the passed on_button_click for the command
+            **button_style_args
+        )
+
+        initial_bg = self._get_validated_current_color(self.search_mode_button, "bg")
+        initial_fg = self._get_validated_current_color(self.search_mode_button, "fg")
+
+        self._bind_animated_hover(
+            button=self.search_mode_button,
+            original_bg=initial_bg,
+            original_fg=initial_fg,
+            hover_target_fg="#FFFFFF",  # Explicitly set hover foreground to white
+            check_state=True           # Or False if these buttons are always enabled
+                                       # and you don't want the state check overhead.
+            # No on_enter_extra_command
+            # No on_leave_extra_command
+        )
+        self.search_mode_button.pack(side="left", padx=(0, 10))
+        return self.search_mode_button # Good practice to return the created widget
+
+    def _create_filters_button(self, top_frame, button_style_args, on_button_click): # No on_button_hover_enter/leave
+        """Creates and packs the Filters button."""
+        self.filters_button = tk.Button(
+            top_frame,
+            text="Vehicle Filters:",
+            command=self.show_filters_window,
+            **button_style_args
+        )
+
+        initial_bg = self._get_validated_current_color(self.filters_button, "bg")
+        initial_fg = self._get_validated_current_color(self.filters_button, "fg")
+
+        self._bind_animated_hover(
+            button=self.filters_button,
+            original_bg=initial_bg,
+            original_fg=initial_fg,
+            hover_target_fg="#FFFFFF",
+            check_state=True
+            # No on_enter_extra_command
+            # No on_leave_extra_command
+        )
+        self.filters_button.pack(side="left", padx=(0, 0))
+        return self.filters_button
+
+    def _create_switch_to_beamng_button(self, top_frame, button_style_args, on_button_click): # No on_button_hover_enter/leave
+        """Creates and packs the Switch to BeamNG button."""
+        initial_text = getattr(self, 'new_button_label', None) or \
+                       f"Switch to BeamNG ({getattr(self, 'DEFAULT_SWITCH_DISPLAY_TEXT', 'App')})"
 
         self.switch_to_beamng_button = tk.Button(
             top_frame,
-            text=initial_text, # Use default text initially
+            text=initial_text,
             command=self.focus_beamng_window,
             **button_style_args
         )
-        self._bind_button_events(self.switch_to_beamng_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
+
+        initial_bg = self._get_validated_current_color(self.switch_to_beamng_button, "bg")
+        initial_fg = self._get_validated_current_color(self.switch_to_beamng_button, "fg")
+
+        self._bind_animated_hover(
+            button=self.switch_to_beamng_button,
+            original_bg=initial_bg,
+            original_fg=initial_fg,
+            hover_target_fg="#FFFFFF",
+            check_state=True
+            # No on_enter_extra_command
+            # No on_leave_extra_command
+        )
         self.switch_to_beamng_button.pack(side="right", padx=(0, 10))
+        return self.switch_to_beamng_button
 
-
-
-
-    def _create_show_switcher_button(self, top_frame, button_style_args, on_button_hover_enter, on_button_hover_leave, on_button_click):
+    def _create_show_switcher_button(self, top_frame, button_style_args, on_button_click): # No on_button_hover_enter/leave
         """Creates and packs the Show Switcher button."""
         self.show_switcher_button = tk.Button(
             top_frame,
@@ -3524,18 +4080,21 @@ class ConfigViewerApp:
             command=self.toggle_floating_window_visibility,
             **button_style_args
         )
-        self._bind_button_events(self.show_switcher_button, on_button_hover_enter, on_button_hover_leave, on_button_click)
+
+        initial_bg = self._get_validated_current_color(self.show_switcher_button, "bg")
+        initial_fg = self._get_validated_current_color(self.show_switcher_button, "fg")
+
+        self._bind_animated_hover(
+            button=self.show_switcher_button,
+            original_bg=initial_bg,
+            original_fg=initial_fg,
+            hover_target_fg="#FFFFFF",
+            check_state=True
+            # No on_enter_extra_command
+            # No on_leave_extra_command
+        )
         self.show_switcher_button.pack(side="right", padx=(0, 10))
-
-    def _bind_button_events(self, button, on_button_hover_enter, on_button_hover_leave, on_button_click):
-        """Binds common events to a button."""
-        button.bind("<Enter>", on_button_hover_enter)
-        button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_button_hover_leave(event, bg, fg))
-        button.bind("<Button-1>", on_button_click)
-
-        
-
-
+        return self.show_switcher_button
 
 
 
@@ -3545,51 +4104,87 @@ class ConfigViewerApp:
 
 
     def create_categorize_button(self, bottom_frame):
-        button_style_args = {
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT,
-            "bd": 0,
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add)
+        """Creates the 'Categorize by' button with smooth hover and disable support."""
+
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF"  # Hover text color
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+        disabled_fg = "grey"
+
+        button_style_args = { # Normal state styles
+            "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+            "highlightbackground": original_bg, "activebackground": active_bg,
+            "activeforeground": active_fg, "font": ("Segoe UI", 12 + self.font_size_add)
         }
-        disabled_button_style_args = button_style_args.copy()  # Copy base style
-        disabled_button_style_args["fg"] = "grey" # Grey text for disabled state
-        disabled_button_style_args["activebackground"] = "#555555" # No click effect
-        disabled_button_style_args["activeforeground"] = "grey"
+        # Define disabled style separately
+        disabled_button_style_args = button_style_args.copy()
+        disabled_button_style_args["fg"] = disabled_fg
+        disabled_button_style_args["activebackground"] = original_bg # No visual change on click when disabled
+        disabled_button_style_args["activeforeground"] = disabled_fg
 
-        def on_bottom_button_hover_enter(event):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg="white", fg="black")
-                # After click effect, revert back to hover style (orange) on enter, or default on leave
-                event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-                event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-        self.categorize_button = tk.Button(
+        # --- Create the Button ---
+        button = tk.Button(
             bottom_frame,
-            text=f"Categorize by: {self.categorization_mode}",
-            command=self.show_categorize_dropdown,
-            **button_style_args
+            text=f"Categorize by: {self.categorization_mode}", # Ensure self.categorization_mode exists
+            command=self.show_categorize_dropdown, # Ensure this method exists
+            **button_style_args # Start with normal style
         )
-        self.categorize_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.categorize_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.categorize_button.bind("<Button-1>", on_bottom_button_click)
-        self.categorize_button.pack(side="left", padx=(10, 0))
+        self.categorize_button = button # Store reference
 
-        if self.is_search_results_window_active: # Initially set button state based on window status
-            self.categorize_button.config(state=tk.DISABLED, **disabled_button_style_args)
-        else:
-            self.categorize_button.config(state=tk.NORMAL, **button_style_args)
+        # --- Bind Hover/Destroy Events using the Helper ---
+        # This replaces the local handlers and bindings for Enter, Leave, Destroy
+        # and handles storing original colors.
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # <<< IMPORTANT: This button can be disabled
+        )
+
+        # --- Pack the Button ---
+        button.pack(side="left", padx=(10, 0))
+
+        # --- State Update Function (Still needed for disable/enable logic) ---
+        def update_button_state(is_disabled):
+             """Updates button state, cancels animation, and applies correct style."""
+             # Ensure button exists before proceeding
+             if not button.winfo_exists():
+                 print(f"Warning: Attempted to update state on destroyed button {button}")
+                 return
+
+             # Cancel any ongoing animation
+             if button in self.animation_states:
+                 state = self.animation_states[button]
+                 anim_id = state.get('anim_id')
+                 if anim_id:
+                     try: button.after_cancel(anim_id)
+                     except tk.TclError: pass
+                 # Clear animation target state
+                 state['anim_id'] = None
+                 state['target_color'] = None
+                 state['start_color'] = None
+
+             # Update the class attribute tracking the state
+             # self.is_search_results_window_active = is_disabled # Make sure this is the correct flag to update
+
+             if is_disabled:
+                 # Apply disabled style (including resetting bg/fg)
+                 button.config(state=tk.DISABLED, **disabled_button_style_args)
+             else:
+                 # Apply normal style (resetting bg/fg to original)
+                 button.config(state=tk.NORMAL, **button_style_args)
+
+        # Attach the update method to the button instance for external access
+        button.update_state = update_button_state
+
+        # --- Set Initial State ---
+        # Use the newly attached update_state function
+        button.update_state(self.is_search_results_window_active)
+
   
   
 
@@ -3619,10 +4214,9 @@ class ConfigViewerApp:
         button_y = button.winfo_rooty()
         button_height = button.winfo_height()
 
-        self.categorize_dropdown_window = tk.Toplevel(self.master)
+        self.categorize_dropdown_window = FadingToplevel(self.master, self)
         self.categorize_dropdown_window.overrideredirect(True)  # Remove window border
         self.categorize_dropdown_window.tk.call('tk', 'scaling', 1.25)  # Set to 100% scaling
-        #self.categorize_dropdown_window.geometry(f"+{button_x}+{button_y - 115}") # Position above button - adjust offset as needed
         self.categorize_dropdown_window.config(bg="#555555") # Dark grey background for dropdown
         self.categorize_dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
 
@@ -3642,28 +4236,50 @@ class ConfigViewerApp:
 
 
         for option in categorize_options:
-            bg_color = "#555555"
-            fg_color = "white"
-            if option == self.categorization_mode: # Highlight current mode
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+            # --- Determine initial visual state ---
+            is_selected = (option == self.categorization_mode)
 
+            # --- Define Colors ---
+            default_bg_color = "#555555"    # Normal, non-selected background
+            default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
+
+            selected_option_bg = self.global_highlight_color # Background for selected item
+            selected_option_fg = "#FFFFFF"                   # Foreground for selected item
+
+            # Hover colors for these specific dropdown items
+            dropdown_item_hover_bg = "#d9d9d9"
+            dropdown_item_hover_fg = "black"
+
+            # --- Button Creation ---
+            # bg and fg are now set by _bind_animated_hover based on is_selected
             dropdown_button = tk.Button(
-                self.categorize_dropdown_window,
-                text=f"Categorize by: {option}", # Display "Categorize by: " prefix in dropdown
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
+                self.categorize_dropdown_window, # Ensure this parent window exists
+                text=f"Categorize by: {option}",
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
                 command=lambda opt=option: on_categorize_option_click(opt),
                 borderwidth=1,
                 relief="solid",
                 anchor="w",
                 padx=10,
-                pady=5,
-                bg=bg_color,
-                fg=fg_color
+                pady=5
+                # Initial bg/fg will be set by _bind_animated_hover
             )
             dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+
+            # --- Apply Smooth Hover Animation & Initial State ---
+            # Assumes self._bind_animated_hover is defined in your class
+            self._bind_animated_hover(
+                button=dropdown_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG for these items
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG for these items
+                check_state=False,                    # Assuming these are not individually disabled
+                is_selected_initial=is_selected,      # Is this button initially selected?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
+
 
         # Force update to calculate window size based on content
         self.categorize_dropdown_window.update_idletasks()
@@ -3699,7 +4315,7 @@ class ConfigViewerApp:
         self.loading_label = tk.Label(
             top_frame,
             text="Loading...",
-            bg="lightgrey",
+            bg="#d9d9d9",
             font=("Segoe UI", 12+self.font_size_add, "bold"),
             fg="blue"
         )
@@ -3710,62 +4326,275 @@ class ConfigViewerApp:
 
 
     def create_category_list_button(self, bottom_frame):
-        button_style_args = {
-            "bg": "#555555",
-            "fg": "white",
+        """Creates the 'Category List' button with smooth hover animation and disable support."""
+
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Text color on hover
+        active_bg = "#666666" # Standard click feedback color
+        active_fg = "#FFFFFF" # Standard click feedback text color
+        disabled_fg = "grey"
+
+        button_style_args = { # Normal state styles
+            "bg": original_bg,
+            "fg": original_fg,
             "relief": tk.FLAT,
             "bd": 0,
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add)
+            # "highlightthickness": 0, # REMOVED as per instruction
+            "highlightbackground": original_bg,
+            "activebackground": active_bg,
+            "activeforeground": active_fg,
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
-        disabled_button_style_args = button_style_args.copy()  # Copy base style
-        disabled_button_style_args["fg"] = "grey" # Grey text for disabled state
-        disabled_button_style_args["activebackground"] = "#555555" # No click effect
-        disabled_button_style_args["activeforeground"] = "grey"
+        # Define disabled style separately
+        disabled_button_style_args = button_style_args.copy()
+        disabled_button_style_args["fg"] = disabled_fg
+        disabled_button_style_args["activebackground"] = original_bg # No visual change on click when disabled
+        disabled_button_style_args["activeforeground"] = disabled_fg
 
-        def on_bottom_button_hover_enter(event):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            if not self.is_search_results_window_active: # Check if search results window is NOT active
-                event.widget.config(bg="white", fg="black")
-                # After click effect, revert back to hover style (orange) on enter, or default on leave
-                event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-                event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-        self.category_list_button = tk.Button(
+        # --- Create the Button ---
+        button = tk.Button(
             bottom_frame,
             text="Category List",
-            command=self.show_category_list_dropdown,
-            **button_style_args
+            command=self.show_category_list_dropdown, # Ensure this method exists
+            **button_style_args # Start with normal style initially
         )
-        self.category_list_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.category_list_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.category_list_button.bind("<Button-1>", on_bottom_button_click)
-        self.category_list_button.pack(side="left", padx=(10, 0))
+        self.category_list_button = button # Store reference
 
-        if self.is_search_results_window_active: # Initially set button state based on window status
-            self.category_list_button.config(state=tk.DISABLED, **disabled_button_style_args)
-        else:
-            self.category_list_button.config(state=tk.NORMAL, **button_style_args)
+        # --- Bind Hover/Destroy Events using the Helper ---
+        # This replaces the local handlers, bindings, and color storage.
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # <<< IMPORTANT: This button needs state checking for hover
+        )
+
+        # --- Pack the Button ---
+        button.pack(side="left", padx=(10, 0))
+
+        # --- State Update Function (Still needed for enable/disable logic) ---
+        def update_state(is_disabled):
+            """Updates button state, cancels animation, and applies correct style."""
+            # Ensure button exists before proceeding
+            if not button.winfo_exists():
+                # Optional: Add a print warning if needed
+                # print(f"Warning: Attempted to update state on destroyed category list button {button}")
+                return
+
+            # Cancel any ongoing animation
+            if button in self.animation_states:
+                state = self.animation_states[button]
+                anim_id = state.get('anim_id')
+                if anim_id:
+                    try: button.after_cancel(anim_id)
+                    except tk.TclError: pass
+                # Clear animation target state
+                state['anim_id'] = None
+                state['target_color'] = None
+                state['start_color'] = None
+
+            # Update the button's state and appearance
+            if is_disabled:
+                button.config(state=tk.DISABLED, **disabled_button_style_args)
+            else:
+                button.config(state=tk.NORMAL, **button_style_args)
+
+        # Attach the update method to the button instance for external access
+        button.update_state = update_state
+
+        # --- Set Initial State ---
+        # Use the update_state function to set the correct initial appearance
+        # Ensure self.is_search_results_window_active accurately reflects the desired initial state
+        button.update_state(self.is_search_results_window_active)
  
 
 
     def destroy_category_list_dropdown(self):
-        self.is_search_results_window_closing = True # <--- SET FLAG BEFORE DESTROY
+        print("destroy_cat_list_func_entered")
+
+        if self.category_list_button_clicked:
+            self.category_list_button_clicked = False
+            return
+        
         if hasattr(self, 'category_list_dropdown_window') and self.category_list_dropdown_window and self.category_list_dropdown_window.winfo_exists():
             self.category_list_dropdown_window.destroy()
             self.category_list_dropdown_window = None
-        self.is_search_results_window_closing = False # <--- RESET FLAG AFTER DESTROY
 
 
+
+
+    def handle_jump_to_page_button_click(self):
+        """Handles clicks on the 'Jump to page' button to show the dropdown menu."""
+        if hasattr(self, 'jump_to_page_dropdown_window') and self.jump_to_page_dropdown_window and self.jump_to_page_dropdown_window.winfo_exists():
+            self.jump_to_page_dropdown_window.destroy()
+            return
+        
+
+
+        button = self.jump_to_page_button_bottom
+
+        button_x = button.winfo_rootx()
+        button_y = button.winfo_rooty() # Get the top of the button
+
+        self.jump_to_page_dropdown_window = dropdown_window = FadingToplevel(self.details_window, self)
+        button_width = button.winfo_width() # Get the width of the button
+
+
+
+
+
+        dropdown_window.overrideredirect(True)
+        dropdown_window.tk.call('tk', 'scaling', 1.25)
+        dropdown_window.config(bg="#333333")
+        dropdown_window.attributes("-topmost", True)
+        dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+
+
+        canvas = tk.Canvas(dropdown_window, bg="#333333", highlightthickness=0, width=100, height=200) # Width same as zip dropdown, make scrollable
+        scrollbar = tk.Scrollbar(dropdown_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#333333")
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="top", fill="both", expand=True) # Pack canvas first to fill space above button
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=300) # Set width of scrollable frame inside canvas
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", lambda ev: self.on_dropdown_mousewheel(ev, canvas)))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+
+        num_pages = math.ceil(len(self.details_filtered_data) / self.items_per_page) if self.items_per_page else 1
+        current_page_index = self.details_page + 1 # Get current page number (1-indexed)
+
+        def on_page_button_click(page_index):
+            self.go_to_details_page(page_index)
+            self.jump_to_page_dropdown_window.destroy()
+            self.jump_to_page_dropdown_window = None
+
+        for i in range(1, num_pages + 1):
+            # --- Define Colors for page buttons ---
+            page_default_bg = "#555555"
+            page_default_fg = "#FFFFFF"
+            page_selected_bg = self.global_highlight_color # Orange for current page
+            page_selected_fg = "#FFFFFF"                   # White text for current page
+            page_hover_bg = "#d9d9d9"
+            page_hover_fg = "black"
+
+            is_selected = (i == current_page_index) # Check if this is the current page
+
+            page_button = tk.Button(
+                scrollable_frame,
+                text=f"Page {i}",
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                command=lambda idx=i: on_page_button_click(idx), # Ensure on_page_button_click exists
+                borderwidth=1,
+                relief="solid",
+                anchor="w",
+                padx=10,
+                pady=5,
+
+            )
+            page_button.config(
+                width=24, # Set fixed width
+                activebackground=page_hover_bg, # For click flash
+                activeforeground=page_hover_fg
+            )
+            page_button.pack(fill="x")
+            # if hasattr(self, 'current_page_buttons_list'): self.current_page_buttons_list.append(page_button)
+
+
+            self._bind_animated_hover(
+                button=page_button,
+                original_bg=page_default_bg,
+                original_fg=page_default_fg,
+                hover_target_bg=page_hover_bg,
+                hover_target_fg=page_hover_fg,
+                check_state=False,
+                is_selected_initial=is_selected,
+                selected_bg=page_selected_bg,
+                selected_fg=page_selected_fg
+            )
+            # REMOVED old binds
+
+        # --- Close Button (below scrollable frame, in dropdown_window) ---
+
+        # --- Define Colors for the Close button ---
+        close_button_original_bg = "#666666"
+        close_button_original_fg = "#FFFFFF"
+        # Hover to global highlight color (orange) or a custom one
+        close_button_hover_bg = self.global_highlight_color # e.g., "#777777"
+        close_button_hover_fg = "#FFFFFF" # Assuming white text on highlight
+
+        close_button = tk.Button(
+            dropdown_window, # Place in dropdown_window
+            text="Close",
+            font=("Segoe UI", 10 + self.font_size_add, "bold"),
+            command=self.destroy_jump_to_page_dropdown_menu, # Ensure this method exists
+            # bg and fg will be set by _bind_animated_hover initially
+            borderwidth=1,
+            relief="solid",
+            padx=10,
+            pady=5
+        )
+        # Set active colors for click flash (optional)
+        close_button.config(
+            activebackground=close_button_hover_bg, # Example: match hover for click
+            activeforeground=close_button_hover_fg
+        )
+        close_button.pack(side="bottom", fill="x") # Pack to bottom of dropdown_window
+
+        # --- Apply Smooth Hover Animation to the Close Button ---
+        self._bind_animated_hover(
+            button=close_button,
+            original_bg=close_button_original_bg,
+            original_fg=close_button_original_fg,
+            hover_target_bg=close_button_hover_bg,
+            hover_target_fg=close_button_hover_fg,
+            check_state=False, # Assuming close button is always enabled
+            is_selected_initial=False, # No selected state
+            selected_bg=None,
+            selected_fg=None
+        )
+
+        # Force update to calculate window size based on content
+        dropdown_window.update_idletasks()
+        # Get the actual dimensions of the dropdown window
+        window_width = dropdown_window.winfo_width()
+        window_height = dropdown_window.winfo_height()
+        # Calculate target X (button's right edge - window width)
+        target_x = (button_x + button_width) - window_width
+        # Calculate target Y (button's top edge - window height)
+        target_y = button_y - window_height
+        # Set the final position
+        dropdown_window.geometry(f"+{target_x}+{target_y}")
+
+
+        dropdown_window.bind("<FocusOut>", lambda event: self.destroy_jump_to_page_dropdown_menu())
+
+    def destroy_jump_to_page_dropdown_menu(self):
+        if hasattr(self, 'jump_to_page_dropdown_window') and self.jump_to_page_dropdown_window and self.jump_to_page_dropdown_window.winfo_exists():
+            self.jump_to_page_dropdown_window.destroy()
+            self.jump_to_page_dropdown_window = None
+
+
+    def go_to_details_page(self, page_index):
+        """Navigates to the specified page in the details window."""
+
+        scanning_win = self.show_scanning_window(text="Loading...")
+
+        self.scanning_window = scanning_win
+
+        if 1 <= page_index <= math.ceil(len(self.details_filtered_data) / self.items_per_page) if self.items_per_page else 1:
+            self.details_page = page_index - 1
+            ConfigViewerApp.details_widget_count = 0
+            self.rebuild_simple_details()
+            self._update_details_pagination_bar()
+        else:
+            print(f"Invalid page number: {page_index}")
 
 
 
@@ -3862,13 +4691,13 @@ class ConfigViewerApp:
         if self.current_tooltip_global_filter_window:
             self.destroy_search_mode_option_tooltip_global_filter()
 
-        self.current_tooltip_global_filter_window = tk.Toplevel(self.master)
+        self.current_tooltip_global_filter_window = FadingToplevel(self.master, self)
         
         self.current_tooltip_global_filter_window.overrideredirect(True)
         self.current_tooltip_global_filter_window.tk.call('tk', 'scaling', 1.25)
         self.current_tooltip_global_filter_window.attributes("-topmost", True)
 
-        tooltip_global_filter_label = tk.Label(self.current_tooltip_global_filter_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="lightgrey", bg=tooltip_color, padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Use tooltip_color
+        tooltip_global_filter_label = tk.Label(self.current_tooltip_global_filter_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="#d9d9d9", bg=tooltip_color, padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Use tooltip_color
         tooltip_global_filter_label.pack(padx=1, pady=1)
         self.tooltip_global_filter_original_bg_color = tooltip_color # Set original color
 
@@ -3887,13 +4716,13 @@ class ConfigViewerApp:
             self.master.after(disappear_delay, self.destroy_search_mode_option_tooltip_global_filter)
 
     def show_error_tooltip_global_filter(self, entry_widget, tip_text): # Error tooltip function
-        self.show_search_mode_option_tooltip_global_filter(entry_widget, tip_text, tooltip_color="red", disappear_delay=4000)
+        self.show_search_mode_option_tooltip_global_filter(entry_widget, tip_text, tooltip_color="#FF0000", disappear_delay=4000)
 
     def flash_tooltip_global_filter_orange(self):
         if self.current_tooltip_global_filter_window and self.tooltip_global_filter_original_bg_color:
             tooltip_global_filter_label = self.current_tooltip_global_filter_window.winfo_children()[0]
             original_color = self.tooltip_global_filter_original_bg_color
-            tooltip_global_filter_label.config(bg="red")
+            tooltip_global_filter_label.config(bg="#FF0000")
             self.master.after(100, lambda: tooltip_global_filter_label.config(bg=original_color))
 
     def validate_numeric_input(self, new_text):
@@ -3906,7 +4735,7 @@ class ConfigViewerApp:
             button.config(text="Off")
 
     def set_button_orange(self, button):
-        button.config(bg=self.global_highlight_color, fg="white")
+        button.config(bg=self.global_highlight_color, fg="#FFFFFF")
 
     def reset_button_color(self, button, on_off_button_style_args):
         button.config(bg=on_off_button_style_args["bg"], fg=on_off_button_style_args["fg"])
@@ -4192,18 +5021,19 @@ class ConfigViewerApp:
             print(f"  DEBUG: self.details_window_closed: {self.details_window_closed}") # <-- DEBUG: Check closed flag
 
             print("DEBUG: show_filters_window - Attempting to show messagebox...") # <-- DEBUG: Before messagebox
-            #messagebox.showinfo(
-            #    "Filters Unavailable",
-            #    "Cannot adjust filters while configuration details window is open.",
-            #    parent=app.master # Set parent to main window to keep messagebox on top
-            #)
-            scanning_win = None  # Initialize scanning_win
 
-            scanning_win = self.show_scanning_window(text="Cannot adjust filters while configurations window is open.")
-            time.sleep(3.125)
-            if scanning_win:
-                scanning_win.destroy()
-#            print("DEBUG: show_filters_window - Messagebox.showinfo() call COMPLETED.") # <-- DEBUG: After messagebox
+
+            scanning_win = None
+            try:
+                scanning_win = self.show_scanning_window(text="Cannot adjust filters while search or filtering is active.")
+                self.master.after(3125, lambda: scanning_win.destroy() if scanning_win and scanning_win.winfo_exists() else None)
+            except Exception as e:
+                print(f"Error managing scanning window: {e}")
+                if scanning_win and scanning_win.winfo_exists():
+                    scanning_win.destroy()
+
+
+
 
             if self.filters_window and self.filters_window.winfo_exists():
                 self.filters_window.focus_set()
@@ -4268,29 +5098,29 @@ class ConfigViewerApp:
         label_font = ("Segoe UI", 12+self.font_size_add, "bold")
         entry_font = ("Segoe UI", 11+self.font_size_add)
 
-        style.configure("DarkTheme.TLabel", background="#333333", foreground="white", font=label_font)
-        style.configure("DarkTheme.TEntry", fieldbackground="lightgrey", foreground="black", lightcolor="lightgrey", borderwidth=1, relief="solid", font=entry_font)
-        style.configure("Title.DarkTheme.TLabel", background="#333333", foreground="white", font=("Segoe UI", 14+self.font_size_add, "bold"))
+        style.configure("DarkTheme.TLabel", background="#333333", foreground="#FFFFFF", font=label_font)
+        style.configure("DarkTheme.TEntry", fieldbackground="#d9d9d9", foreground="black", lightcolor="#d9d9d9", borderwidth=1, relief="solid", font=entry_font)
+        style.configure("Title.DarkTheme.TLabel", background="#333333", foreground="#FFFFFF", font=("Segoe UI", 14+self.font_size_add, "bold"))
 
         bottom_button_style_args = {
             "bg": "#555555",
-            "fg": "white",
+            "fg": "#FFFFFF",
             "relief": tk.FLAT, # Make flat
             "bd": 0,          # Remove border
             "highlightbackground": "#555555",
             "activebackground": "#666666",
-            "activeforeground": "white",
+            "activeforeground": "#FFFFFF",
             "font":("Segoe UI", 12+self.font_size_add),
         }
 
         on_off_button_style_args = {
             "bg": "#555555",
-            "fg": "white",
+            "fg": "#FFFFFF",
             "relief": tk.FLAT, # Make flat
             "bd": 0,          # Remove border
             "highlightbackground": "#555555",
             "activebackground": "#666666",
-            "activeforeground": "white",
+            "activeforeground": "#FFFFFF",
             "font":("Segoe UI", 10+self.font_size_add),
         }
 
@@ -4451,22 +5281,68 @@ class ConfigViewerApp:
         buttons_frame = tk.Frame(filters_window, bg="#333333", pady=10)
         buttons_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-        apply_button = tk.Button(buttons_frame, text="Apply Filters", command=lambda: self.apply_filters_and_run_filter(entry_widgets), **bottom_button_style_args) # Modified command
+        try:
+            original_bg = bottom_button_style_args.get('bg', "#555555")
+            original_fg = bottom_button_style_args.get('fg', "#FFFFFF")
+            # Ensure active colors are in the style for consistent click feedback
+            active_bg = bottom_button_style_args.get('activebackground', "#666666")
+            active_fg = bottom_button_style_args.get('activeforeground', "#FFFFFF")
+            # Update the style dict if active colors were missing
+            bottom_button_style_args['activebackground'] = active_bg
+            bottom_button_style_args['activeforeground'] = active_fg
+        except AttributeError: # Handle if bottom_button_style_args is not a dict
+             print("Warning: bottom_button_style_args is invalid. Using default colors.")
+             original_bg = "#555555"
+             original_fg = "#FFFFFF"
+             active_bg = "#666666"
+             active_fg = "#FFFFFF"
+             # Create a default style dict if needed
+             bottom_button_style_args = {
+                "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+                "highlightbackground": original_bg, # Example default values
+                "activebackground": active_bg, "activeforeground": active_fg
+             }
+
+
+        hover_fg = "#FFFFFF" # Standard hover foreground
+
+        # --- Create Apply Button ---
+        apply_button = tk.Button(
+            buttons_frame,
+            text="Apply Filters",
+            command=lambda: self.apply_filters_and_run_filter(entry_widgets),
+            **bottom_button_style_args
+        )
         apply_button.pack(side=tk.LEFT, padx=10, expand=True, fill=tk.X)
 
-        clear_button = tk.Button(buttons_frame, text="Clear", command=lambda: self.clear_all_filters_and_files(entry_widgets, on_off_button_style_args), **bottom_button_style_args)
+        # --- Create Clear Button ---
+        clear_button = tk.Button(
+            buttons_frame,
+            text="Clear",
+            command=lambda: self.clear_all_filters_and_files(entry_widgets, on_off_button_style_args),
+            **bottom_button_style_args
+        )
         clear_button.pack(side=tk.RIGHT, padx=10, expand=True, fill=tk.X)
 
-        def on_enter_apply_clear(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
 
-        def on_leave_apply_clear(event):
-            event.widget.config(bg="#555555", fg="white")
 
-        apply_button.bind("<Enter>", on_enter_apply_clear)
-        apply_button.bind("<Leave>", on_leave_apply_clear)
-        clear_button.bind("<Enter>", on_enter_apply_clear)
-        clear_button.bind("<Leave>", on_leave_apply_clear)
+        # --- Bind Apply Button using the helper function ---
+        self._bind_animated_hover(
+            button=apply_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming always enabled
+        )
+
+        # --- Bind Clear Button using the helper function ---
+        self._bind_animated_hover(
+            button=clear_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming always enabled
+        )
 
 
         #self.center_window()
@@ -5037,41 +5913,53 @@ class ConfigViewerApp:
 
 
     def create_filter_button(self, bottom_frame):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
+        """Creates the filter button with smooth hover animation."""
+
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Text color on hover
+        active_bg = "#666666" # Standard click feedback color
+        active_fg = "#FFFFFF" # Standard click feedback text color
+
+        button_style_args = {
+            "bg": original_bg,
+            "fg": original_fg,
+            "relief": tk.FLAT,
+            "bd": 0,
+            # "highlightthickness": 0, # REMOVED as per instruction
+            "highlightbackground": original_bg,
+            "activebackground": active_bg, # For standard click feedback
+            "activeforeground": active_fg, # For standard click feedback
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
 
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
+        # --- Create the Button ---
+        # Ensure required attributes exist (e.g., in __init__)
+        # if not hasattr(self, 'filter_options'): self.filter_options = {0: "Default"}
+        # if not hasattr(self, 'filter_state'): self.filter_state = 0
 
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        self.filter_button = tk.Button(
+        button = tk.Button(
             bottom_frame,
-            text=f"{self.filter_options[self.filter_state]} [0]",
-            #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
+            text=f"{self.filter_options[self.filter_state]} [0]", # Update text as needed
             command=self.show_filter_dropdown,
-            **button_style_args # Apply the button styles
+            **button_style_args
         )
-        self.filter_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.filter_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.filter_button.bind("<Button-1>", on_bottom_button_click)
-        self.filter_button.pack(side="left", padx=(10, 0))
+        self.filter_button = button # Store reference if needed elsewhere in the class
+
+        # --- Bind Hover/Destroy Events using the Helper ---
+        # This replaces the local handlers, bindings, and color storage
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # This button did not check state in original code
+        )
+
+        # --- Pack the Button ---
+        button.pack(side="left", padx=(10, 0))
+
 
 
     def show_filter_dropdown(self):
@@ -5101,7 +5989,7 @@ class ConfigViewerApp:
         button_y = button.winfo_rooty()
         # button_height = button.winfo_height() # We don't strictly need button_height for this calculation
 
-        self.filter_dropdown_window = tk.Toplevel(self.master) # Use master.root or appropriate parent
+        self.filter_dropdown_window = FadingToplevel(self.master, self) # Use master.root or appropriate parent
         self.filter_dropdown_window.overrideredirect(True) # Remove window border
         # Don't set geometry yet
         self.filter_dropdown_window.wm_attributes("-topmost", True) # Keep on top of other windows
@@ -5117,8 +6005,8 @@ class ConfigViewerApp:
             self.filter_state = index # <--- FIX: Correctly update filter_state
             current_filter = self.filter_options[self.filter_state]
             self.filter_button.config(text=f"{current_filter} [0]")
-            self.filter_dropdown_window.destroy()
-            self.filter_dropdown_window = None
+            #self.filter_dropdown_window.destroy()
+            #self.filter_dropdown_window = None
 
             # --- NEW: Reset Brand, Name, Bodystyle, and Country filters to "All..." when main filter changes ---
             brand_button = self.sidebar_filter_buttons.get("Brand")
@@ -5156,6 +6044,8 @@ class ConfigViewerApp:
                     self.destroy_search_results_window() # Close Search Results window if switching back to "View All" AND search bar is empty AND global filters are OFF
                     self.search_results_window = None
                     self.is_search_results_window_active = False
+                    print(f"!!!!!!!!!! self.is_search_results_window_active SET TO FALSE by on_dropdown_button_click, under show_filter_dropdown. Timestamp: {time.time()} !!!!!!!!!!")
+
                     print("DEBUG: show_filter_dropdown - Search Results window DESTROYED (switching back to 'View All' AND search bar EMPTY AND Global Filters OFF).")
                 else:
                     print("DEBUG: show_filter_dropdown - Keeping Search Results window OPEN (switching back to 'View All' BUT search bar NOT empty OR Global Filters ON).") # DEBUG - Window Kept Open
@@ -5171,33 +6061,52 @@ class ConfigViewerApp:
         # --- MODIFICATION: Filter out the items to be hidden ---
 
 
-        for index, option in enumerate(filtered_options_list): # Corrected enumerate here, now iterating over filtered list
-            bg_color = "#555555" # Default medium grey background
-            fg_color = "white" # Default white foreground
+        for index, option in enumerate(filtered_options_list): # Corrected enumerate here
+            # --- Determine initial colors and selected state ---
+            is_selected = (option == self.filter_options[self.filter_state]) # Check if this option is the currently selected filter
 
+            default_bg_color = "#555555"    # Normal, non-selected background
+            default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
 
-            if option == self.filter_options[self.filter_state]: # Compare against original list for highlighting
-                bg_color = self.global_highlight_color # Orange background for current filter
-                fg_color = "white" # White text for visibility on orange
+            selected_option_bg = self.global_highlight_color # Orange background for current filter
+            selected_option_fg = "#FFFFFF"                   # White text for visibility on orange
 
+            # --- Define hover colors for these dropdown items ---
+            dropdown_item_hover_bg = "#d9d9d9"
+            dropdown_item_hover_fg = "black"
 
+            # Determine the actual initial bg/fg for the button based on selection
+            # This is now handled by _bind_animated_hover's `is_selected_initial` logic
+
+            # --- Button creation (styles are now set by _bind_animated_hover initially) ---
             dropdown_button = tk.Button(
-                self.filter_dropdown_window,
+                self.filter_dropdown_window, # Ensure this window exists
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command now needs to also handle visually updating the selected item
+                # This lambda is just for the original command part. Visual update is separate.
                 command=lambda idx=self.filter_options.index(option): on_dropdown_button_click(idx), # <--- MODIFIED: Use original index from self.filter_options
-                borderwidth=1,
+                borderwidth=1, # Keep these styles if they are specific to dropdown items
                 relief="solid",
                 anchor="w",
                 padx=10,
-                pady=5,
-                bg=bg_color, # Set background color here
-                fg=fg_color,  # Set foreground color here
+                pady=5
+                # bg and fg are set by _bind_animated_hover
             )
             dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black")) # Store original bg and fg, set fg to black on hover
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg)) # Revert to original bg and fg
 
+            # --- Apply Smooth Hover Animation using the modified binder ---
+            self._bind_animated_hover(
+                button=dropdown_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG
+                check_state=False,                    # Assuming these are not disabled
+                is_selected_initial=is_selected,      # Is this button initially selected?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
 
         # --- DYNAMIC POSITIONING ---
         # Force Tkinter to calculate the window's required size based on its contents
@@ -5262,7 +6171,7 @@ class ConfigViewerApp:
  
   
     def create_status_labels(self, bottom_frame):
-        self.deleting_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add, "bold")) # Dark bg, lightgrey fg
+        self.deleting_label = tk.Label(bottom_frame, text="", bg="#333333", fg="#d9d9d9", font=("Segoe UI", 12+self.font_size_add, "bold")) # Dark bg, lightgrey fg
         self.deleting_label.pack(side="left", expand=True, padx=(10, 0))
 
 
@@ -5292,195 +6201,170 @@ class ConfigViewerApp:
 
 
     def create_isolated_mods_button(self, bottom_frame):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
+        """Creates the 'Isolated Mods' button with smooth hover animation."""
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Explicitly defining, though binder defaults to original_fg if None
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args = {
+            "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+            "highlightbackground": original_bg,
+            "activebackground": active_bg, "activeforeground": active_fg,
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
 
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        self.isolated_mods_button = tk.Button(bottom_frame, text="Isolated Mods", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
-                                        command=self.open_isolated_folder_in_explorer,
-                                        **button_style_args # Apply the button styles
+        # --- Create the Button ---
+        button = tk.Button(
+            bottom_frame,
+            text="Isolated Mods",
+            command=self.open_isolated_folder_in_explorer, # Ensure this method exists
+            **button_style_args
         )
-        self.isolated_mods_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.isolated_mods_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.isolated_mods_button.bind("<Button-1>", on_bottom_button_click)
-        self.isolated_mods_button.pack(side="right", padx=(0, 10))
+        self.isolated_mods_button = button # Store reference if needed
 
+        # --- Bind using the helper ---
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg, # Can omit if same as original_fg
+            check_state=False # Assuming this button is always enabled
+        )
 
+        # --- Pack the Button ---
+        button.pack(side="right", padx=(0, 10))
+        return button
 
     def create_hidden_vehicles_button(self, bottom_frame):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
+        """Creates the 'Hidden Vehicles' button with smooth hover animation."""
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF"
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args = {
+            "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+            "highlightbackground": original_bg,
+            "activebackground": active_bg, "activeforeground": active_fg,
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
 
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        self.hidden_vehicles_button = tk.Button(bottom_frame, text="Hidden Vehicles", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
-                                        command=self.show_hidden_vehicles_window,
-                                        **button_style_args # Apply the button styles
+        # --- Create the Button ---
+        button = tk.Button(
+            bottom_frame,
+            text="Hidden Vehicles",
+            command=self.show_hidden_vehicles_window, # Ensure this method exists
+            **button_style_args
         )
-        self.hidden_vehicles_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.hidden_vehicles_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.hidden_vehicles_button.bind("<Button-1>", on_bottom_button_click)
-        self.hidden_vehicles_button.pack(side="right", padx=(0, 10))
+        self.hidden_vehicles_button = button # Store reference if needed
 
+        # --- Bind using the helper ---
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this button is always enabled
+        )
+
+        # --- Pack the Button ---
+        button.pack(side="right", padx=(0, 10))
+        return button
 
 
     def create_settings_button(self, bottom_frame, scale_changed=False):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
+        """Creates the 'Settings' button with smooth hover animation."""
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF"
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args = {
+            "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+            "highlightbackground": original_bg,
+            "activebackground": active_bg, "activeforeground": active_fg,
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
 
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        self.settings_button = tk.Button(bottom_frame, text="Settings", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
-                                        command=self.show_settings_dropdown,
-                                        **button_style_args # Apply the button styles
+        # --- Create the Button ---
+        button = tk.Button(
+            bottom_frame,
+            text="Settings",
+            command=self.show_settings_dropdown, # Ensure this method exists
+            **button_style_args
         )
-        self.settings_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.settings_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.settings_button.bind("<Button-1>", on_bottom_button_click)
-        self.settings_button.bind("<Button-3>", self.on_settings_button_right_click)
-        self.settings_button.pack(side="right", padx=(0, 10))
+        self.settings_button = button # Store reference
 
+        # --- Bind using the helper FOR HOVER ---
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this button is always enabled
+        )
+
+        # --- Keep OTHER specific bindings ---
+        button.bind("<Button-3>", self.on_settings_button_right_click) # Ensure this method exists
+
+        # --- Pack the Button ---
+        button.pack(side="right", padx=(0, 10))
+
+        # --- Keep special logic ---
         if scale_changed:
             print("DEBUG: Font size changed this session. Scheduling settings dropdown reopen in half a second second.")
-            # Reset the flag immediately after deciding to schedule the action
-            # self.font_size_changed_this_session = False # no longer necessary
-            # Schedule the function call after 1000 milliseconds (1 second)
+            # Ensure self.master or appropriate root window reference exists
             self.master.after(500, self.show_settings_dropdown)
 
+        return button
 
 
     def create_restart_button(self, bottom_frame):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": self.restart_button_active_fg_color,
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
+        """Creates the 'Restart' button with smooth hover animation."""
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        # Use the specific original foreground color for this button
+        original_fg = self.restart_button_active_fg_color # Ensure this attribute exists
+        hover_fg = "#FFFFFF" # Hover text color is still white
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args = {
+            "bg": original_bg, "fg": original_fg, # Use specific initial fg
+            "relief": tk.FLAT, "bd": 0,
+            "highlightbackground": original_bg,
+            "activebackground": active_bg, "activeforeground": active_fg,
+            "font": ("Segoe UI", 12 + self.font_size_add)
         }
 
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        self.restart_button = tk.Button(bottom_frame, text="Restart", #font=("Segoe UI", 12+self.font_size_add), # Removed redundant font argument HERE
-                                        command=self.restart_script_and_save_settings,
-                                        **button_style_args # Apply the button styles
+        # --- Create the Button ---
+        button = tk.Button(
+            bottom_frame,
+            text="Restart",
+            command=self.restart_script_and_save_settings, # Ensure this method exists
+            **button_style_args
         )
-        self.restart_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.restart_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.restart_button.bind("<Button-1>", on_bottom_button_click)
-        self.restart_button.pack(side="right", padx=(0, 10))
+        self.restart_button = button # Store reference if needed
 
-
-
-
-    def create_resize_button(self, bottom_frame):
-        button_style_args = { # Re-define button_style_args here to remove "bold" font
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font":("Segoe UI", 12+self.font_size_add) # REMOVE BOLD FONT - for bottom frame buttons
-        }
-
-        def on_bottom_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_bottom_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_bottom_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_bottom_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_bottom_button_hover_leave(e, bg, fg))
-
-
-        # VVV CHANGE THIS LINE VVV
-        self.resize_button = tk.Button(bottom_frame, text="Change Window Size",
-                                        command=self.do_nothing,
-                                        **button_style_args
+        # --- Bind using the helper ---
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg, # Pass the specific original fg
+            hover_target_fg=hover_fg,       # Specify the hover fg
+            check_state=False      # Assuming this button is always enabled
         )
-        # VVV And update these lines VVV
-        self.resize_button.bind("<Enter>", on_bottom_button_hover_enter)
-        self.resize_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_bottom_button_hover_leave(event, bg, fg))
-        self.resize_button.bind("<Button-1>", on_bottom_button_click)
-        #self.resize_button.pack(side="right", padx=(0, 10)) # Added some padding like others for consistency
 
-
+        # --- Pack the Button ---
+        button.pack(side="right", padx=(0, 10))
+        return button
 
 
 
@@ -5503,7 +6387,7 @@ class ConfigViewerApp:
         print("Creating new dropdown.")
 
         # --- Create the Toplevel window ---
-        self.settings_dropdown_window = tk.Toplevel(self.master)
+        self.settings_dropdown_window = FadingToplevel(self.master, self)
         self.settings_dropdown_window.overrideredirect(True)
         # Basic styling - do this early
         self.settings_dropdown_window.config(bg="#333333")
@@ -5562,57 +6446,138 @@ class ConfigViewerApp:
                          self.settings_dropdown_window = None # Clear ref *immediately* after destroy
 
                     # Schedule the reopening
-                    self.master.after(10, self.show_settings_dropdown)
+                    self.master.after(250, self.show_settings_dropdown)
                 else:
                     print("Warning: Original settings button gone, cannot reopen dropdown.")
                     self.settings_dropdown_window = None # Ensure ref is cleared
             # No else needed for non-toggle, destruction was handled above or dropdown remains closed
 
 
-        font_option_text = f"⚙️ UI Font Size and Scale: {self._get_font_size_name()}"
-        #if self.font_size_changed_this_session:
-            #font_option_text += " (Restart needed for this change to take full effect)"
+
+
 
 
         # --- Define settings options ---
         settings_options = [
             # Format: (Text, Command, Is_Toggle_Flag)
-            ("🔄 Rescan All Mods, Configurations and Refresh UI", self.on_rescan_all_button_click_handler, False), # 🔄 = Refresh/Rescan
-            ("✨ Attempt to Show the Latest Installed Mods In The List First: " + ("On" if self.sort_by_install_date else "Off"), self.toggle_sort_by_install_date, True), # 📅 = Date/Time (for latest)
-            ("🚀 Show Transparent Switcher Window On Application Launch: " + ("On" if self.show_switcher_on_startup else "Off"), self.toggle_show_switcher_on_startup, True), # 🚀 = Launch/Startup
-            ("➖ Hide All Type and Country Categories On Application Launch: " + ("On" if self.collapse_categories_by_default else "Off"), self.toggle_collapse_categories_by_default, True), # ➖ = Collapse/Hide
+
+            ("SEPARATOR", "Information Display"),
+
             ("❓ Show Configs Without Vehicle Preview Images: " + ("On" if self.placeholder_settings else "Off"), self.toggle_placeholder_settings, True), # 🖼️ = Images (related to preview images) - changed from ⬜ to be more direct about images being the subject
-            ("👆 Double Clicking On a Vehicle Preview should: " + ("Replace the Current Vehicle" if self.middle_click_settings else "Add it to the Spawn Queue"), self.toggle_middle_click_settings, True), # 🖱️ = Mouse Click Action
             ("📁 Display Vehicle Folder Names Under Previews: " + ("On" if self.show_folder_settings else "Off"), self.toggle_show_folder_settings, False), # 📁 = Folder
+
+            ("✨ Attempt to Show the Latest Installed Mods In The List First: " + ("On" if self.sort_by_install_date else "Off"), self.toggle_sort_by_install_date, True), # 📅 = Date/Time (for latest)
+            ("📌 Display Pinned 'Favorites' Category: " + ("On" if self.show_pinned_favorites_category else "Off"), self.toggle_show_pinned_favorites_category, True), 
+
+            ("SEPARATOR", "Configuration List"),
+
+            ("👆 Double Clicking On a Vehicle Preview should: " + ("Replace the Current Vehicle" if self.middle_click_settings else "Add it to the Spawn Queue"), self.toggle_middle_click_settings, True), # 🖱️ = Mouse Click Action 
             ("↕️ 'Jump to page' Button Placement in Configuration List: " + ("Bottom" if self.jump_to_page_button_should_be_bottom else "Top"), self.toggle_jump_to_page_button_should_be_bottom, True), # ↕️ = Vertical Placement
-            (font_option_text, self.toggle_font_size, True),
-            #("🔧 Rebuild GUI (Experimental)", self.rebuild_gui, False), # <-- ADD THIS LINE
+            ("📜 Auto-close Configurations list when switching to BeamNG and back: " + ("Off" if self.leave_config_window_open else "On"), self.toggle_leave_config_window_open, True),            
+
+
+            ("SEPARATOR", "General Behavior and UI Settings"),
+
+            ("🚀 Show Transparent Switcher Window On Application Launch: " + ("On" if self.show_switcher_on_startup else "Off"), self.toggle_show_switcher_on_startup, True), # 🚀 = Launch/Startup
+            ("➖ Collapse All Type and Country Categories On Application Launch: " + ("On" if self.collapse_categories_by_default else "Off"), self.toggle_collapse_categories_by_default, True), # ➖ = Collapse/Hide            
+            (f"📚 Default Categorization mode: {self.default_categorization_mode}", self.toggle_default_categorization_mode, True),
+            (f"⚙️ UI Font Size and Scale: {self._get_font_size_name()}", self.toggle_font_size, True),
+
+
+            ("SEPARATOR", "Other Utilities"),
+
+            ("🔄 Rescan All Mods, Configurations and Refresh UI", self.on_rescan_all_button_click_handler, False), # 🔄 = Refresh/Rescan
+            ("🚮 Clear BeamNG's Vehicle Cache (May help with missing/incorrect textures)", self.delete_beam_vehicle_cache, False),
             ("❌ Close Settings Menu", self.do_nothing, False), # ❌ = Close/Exit
+
+
+            #("🔧 Rebuild GUI (Experimental)", self.rebuild_gui, False), # leave this commented out
         ]
 
+        print(f"📚 Default Categorization mode: {self.default_categorization_mode} SETTINGS DROPDOWN SEES")
         # --- Create and Pack the Content (Setting Buttons) ---
         # This determines the required size of the dropdown window
-        for option_text, command, is_toggle in settings_options:
-            dropdown_button = tk.Button(
-                self.settings_dropdown_window,
-                text=option_text,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda cmd=command, toggle=is_toggle: on_settings_option_click(cmd, toggle),
-                borderwidth=1,
-                relief="solid",
-                anchor="w", # Align text to the West (left)
-                padx=10,
-                pady=5,
-                bg="#555555",
-                fg="white",
-                activebackground="lightgrey", # Set hover colors directly
-                activeforeground="black"
-            )
-            dropdown_button.pack(fill="x", padx=2, pady=(1,0)) # Add a little padding
+        for option_item in settings_options: # Iterate through the modified list
+            if len(option_item) == 3:
+                # This is a BUTTON item
+                option_text, command, is_toggle = option_item # Unpack the button data
 
-            # Simplified hover using activebackground/activeforeground (Button handles this)
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button: btn.config(bg="#555555", fg="white"))
+                # --- Define Colors for these dropdown items ---
+                original_bg = "#555555"
+                original_fg = "#FFFFFF"
+
+                # Specific hover colors for these settings options
+                settings_item_hover_bg = "#d9d9d9"
+                settings_item_hover_fg = "black"
+
+                # --- Button Creation (initial bg/fg will be set by _bind_animated_hover) ---
+                dropdown_button = tk.Button(
+                    self.settings_dropdown_window, # Ensure this window/frame exists
+                    text=option_text,
+                    font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                    # The command lambda captures the specific command and toggle state for this button
+                    command=lambda cmd=command, toggle=is_toggle: on_settings_option_click(cmd, toggle),
+                    borderwidth=1,      # Keep specific styling for dropdown items
+                    relief="solid",
+                    anchor="w",         # Align text to the West (left)
+                    padx=10,
+                    pady=5
+
+                )
+
+                dropdown_button.config(
+                    activebackground=settings_item_hover_bg,
+                    activeforeground=settings_item_hover_fg
+                )
+
+                dropdown_button.pack(fill="x", padx=2, pady=(1,0)) # Add a little padding
+
+                # --- Apply Smooth Hover Animation using the modified binder ---
+                self._bind_animated_hover(
+                    button=dropdown_button,
+                    original_bg=original_bg,
+                    original_fg=original_fg,
+                    hover_target_bg=settings_item_hover_bg, # Custom hover BG
+                    hover_target_fg=settings_item_hover_fg, # Custom hover FG
+                    check_state=False,                      # Assuming these items are not disabled
+                    # No selected state needed for these settings options
+                    is_selected_initial=False,
+                    selected_bg=None,
+                    selected_fg=None
+                )
+
+
+            elif len(option_item) == 2:
+                marker, separator_name_text = option_item # Unpack the separator data
+                if marker == "SEPARATOR":
+                    # Create and pack the separator name label
+                    separator_label = tk.Label(
+                        self.settings_dropdown_window,
+                        text=separator_name_text,
+                        font=("Segoe UI", 10 + self.font_size_add, "italic"), # Slightly different font
+                        fg="#BBBBBB",  # Lighter text color for the separator name
+                        bg="#333333",  # Match dropdown background
+                        anchor="w",
+                        padx=10,
+                    )
+                    separator_label.pack(fill="x", padx=2, pady=(5, 0)) # pady=(extra_top_space, space_before_line)
+                    
+                    if self.dev_mode:
+                        separator_label.bind("<Button-3>", self.enter_command)
+
+                    # # Create and pack the separator line (a thin Frame)
+                    # separator_line = tk.Frame(
+                    #     self.settings_dropdown_window,
+                    #     height=1,        # Height of the line
+                    #     bg="#4A4A4A"     # Color of the line, slightly darker than text, lighter than deepest bg
+                    # )
+                    # separator_line.pack(fill="x", padx=5, pady=(0, 5)) # pady=(space_after_label, space_after_line)
+                
+                else:
+                    print(f"Warning: Encountered an unknown 2-element item in settings_options: {option_item}")
+            else:
+                print(f"Warning: Encountered an item with unexpected format in settings_options: {option_item}")
+
 
 
         # --- DYNAMIC POSITIONING - AFTER content is packed ---
@@ -5643,6 +6608,7 @@ class ConfigViewerApp:
 
 
 
+
     def do_nothing(self):
         """
         dummy function that does nothing
@@ -5651,29 +6617,52 @@ class ConfigViewerApp:
         
 
 
-
-
     def on_settings_button_right_click(self, event):
         """
         This function is called when the settings button is right-clicked.
         It triggers the self.toggle_console() function.
         """
         self.toggle_console()
+
+
+
         self.enable_debug_shortcuts = True
 
         if self.enable_debug_shortcuts:
 
 
             #self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window()) # <--- ADD THIS LINE
-            self.master.bind_all("<Control-j>", lambda event: self.show_hidden_vehicles_window()) #debug
-            self.master.bind_all("<Control-k>", lambda event: self.set_filter_to_view_all_and_turn_subset_off()) #debug
-            self.master.bind_all("<Control-l>", lambda event: self.open_isolated_folder_in_explorer()) #debug
-            self.master.bind_all("<Control-f>", lambda event: self.on_color_picker_replace_or_spawn()) #debug
-            self.master.bind_all("<Control-g>", lambda event: self.color_picker1()) #debug
-            self.master.bind_all("<Control-d>", lambda event: self.manual_gc_collect()) # Bind Ctrl+G to manual GC
-            self.master.bind_all("<Control-a>", lambda event: self.update_grid_layout()) #debug
-            self.master.bind_all("<Control-q>", lambda event: self.perform_search()) #debug      
-            self.master.bind_all("<Control-P>", lambda event: self.destroy_search_results_window()) #debug     
+
+            ### SHORTCUTS START HERE ###
+            self.master.bind_all("<Control-j>", lambda event: self.show_hidden_vehicles_window(), add='+') #debug
+            self.master.bind_all("<Control-k>", lambda event: self.set_filter_to_view_all_and_turn_subset_off(), add='+') #debug
+            self.master.bind_all("<Control-l>", lambda event: self.open_isolated_folder_in_explorer(), add='+') #debug
+            self.master.bind_all("<Control-f>", lambda event: self.on_color_picker_replace_or_spawn(), add='+') #debug
+            self.master.bind_all("<Control-g>", lambda event: self.color_picker1(), add='+') #debug
+            self.master.bind_all("<Control-d>", lambda event: self.manual_gc_collect(), add='+') # Bind Ctrl+G to manual GC
+            self.master.bind_all("<Control-s>", lambda event: self.update_grid_layout(), add='+') #debug
+            self.master.bind_all("<Control-q>", lambda event: self.perform_search(), add='+') #debug      
+            self.master.bind_all("<Control-P>", lambda event: self.destroy_search_results_window(), add='+') #debug
+            self.master.bind_all("<Control-h>", lambda event: self.force_clear_all_hover_effects(), add='+')     
+            self.master.bind_all("<Control-d>", lambda event: self.hide_sidebar_info(), add='+')
+            self.master.bind_all("<Control-x>", lambda event: self.toggle_show_pinned_favorites_category(called_via_shortcut=True), add='+')
+            self.master.bind_all("<Control-z>", lambda event: self.show_search_results_window(self.data), add='+')
+            #self.master.bind_all("<Control-w>", lambda event: self._move_cursor_away(), add='+')
+            #self.master.bind_all("<Control-k>", lambda event: self._restore_cursor(), add='+')
+            #self.master.bind_all("<Control-e>", lambda event: self.print_cursor_location(), add='+')
+            #self.master.bind_all("<Shift-a>", lambda event: self.show_search_results_window(final_list))
+
+
+
+
+            scanning_win = self.show_scanning_window(text="Debug Shortcuts Activated.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
 
 
         
@@ -5742,10 +6731,9 @@ class ConfigViewerApp:
                 self.perform_details_search()
             else:
                 # 4c. If search is empty, close/hide the main details window
-                print("DEBUG: Closing/Hiding details window via on_details_window_close()")
+                print("DEBUG: Closing/Hiding details window via close_details_window_from_x_button()")
                 # Ensure on_details_window_close correctly hides or destroys the window
-                self.details_window_intentionally_closed = True
-                self.on_details_window_close()
+                self.close_details_window_from_x_button()
             return # Return after handling details window
 
         # 5. If none of the above windows were active, clear the main search bar (if not empty)
@@ -5758,6 +6746,8 @@ class ConfigViewerApp:
         else:
              print("DEBUG: Main search bar already empty.")
         # No return needed here, it's the last step.
+
+
 
 
     def toggle_middle_click_settings(self):
@@ -5838,6 +6828,29 @@ class ConfigViewerApp:
         self.master.after(600, self.show_settings_dropdown)
 
         self.save_settings() # Save setting to file - ADDED
+
+
+    def toggle_leave_config_window_open(self):
+        """Toggles the 'Jump to page button location' setting and updates dropdown text."""
+
+        self.leave_config_window_open = not self.leave_config_window_open
+        
+        '''
+        if self.dev_mode:
+
+            scanning_win = self.show_scanning_window(text=f"self.leave_config_window_open = {self.leave_config_window_open}", dev_notif=True)
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+                '''
+
+        self.update_settings_dropdown_button_text()
+        self.save_settings()
+
 
 
 
@@ -5948,45 +6961,84 @@ class ConfigViewerApp:
         return True # Indicate it was a toggle action that needs refresh
 
 
-    def load_settings(self):
+    def toggle_default_categorization_mode(self):
+        if self.default_categorization_mode == 'Type':
+            self.default_categorization_mode = 'Country'
+            print(f"self.default_categorization_mode set to {self.default_categorization_mode}")
+
+        elif self.default_categorization_mode == 'Country':
+            self.default_categorization_mode = 'None'
+            print(f"self.default_categorization_mode set to {self.default_categorization_mode}")
+
+        elif self.default_categorization_mode == 'None':
+            self.default_categorization_mode = 'Type'
+            print(f"self.default_categorization_mode set to {self.default_categorization_mode}")
+
+        self.save_settings() # Save the new setting immediately
+
+
+
+
+    def delete_beam_vehicle_cache(self):
+        userfolder_root = (os.path.dirname(os.path.dirname(self.script_dir))) # Go up 2 levels (likely 0.35 or something like that)
+        folder_path = os.path.join(userfolder_root, "temp") # head to the temp folder
+        vehicle_cache_folder_to_delete = os.path.join(folder_path, "vehicles") # vehicles folder to target
+
+        operation_state = None
+        if os.path.exists(vehicle_cache_folder_to_delete):
+            if os.path.isdir(vehicle_cache_folder_to_delete):
+                print(f"Vehicle cache folder found. Proceeding with deletion...")
+                try:
+                    # Delete the entire directory tree
+                    shutil.rmtree(vehicle_cache_folder_to_delete)
+                    print(f"Successfully deleted: {vehicle_cache_folder_to_delete}")
+                    operation_state = "folder_deleted"
+                except OSError as e:
+                    # OSError can occur for various reasons (permissions, file in use, etc.)
+                    print(f"Error deleting folder '{vehicle_cache_folder_to_delete}': {e}")
+                    print(f"OSError deleting vehicle cache: {e}") # Also print to console for dev
+                    operation_state = "folder_cannot_be_deleted"
+            else:
+                print(f"Path '{vehicle_cache_folder_to_delete}' exists but is not a directory. No action taken.")
+                print(f"Warning: '{vehicle_cache_folder_to_delete}' is not a directory.")
+                operation_state = "folder_is_not_directory"
+        else:
+            print(f"Vehicle cache folder '{vehicle_cache_folder_to_delete}' does not exist. No action needed.")
+            operation_state = "folder_does_not_exist"
+
+            
+        if operation_state == "folder_deleted":    
+            scanning_win = self.show_scanning_window(text="BeamNG Vehicle Cache Cleared Successfully")
+
+        elif operation_state == "folder_cannot_be_deleted":
+            scanning_win = self.show_scanning_window(text="Could not clear BeamNG Vehicle Cache.\n" 
+                                                    "Try closing BeamNG first then try again.", medium=True)
+
+        elif operation_state == "folder_is_not_directory":
+            scanning_win = self.show_scanning_window(text="Could not clear BeamNG Vehicle Cache")
+
+        elif operation_state == "folder_does_not_exist":
+            scanning_win = self.show_scanning_window(text="BeamNG Vehicle Cache already cleared")
+
+        else:
+            scanning_win = self.show_scanning_window(text="Could not clear BeamNG Vehicle Cache")
+
+        
+        if scanning_win:
+
+            def close_scanning_window():
+
+                scanning_win.destroy()
+
+            scanning_win.after(5125, close_scanning_window)
+
+
+
+
+    def load_settings(self): # add the fav category
         """Loads settings from settings file, including collapse categories by default."""
-        default_show_switcher_on_startup = False
-        self.show_switcher_on_startup = default_show_switcher_on_startup
-        default_sort_by_install_date = False
-        self.sort_by_install_date = default_sort_by_install_date
-        # --- NEW: Default for collapse categories setting ---
-        default_collapse_categories_by_default = False
-        self.collapse_categories_by_default = default_collapse_categories_by_default
-        # --- NEW: Default for collapse categories setting ---
-        # --- NEW: Default for placeholder_settings setting ---
-        default_placeholder_settings = False
-        self.placeholder_settings = default_placeholder_settings
-
-        default_middle_click_settings = False
-        self.middle_click_settings = default_middle_click_settings
-
-        default_show_folder_settings = False
-        self.show_folder_settings = default_show_folder_settings
-
-        default_jump_to_page_button_should_be_bottom = True
-        self.jump_to_page_button_should_be_bottom = default_jump_to_page_button_should_be_bottom
-
-
-        default_font_size_add = 0
-        self.font_size_add = default_font_size_add
-
-        # --- NEW: Default for placeholder_settings setting ---
-
 
         print("\n--- load_settings() DEBUG ENTRY ---") # Debug entry
-        print(f"DEBUG: Initial self.show_switcher_on_startup: {self.show_switcher_on_startup}") # Debug initial value
-        print(f"DEBUG: Initial self.sort_by_install_date: {self.sort_by_install_date}") # Debug initial value - sort date
-        print(f"DEBUG: Initial self.collapse_categories_by_default: {self.collapse_categories_by_default}") # Debug initial value - collapse categories
-        print(f"DEBUG: Initial self.placeholder_settings: {self.placeholder_settings}") # Debug initial value - placeholder_settings
-        print(f"DEBUG: Initial self.middle_click_settings: {self.middle_click_settings}")
-        print(f"DEBUG: Initial self.show_folder_settings: {self.show_folder_settings}")
-        print(f"DEBUG: Initial self.jump_to_page_button_should_be_bottom: {self.jump_to_page_button_should_be_bottom}")
-        print(f"DEBUG: Initial self.font_size_add: {self.font_size_add}")
 
         try:
             if os.path.exists(self.settings_file_path):
@@ -6047,7 +7099,7 @@ class ConfigViewerApp:
 
                         elif line.startswith("middle_click_settings:"):
                             value_str = line[len("middle_click_settings:"):].strip().lower()
-                            print(f"DEBUG: middle_click_settings line found, value_str: '{value_str}'") # Debug - value_str for placeholder_settings
+                            print(f"DEBUG: middle_click_settings line found, value_str: '{value_str}'")
                             if value_str == "on":
                                 self.middle_click_settings = True
                             elif value_str == "off":
@@ -6057,7 +7109,7 @@ class ConfigViewerApp:
 
                         elif line.startswith("show_folder_settings:"):
                             value_str = line[len("show_folder_settings:"):].strip().lower()
-                            print(f"DEBUG: show_folder_settings line found, value_str: '{value_str}'") # Debug - value_str for placeholder_settings
+                            print(f"DEBUG: show_folder_settings line found, value_str: '{value_str}'")
                             if value_str == "on":
                                 self.show_folder_settings = True
                             elif value_str == "off":
@@ -6067,13 +7119,34 @@ class ConfigViewerApp:
 
                         elif line.startswith("jump_to_page_button_should_be_bottom:"):
                             value_str = line[len("jump_to_page_button_should_be_bottom:"):].strip().lower()
-                            print(f"DEBUG: jump_to_page_button_should_be_bottom, value_str: '{value_str}'") # Debug - value_str for placeholder_settings
+                            print(f"DEBUG: jump_to_page_button_should_be_bottom, value_str: '{value_str}'") 
                             if value_str == "on":
                                 self.jump_to_page_button_should_be_bottom = True
                             elif value_str == "off":
                                 self.jump_to_page_button_should_be_bottom = False
                             else:
                                 print(f"Warning: Invalid jump_to_page_button_should_be_bottom value: '{value_str}'. Using default.")
+
+                        elif line.startswith("leave_config_window_open:"):
+                            value_str = line[len("leave_config_window_open:"):].strip().lower()
+                            print(f"DEBUG: leave_config_window_open, value_str: '{value_str}'") 
+                            if value_str == "on":
+                                self.leave_config_window_open = True
+                            elif value_str == "off":
+                                self.leave_config_window_open = False
+                            else:
+                                print(f"Warning: Invalid leave_config_window_open value: '{value_str}'. Using default.")
+
+                        elif line.startswith("show_pinned_favorites_category:"):
+                            value_str = line[len("show_pinned_favorites_category:"):].strip().lower()
+                            print(f"DEBUG: show_pinned_favorites_category, value_str: '{value_str}'")
+                            if value_str == "on":
+                                self.show_pinned_favorites_category = True
+                            elif value_str == "off":
+                                self.show_pinned_favorites_category = False
+                            else:
+                                print(f"Warning: Invalid self.show_pinned_favorites_category: '{value_str}'. Using default.")
+
 
                         elif line.startswith("FontSizeAdd:"): 
                             value_str = line[len("FontSizeAdd:"):].strip() # Added: Extract the value part
@@ -6084,12 +7157,27 @@ class ConfigViewerApp:
                                 if loaded_size in [0, 2, 4]: # Your original check
                                     self.font_size_add = loaded_size
                                     print(f"  Loaded font size add value: {self.font_size_add}")
-                                else:
-                                    print(f"  Warning: Invalid FontSizeAdd value: '{value_str}'. Using default ({default_font_size_add}).")
-                                    self.font_size_add = default_font_size_add # Use the defined default
+                                #else:
+                                    #print(f"  Warning: Invalid FontSizeAdd value: '{value_str}'. Using default ({default_font_size_add}).")
+                                    #self.font_size_add = default_font_size_add # Use the defined default
                             except ValueError:
-                                print(f"  Warning: Invalid FontSizeAdd format: '{value_str}'. Using default ({default_font_size_add}).")
-                                self.font_size_add = default_font_size_add # Use the defined default
+                                print(f"  Warning: Invalid FontSizeAdd format: '{value_str}'. Using default ({self.font_size_add}).")
+                                #self.font_size_add = default_font_size_add # Use the defined default
+
+
+                        elif line.startswith("default_categorization_mode:"): 
+                            self.default_categorization_mode = line[len("default_categorization_mode:"):].strip() 
+                            print(f"DEBUG: default_categorization_mode line found, '{self.default_categorization_mode}'") # Optional: Add debug print here too
+                            try:
+
+                                    self.categorization_mode = self.default_categorization_mode
+                                    print(f"  Loaded default_categorization_mode value: {self.categorization_mode}")
+
+                            except Exception as e:
+                                print(f"  Warning: Could not load default categorization mode from file: '{self.default_categorization_mode}'. Using default cat mode ({self.categorization_mode}).")
+
+
+
 
                         else:
                             pass # Keep this for lines that don't match any setting
@@ -6099,14 +7187,7 @@ class ConfigViewerApp:
         except Exception as e:
             print(f"Error loading floating window position and settings: {e}")
 
-        print(f"DEBUG: Final self.show_switcher_on_startup value: {self.show_switcher_on_startup}") # Debug - final value
-        print(f"DEBUG: Final self.sort_by_install_date value: {self.sort_by_install_date}") # Debug - final value - sort date
-        print(f"DEBUG: Final self.collapse_categories_by_default value: {self.collapse_categories_by_default}") # Debug - final collapse categories value
-        print(f"DEBUG: Final self.placeholder_settings value: {self.placeholder_settings}") # Debug - final placeholder_settings value
-        print(f"DEBUG: Final self.middle_click_settings value: {self.middle_click_settings}") 
-        print(f"DEBUG: Final self.show_folder_settings value: {self.show_folder_settings}")
-        print(f"DEBUG: Final self.jump_to_page_button_should_be_bottom value: {self.jump_to_page_button_should_be_bottom}") 
-        print(f"DEBUG: Final self.font_size_add value: {self.font_size_add}") 
+
       
         
 
@@ -6119,13 +7200,13 @@ class ConfigViewerApp:
                 f.write(f"ShowSwitcherOnStartup: {'on' if self.show_switcher_on_startup else 'off'}\n")
                 f.write(f"SortByInstallDate: {'on' if self.sort_by_install_date else 'off'}\n")
                 f.write(f"CollapseCategoriesByDefault: {'on' if self.collapse_categories_by_default else 'off'}\n")
-                # --- NEW: Save Include No Preview Images Setting ---
                 f.write(f"PlaceholderSetting: {'on' if self.placeholder_settings else 'off'}\n")
-                # --- NEW: Save Include No Preview Images Setting ---
                 f.write(f"middle_click_settings: {'on' if self.middle_click_settings else 'off'}\n")
                 f.write(f"show_folder_settings: {'on' if self.show_folder_settings else 'off'}\n")
                 f.write(f"jump_to_page_button_should_be_bottom: {'on' if self.jump_to_page_button_should_be_bottom else 'off'}\n")
-
+                f.write(f"leave_config_window_open: {'on' if self.leave_config_window_open else 'off'}\n")
+                f.write(f"show_pinned_favorites_category: {'on' if self.show_pinned_favorites_category else 'off'}\n")
+                f.write(f"default_categorization_mode: {self.default_categorization_mode}\n")
                 f.write(f"FontSizeAdd: {self.font_size_add}\n")
 
                 if self.items_to_be_hidden or self.unhide_was_toggled_in_hidden_window:
@@ -6167,7 +7248,7 @@ class ConfigViewerApp:
 
 
     def create_item_count_label(self, bottom_frame):
-        self.item_count_label = tk.Label(bottom_frame, text="", bg="#333333", fg="lightgrey", font=("Segoe UI", 12+self.font_size_add)) # Dark bg, lightgrey fg
+        self.item_count_label = tk.Label(bottom_frame, text="", bg="#333333", fg="#d9d9d9", font=("Segoe UI", 12+self.font_size_add)) # Dark bg, lightgrey fg
         self.item_count_label.pack(side="right", padx=(10, 10))
 
     def setup_main_frame(self):
@@ -6222,10 +7303,6 @@ class ConfigViewerApp:
     def setup_sidebar_frame(self):
         print("--- DEBUG: ENTERING setup_sidebar_frame ---")
 
-        # Sidebar Frame (Main Grid) - CONTAINER FRAME - NO BG COLOR
-
-        #if self.hide_main_grid_and_sidebar_start_passed == 1: # Set the flag for subsequent calls - if startup has not passed  (false) 
-        #    return  # Exit function early on first call
         
         self.sidebar_frame = tk.Frame(self.main_frame, width=300, highlightthickness=1, highlightbackground="#333333", bg="#333333") # Changed sidebar_frame bg to "#333333" - MATCH TOP HALF - CHANGED BACK TO "#333333"
         print(f"DEBUG: Created self.sidebar_frame. Parent is: {self.sidebar_frame.master}") # ADD THIS
@@ -6242,6 +7319,9 @@ class ConfigViewerApp:
         self.sidebar_top_frame.pack(side="bottom", fill="both", expand=True, padx=0, pady=0) # sidebar_top_frame (Car Info) packed SECOND below it, side=BOTTOM
         # --- MODIFIED PACKING ORDER ---
         print("--- DEBUG: EXITING setup_sidebar_frame ---") 
+
+
+
 
     def setup_sidebar_top_frame_content(self):
 
@@ -6269,11 +7349,9 @@ class ConfigViewerApp:
         self.create_sidebar_info_labels(self.sidebar_top_frame, sidebar_padding)
         self.create_sidebar_zip_name_label(self.sidebar_top_frame, sidebar_padding)
 
-
     def setup_sidebar_bottom_frame_content(self):
 
-        #if self.hide_main_grid_and_sidebar_start_passed == 1: # Set the flag for subsequent calls - if startup has not passed  (false) 
-        #    return  # Exit function early on first call
+
 
         sidebar_padding = 10
         # Calculate the maximum width for the text itself, considering padding
@@ -6287,7 +7365,7 @@ class ConfigViewerApp:
             text="Constraints",
             font=("Segoe UI", 14+self.font_size_add, "bold"),
             bg="#333333",
-            fg="white",
+            fg="#FFFFFF",
             justify="center", 
             wraplength=max_text_width # Set maximum line length in pixels
         )
@@ -6368,6 +7446,7 @@ class ConfigViewerApp:
         # --- MODIFIED PACKING ORDER ---
 
 
+
     def _update_filters_label_status(self):
         """
         Checks the status of filter buttons and updates the "Filters" label accordingly.
@@ -6394,7 +7473,7 @@ class ConfigViewerApp:
             print("DEBUG: _update_filters_label_status - Enabling sidebar filter buttons.") # Debug
             for filter_name in filter_buttons:
                 button = filter_buttons[filter_name]
-                button.config(state=tk.NORMAL, fg="white") # Enable and set text color back to white
+                button.config(state=tk.NORMAL, fg="#FFFFFF") # Enable and set text color back to white
         # --- MODIFIED: Check conditions to disable sidebar filter buttons ---
 
 
@@ -6408,7 +7487,7 @@ class ConfigViewerApp:
             self.all_filters_all = False
 
         if self.all_filters_all:
-            self.sidebar_filters_label.config(fg="white", text="Constraints") # Default color and text
+            self.sidebar_filters_label.config(fg="#FFFFFF", text="Constraints") # Default color and text
 
             # --- MODIFICATION START: Conditionally close Search Results window when Constraints become inactive ---
             if self.filter_state == 0 and not self.search_var.get().strip() and not self.is_data_subset_active: # Check for View All, empty search, and no global filters
@@ -6453,52 +7532,85 @@ class ConfigViewerApp:
 
     def _add_filter_dropdown_elements(self, dropdown_frame, filter_options_data):
         """
-        Adds labels and buttons (acting as dropdowns) for each filter option to the frame.
+        Adds labels and buttons (acting as dropdowns) for each filter option to the frame,
+        WITH smooth hover animation and INSTANT visual reset on click.
         """
         dropdown_row = 0
-        dropdown_col = 0 # Column is always 0 for single column layout
-        self.sidebar_filter_buttons = {}  # To store button references
+        dropdown_col = 0
+        self.sidebar_filter_buttons = {}
 
-        button_style_args_constraints = { # Define button_style_args for constraint buttons
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white"
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF"
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args_constraints = {
+            "bg": original_bg, "fg": original_fg, "relief": tk.FLAT, "bd": 0,
+            "highlightthickness": 0, "highlightbackground": original_bg,
+            "activebackground": active_bg, "activeforeground": active_fg
+            # Font applied directly below
         }
 
-        def on_constraint_button_hover_enter(event):
-            if event.widget['state'] != tk.DISABLED: # --- ADDED CHECK: if button is NOT disabled
-                event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_constraint_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            if event.widget['state'] != tk.DISABLED: # --- ADDED CHECK: if button is NOT disabled
-                event.widget.config(bg=original_bg, fg=original_fg)
-
-
         for filter_name, options in filter_options_data.items():
-            label = tk.Label(dropdown_frame, text=f"{filter_name}:", font=("Segoe UI", 11+self.font_size_add, "bold"), bg="#333333", fg="lightgrey", anchor="w") # Dark grey bg for labels - CHANGED to "#333333" - MATCH TOP HALF
-            label.grid(row=dropdown_row, column=dropdown_col, sticky="w", padx=(0, 5), pady=(2, 5))  # Right padding for label, sticky='w' for left align
+            # --- Label Creation (Unchanged) ---
+            label = tk.Label(dropdown_frame, text=f"{filter_name}:", font=("Segoe UI", 11+self.font_size_add, "bold"), bg="#333333", fg="#d9d9d9", anchor="w")
+            label.grid(row=dropdown_row, column=dropdown_col, sticky="w", padx=(0, 5), pady=(2, 5))
 
-            # --- Replace OptionMenu with Button ---
+            # --- Get the actual command method dynamically ---
+            # It's crucial to get the method itself, not call it yet
+            try:
+                original_command_func = getattr(self, f"show_sidebar_{filter_name.lower()}_dropdown")
+            except AttributeError:
+                print(f"Error: Method show_sidebar_{filter_name.lower()}_dropdown not found!")
+                # Assign a dummy command to prevent errors
+                original_command_func = lambda: print(f"Missing command for {filter_name}")
+
+            # --- Create the Button (WITHOUT command initially) ---
             button = tk.Button(
                 dropdown_frame,
-                text=options[0],  # Initial text is the first option ("All...")
+                text=options[0],
                 font=("Segoe UI", 10+self.font_size_add),
-                command=lambda fn=filter_name.lower(): getattr(self, f"show_sidebar_{fn}_dropdown")(),  # Dynamic command
-                width=12, # Fixed width for buttons (adjust as needed)
-                **button_style_args_constraints # <--- APPLY BUTTON STYLES HERE
+                # command= set below using the wrapper
+                width=12,
+                **button_style_args_constraints
             )
-            button.grid(row=dropdown_row, column=dropdown_col+1, sticky="ew", padx=(0, 5), pady=(2, 5))  # Right padding for dropdown, sticky='ew' to fill cell horizontally
+            button.grid(row=dropdown_row, column=dropdown_col+1, sticky="ew", padx=(0, 5), pady=(2, 5))
 
-            button.bind("<Enter>", on_constraint_button_hover_enter) # Bind hover enter event
-            button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_constraint_button_hover_leave(event, bg, fg)) # Bind hover leave event
+            # --- Define the Command Wrapper ---
+            # This function will run when the button is clicked
+            def command_wrapper(btn=button, cmd=original_command_func, bg=original_bg, fg=original_fg):
+                try:
+                    # 1. Reset Appearance IMMEDIATELY
+                    if btn.winfo_exists() and btn['state'] == tk.NORMAL:
+                        # Instantly set foreground back
+                        btn.config(fg=fg)
+                        # Start animation back to original background
+                        # This cancels any highlight animation and starts the revert
+                        self._start_animation(btn, properties_to_animate={'bg':'original_bg', 'fg':'original_fg'})
+                except tk.TclError:
+                    pass # Widget might be gone
 
-            self.sidebar_filter_buttons[filter_name] = button  # Store button reference
+                # 2. Execute the Original Command Function
+                cmd() # Call the saved original command (e.g., self.show_sidebar_category_dropdown)
 
-            dropdown_row += 1 # Increment row after each label-button pair
+            # --- Assign the Wrapper to the Button's Command ---
+            button.config(command=command_wrapper)
+
+            # --- Apply Smooth Hover Animation (Still needed for Enter/Leave) ---
+            self._bind_animated_hover(
+                button=button,
+                original_bg=original_bg,
+                original_fg=original_fg,
+                hover_target_fg=hover_fg,
+                check_state=True # Still check state for hover effects
+            )
+
+            # --- Storing Reference (Unchanged) ---
+            self.sidebar_filter_buttons[filter_name] = button
+
+            dropdown_row += 1
 
 
             
@@ -6559,32 +7671,72 @@ class ConfigViewerApp:
 
 
     def _create_dropdown_option_buttons(self, scrollable_frame, current_options, button, dropdown_window):
-        """Creates and packs option buttons in the scrollable frame."""
-        for option in current_options:
-            bg_color = "#555555"
-            fg_color = "white"
-            current_button_text = button.cget("text")
-            if option == current_button_text:
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+        """Creates and packs option buttons in the scrollable frame with smooth hover."""
+        # This function is very similar to _create_bodystyle_option_buttons and _create_country_option_buttons
+        # The main difference is the command called (_on_name_dropdown_button_click)
 
-            dropdown_button = tk.Button(
+        # --- Define Colors ---
+        default_bg_color = "#555555"    # Normal, non-selected background
+        default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
+
+        selected_option_bg = self.global_highlight_color # Background for the currently "selected" option
+        selected_option_fg = "#FFFFFF"                   # Foreground for the "selected" option
+
+        # Specific hover colors for these dropdown items
+        dropdown_item_hover_bg = "#d9d9d9"
+        dropdown_item_hover_fg = "black"
+
+        # Get the text of the main button that opened this dropdown, to determine current selection
+        current_main_button_text = button.cget("text")
+
+        # Store references to the created buttons if the click handler needs to update them all
+        created_buttons_list = [] # Example
+
+        for option in current_options:
+            # --- Determine if this option is currently selected ---
+            is_selected = (option == current_main_button_text)
+
+            # --- Button Creation ---
+            # Initial bg/fg will be set by _bind_animated_hover based on is_selected
+            dropdown_option_button = tk.Button( # Renamed for clarity
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda opt=option, fname="name": self._on_name_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window),
-                borderwidth=1,
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command lambda captures necessary arguments for the click handler
+                command=lambda opt=option, main_btn=button, dd_win=dropdown_window: \
+                    self._on_name_dropdown_button_click(opt, fname="name", fbutton=main_btn, fdropdown_window=dd_win),
+                borderwidth=1,      # Keep specific styling
                 relief="solid",
                 anchor="w",
                 padx=10,
                 pady=2,
-                bg=bg_color,
-                fg=fg_color,
-                width=240
+                width=240 # If you need fixed width, keep it.
+                # bg and fg are now set by _bind_animated_hover
             )
-            dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+            # Set active colors (for instant click flash) - optional
+            dropdown_option_button.config(
+                activebackground=dropdown_item_hover_bg,
+                activeforeground=dropdown_item_hover_fg
+            )
+            # Apply fixed width if desired (as in original)
+            dropdown_option_button.config(width=240)
+
+
+            dropdown_option_button.pack(fill="x")
+            created_buttons_list.append(dropdown_option_button)
+
+            # --- Apply Smooth Hover Animation using the modified binder ---
+            self._bind_animated_hover(
+                button=dropdown_option_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG for these items
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG for these items
+                check_state=False,                    # Assuming these are not individually disabled
+                is_selected_initial=is_selected,      # Is this button initially "selected"?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
 
 
     def _on_name_dropdown_button_click(self, option_text, fname, fbutton, fdropdown_window):
@@ -6908,33 +8060,30 @@ class ConfigViewerApp:
             getattr(self, dropdown_attr_name).destroy()
 
     def _create_dropdown_base(self, button, dropdown_attr_name):
-        """Creates the base dropdown window, canvas, scrollbar, and frame (MODIFIED for scrolling)."""
+        """Creates the base dropdown window, canvas, scrollbar, and frame (MODIFIED for scrolling and animation)."""
         button_x = button.winfo_rootx()
         button_y = button.winfo_rooty()
-        button_height = button.winfo_height()
+        button_height = button.winfo_height() # Get button height for positioning
 
-        dropdown_window = tk.Toplevel(self.master)
+        dropdown_window = FadingToplevel(self.master, self, fade_in_duration_ms=0)
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
-        dropdown_window.geometry(f"+{button_x}+{button_y - 200}") # Initial position above to avoid flicker
         dropdown_window.config(bg="#333333")
-        dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+        highlight_thickness_val = 3
+        dropdown_window.config(highlightthickness=highlight_thickness_val, highlightbackground="#666666")
 
-
-
+        canvas_height_val = 410
         if self.font_size_add == 0:
-            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=180, height=410) # dropdown width other dropdowns
-
+            canvas_width_val = 180
         elif self.font_size_add == 2:
-            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=170, height=410)
-
+            canvas_width_val = 170
         elif self.font_size_add == 4:
-            canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=160, height=410)
-
-
+            canvas_width_val = 160
+        
+        canvas = tk.Canvas(dropdown_window, bg="#444444", highlightthickness=0, width=canvas_width_val, height=canvas_height_val)
 
         scrollbar = tk.Scrollbar(dropdown_window, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="#333333") # modify width and height here for dropdown
+        scrollable_frame = tk.Frame(canvas, bg="#333333")
 
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -6946,23 +8095,55 @@ class ConfigViewerApp:
         )
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 
-        # --- MODIFIED: Bind Mousewheel only on Canvas Enter/Leave ---
+        # --- Animation Setup ---
+        scrollbar_width_estimate = 17 # A common estimate for Tkinter scrollbars
+        target_win_width = canvas_width_val + scrollbar_width_estimate + (2 * highlight_thickness_val)
+        target_win_height = canvas_height_val + (2 * highlight_thickness_val)
+
+        anim_fixed_x = button_x
+        initial_anim_height = 1 # Define initial height for animation start
+
+        # CORRECTED: Calculate anim_anchor_y for the dropdown's top edge.
+        # To have the dropdown's bottom meet the button's top edge initially:
+        # bottom_of_dropdown_at_start = anim_anchor_y + initial_anim_height
+        # We want bottom_of_dropdown_at_start == button_y
+        # So, anim_anchor_y + initial_anim_height = button_y
+        # Therefore:
+        anim_anchor_y = button_y - initial_anim_height
+
+        # Set initial geometry for animation (very small height, at final position and width)
+        dropdown_window.geometry(f"{target_win_width}x{initial_anim_height}+{anim_fixed_x}+{anim_anchor_y}")
+        dropdown_window.update_idletasks() # Ensure geometry is processed
+
+        animation_step = 40  # Pixels per step
+        animation_delay = 10 # Milliseconds between steps
+
+        self._animate_window_height(
+            window=dropdown_window,
+            target_height=target_win_height,
+            current_height=initial_anim_height, # Start animation from this height
+            step=animation_step,
+            delay=animation_delay,
+            fixed_x=anim_fixed_x,
+            final_width=target_win_width,
+            anchor_y=anim_anchor_y,       # Use the corrected Y for the top edge
+            anchor_point='top'            # Animate downwards
+        )
+        # --- End Animation Setup ---
+
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", lambda ev: self.on_dropdown_mousewheel(ev, canvas)))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        # --- MODIFIED: Bind Mousewheel only on Canvas Enter/Leave ---
 
-        def on_dropdown_canvas_enter(event, canvas):
-            canvas.focus_set()
-
-        dropdown_window.bind("<FocusOut>", lambda event, fname="name": self.destroy_sidebar_filter_dropdown(fname))
+        dropdown_window.bind("<FocusOut>", lambda event, name_to_close=dropdown_attr_name: self.destroy_sidebar_filter_dropdown(name_to_close))
         setattr(self, dropdown_attr_name, dropdown_window)
         return scrollable_frame, dropdown_window, canvas
+
 
 
     def _create_name_dropdown_content(self, scrollable_frame, dynamic_name_options, button, dropdown_window, canvas):
         """Creates the content of the name dropdown: search entry and options."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="#FFFFFF", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -7080,32 +8261,63 @@ class ConfigViewerApp:
         
 
     def _create_country_option_buttons(self, scrollable_frame, current_options, button, dropdown_window):
-        """Creates and packs option buttons in the scrollable frame for country."""
-        for option in current_options:
-            bg_color = "#555555"
-            fg_color = "white"
-            current_button_text = button.cget("text")
-            if option == current_button_text:
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+        """Creates and packs option buttons in the scrollable frame for country with smooth hover."""
 
-            dropdown_button = tk.Button(
+        # --- Define Colors ---
+        default_bg_color = "#555555"    # Normal, non-selected background
+        default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
+
+        selected_option_bg = self.global_highlight_color # Background for the currently "selected" option
+        selected_option_fg = "#FFFFFF"                   # Foreground for the "selected" option
+
+        # Specific hover colors for these dropdown items
+        dropdown_item_hover_bg = "#d9d9d9"
+        dropdown_item_hover_fg = "black"
+
+        # Get the text of the main button that opened this dropdown, to determine current selection
+        current_main_button_text = button.cget("text")
+
+        for option in current_options:
+            # --- Determine if this option is currently selected ---
+            is_selected = (option == current_main_button_text)
+
+            # --- Button Creation ---
+            # Initial bg/fg will be set by _bind_animated_hover based on is_selected
+            dropdown_option_button = tk.Button( # Renamed to avoid confusion
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda opt=option, fname="country": self._on_country_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window), # Call _on_country_dropdown_button_click
-                borderwidth=1,
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command lambda captures necessary arguments for the click handler
+                command=lambda opt=option, main_btn=button, dd_win=dropdown_window: \
+                    self._on_country_dropdown_button_click(opt, fname="country", fbutton=main_btn, fdropdown_window=dd_win),
+                borderwidth=1,      # Keep specific styling
                 relief="solid",
                 anchor="w",
                 padx=10,
                 pady=2,
-                bg=bg_color,
-                fg=fg_color,
-                width=240
+                width=240 # If you need fixed width, keep it. Otherwise, remove for dynamic width.
+                # bg and fg are now set by _bind_animated_hover
             )
-            dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+            # Set active colors (for instant click flash) - optional
+            dropdown_option_button.config(
+                activebackground=dropdown_item_hover_bg,
+                activeforeground=dropdown_item_hover_fg
+            )
+
+            dropdown_option_button.pack(fill="x")
+
+            # --- Apply Smooth Hover Animation using the modified binder ---
+            self._bind_animated_hover(
+                button=dropdown_option_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG for these items
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG for these items
+                check_state=False,                    # Assuming these are not individually disabled
+                is_selected_initial=is_selected,      # Is this button initially "selected"?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
 
         
 
@@ -7127,7 +8339,7 @@ class ConfigViewerApp:
     def _create_country_dropdown_content(self, scrollable_frame, dynamic_country_options, button, dropdown_window, canvas):
         """Creates the content of the country dropdown: search entry and options."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="#FFFFFF", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -7235,13 +8447,75 @@ class ConfigViewerApp:
         return button_x, button_y
 
     def _create_dropdown_window(self, master, button_x, button_y):
-        """Creates the toplevel dropdown window."""
-        dropdown_window = tk.Toplevel(master)
+        """
+        Creates and animates the toplevel dropdown window.
+        Its target size is determined based on self.font_size_add.
+        The window's top edge will be at button_y - 250, and it will animate downwards.
+
+        Args:
+            master: The Tkinter master widget for the FadingToplevel.
+            button_x (int): The target X coordinate for the dropdown's top-left corner.
+            button_y (int): The Y coordinate used to calculate the dropdown's top edge.
+                            The dropdown's top will be at button_y - 250.
+        """
+        dropdown_window = FadingToplevel(master, self, fade_in_duration_ms=0) # Use 'master' arg
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
-        dropdown_window.geometry(f"+{button_x}+{button_y - 250}")  # Position below button, increased offset
         dropdown_window.config(bg="#444444")
-        dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+        highlight_thickness_val = 3
+        dropdown_window.config(highlightthickness=highlight_thickness_val, highlightbackground="#666666")
+
+        # --- Determine target dimensions based on self.font_size_add (for internal content) ---
+        # Assuming these are canvas dimensions, and window needs to fit them + scrollbar + border
+        canvas_height_val = 410 # Fixed height from your snippet
+
+        if self.font_size_add == 0:
+            canvas_width_val = 180
+        elif self.font_size_add == 2:
+            canvas_width_val = 170
+        elif self.font_size_add == 4:
+            canvas_width_val = 160
+
+        # Estimate scrollbar width (assuming one might be present, similar to _create_dropdown_base)
+        scrollbar_width_estimate = 17 # A common estimate
+        
+        # Calculate target window dimensions
+        # Target width = canvas width + scrollbar width + 2 * border thickness
+        target_width = canvas_width_val + scrollbar_width_estimate + (2 * highlight_thickness_val)
+        # Target height = canvas height + 2 * border thickness
+        target_height = canvas_height_val + (2 * highlight_thickness_val)
+        # --- End Dimension Determination ---
+
+        # --- Animation Setup ---
+        anim_fixed_x = button_x
+        initial_anim_height = 1  # Start animation with a 1-pixel height
+
+        # CORRECTED: Calculate anim_anchor_y for the dropdown's top edge.
+        # To have the dropdown's bottom meet the button's top edge initially (when dropdown height is initial_anim_height):
+        # anim_anchor_y (top of dropdown) = button_y (top of button) - initial_anim_height
+        anim_anchor_y = button_y - initial_anim_height
+
+        # Set the initial geometry for the animation:
+        # Positioned at anim_fixed_x, anim_anchor_y (which is just above button's top),
+        # with target_width and initial_anim_height.
+        dropdown_window.geometry(f"{target_width}x{initial_anim_height}+{anim_fixed_x}+{anim_anchor_y}")
+        dropdown_window.update_idletasks()  # Ensure geometry is processed before animation starts
+
+        animation_step = 40   # Pixels per step
+        animation_delay = 10  # Milliseconds between steps
+
+        self._animate_window_height(
+            window=dropdown_window,
+            target_height=target_height,
+            current_height=initial_anim_height,
+            step=animation_step,
+            delay=animation_delay,
+            fixed_x=anim_fixed_x,
+            final_width=target_width,
+            anchor_y=anim_anchor_y,       # Use the corrected Y for the top edge
+            anchor_point='top'            # Animate by growing height downwards
+        )
+        # --- End Animation Setup --
 
         return dropdown_window
 
@@ -7270,7 +8544,7 @@ class ConfigViewerApp:
     def _create_search_bar(self, scrollable_frame, search_var):
         """Creates the search bar entry in the scrollable frame."""
         search_bar_width = 18
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=search_bar_width)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="#FFFFFF", fg="black", width=search_bar_width)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
 
@@ -7291,32 +8565,77 @@ class ConfigViewerApp:
         return update_options # Return the function to be bound
 
     def _create_dropdown_buttons(self, scrollable_frame, options, button_widget, dropdown_width, on_dropdown_button_click):
-        """Creates the dropdown buttons in the scrollable frame."""
-        for option in options:
-            bg_color = "#555555"
-            fg_color = "white"
-            current_button_text = button_widget.cget("text")
-            if option == current_button_text:
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+        """Creates the dropdown buttons in the scrollable frame with smooth hover."""
 
-            dropdown_button = tk.Button(
+        # --- Define Colors ---
+        default_bg_color = "#555555"    # Normal, non-selected background
+        default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
+
+        selected_option_bg = self.global_highlight_color # Background for the currently "selected" option
+        selected_option_fg = "#FFFFFF"                   # Foreground for the "selected" option
+
+        # Specific hover colors for these dropdown items
+        dropdown_item_hover_bg = "#d9d9d9"
+        dropdown_item_hover_fg = "black"
+
+        # Get the text of the main button that opened this dropdown, to determine current selection
+        current_main_button_text = button_widget.cget("text")
+
+        # Store references to the created buttons if the on_dropdown_button_click needs to update them all
+        # You might want to pass a list to this function to populate, or handle it in the caller
+        created_buttons_list = [] # Example
+
+        for option in options:
+            # --- Determine if this option is currently selected ---
+            is_selected = (option == current_main_button_text)
+
+            # --- Button Creation ---
+            # Initial bg/fg will be set by _bind_animated_hover based on is_selected
+            dropdown_option_button = tk.Button( # Renamed for clarity
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda opt=option: on_dropdown_button_click(opt),
-                borderwidth=1,
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command lambda captures the option for the click handler
+                command=lambda opt=option: on_dropdown_button_click(opt), # Uses the passed click handler
+                borderwidth=1,      # Keep specific styling
                 relief="solid",
                 anchor="w",
                 padx=10,
                 pady=2,
-                bg=bg_color,
-                fg=fg_color,
-                width=240
+                #width=dropdown_width, # Use the passed dropdown_width argument
+                width=240 # Or keep fixed if dropdown_width isn't always what you want here
+                # bg and fg are now set by _bind_animated_hover
             )
-            dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+
+            # Apply width if provided and valid
+            if dropdown_width is not None and isinstance(dropdown_width, int) and dropdown_width > 0:
+                 dropdown_option_button.config(width=dropdown_width)
+            else:
+                 # If fixed width is desired when dropdown_width is not applicable:
+                 # dropdown_option_button.config(width=240) # Example fixed width
+                 pass # Or let it auto-size based on text
+
+            # Set active colors (for instant click flash) - optional
+            dropdown_option_button.config(
+                activebackground=dropdown_item_hover_bg,
+                activeforeground=dropdown_item_hover_fg
+            )
+
+            dropdown_option_button.pack(fill="x")
+            created_buttons_list.append(dropdown_option_button) # Add to list
+
+            # --- Apply Smooth Hover Animation using the modified binder ---
+            self._bind_animated_hover(
+                button=dropdown_option_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG for these items
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG for these items
+                check_state=False,                    # Assuming these are not individually disabled
+                is_selected_initial=is_selected,      # Is this button initially "selected"?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
 
 
     def _on_dropdown_button_click_for_brands(self, option_text, filter_name, button_widget, dropdown_window):
@@ -7578,6 +8897,11 @@ class ConfigViewerApp:
         self.master.bind_all('<KeyPress-Alt_R>', self.prevent_alt_freeze)
 
 
+        if self.dev_mode:
+            self.master.bind_all("<+>", lambda event: self.focus_beamng_window())
+            self.master.bind_all("<Control-P>", lambda event: self.update_grid_layout())
+
+
         self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window()) # <--- ADD THIS LINE
         self.master.bind_all("<Control-Y>", lambda event: self.focus_beamng_window()) 
 
@@ -7628,10 +8952,16 @@ class ConfigViewerApp:
             # Optionally, you could call update_main_focus_flag() here too,
             # but the direct set fulfills the request. If you called the update
             # function, it would also result in False because window_has_os_focus is False.
+            self.on_main_window_click(event, called_to_destroy=True)
+            print("cursor restored from focus out")
+
+
         elif event is None:
             print("--- Window <FocusOut> likely triggered programmatically ---")
             self.window_has_os_focus = False
             self.main_search_entry_widget_focused_but_window_not_focus = False
+            print("cursor restored from focus out")
+
             print(f"Window lost focus (programmatic). Flag forced to FALSE.")
 
 
@@ -8112,8 +9442,9 @@ class ConfigViewerApp:
             print("Warning: switch_to_beamng_button not created yet, cannot update label.")
 
 
-        # --- Permanent Bindings (kept as requested) ---
+
         # These ensure Ctrl+Y always works, regardless of the list passed to _update_emm_binding
+
         self.master.bind_all("<Control-y>", lambda event: self.focus_beamng_window())
         self.master.bind_all("<Control-Y>", lambda event: self.focus_beamng_window())
 
@@ -8158,7 +9489,7 @@ class ConfigViewerApp:
             #print(f"New position: x={current_x}, y={current_y}")
             #print(f"New size: width={current_width}, height={current_height}")
 
-            self.on_main_window_click(event)
+            self.on_main_window_click(event, called_to_destroy=False)
 
             # Update previous position and size to the current ones
             self.prev_master_x = current_x
@@ -8176,34 +9507,34 @@ class ConfigViewerApp:
         with existence checks and conditional lifting for details window.
         """
         if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
-            print("DEBUG: lift_search_results_window - Search Results window exists and is active - lifting.")
+            #print("DEBUG: lift_search_results_window - Search Results window exists and is active - lifting.")
             self.search_results_window.lift()
 
         # --- MODIFIED: Check for details window existence AND if it's open before lifting ---
         if hasattr(self, 'details_window') and self.details_window and self.details_window.winfo_exists() and not self.details_window_closed:
-            print("DEBUG: lift_search_results_window - Details window exists and is OPEN - lifting and grabbing focus.")
+            #print("DEBUG: lift_search_results_window - Details window exists and is OPEN - lifting and grabbing focus.")
             self.details_window.lift()
             #self.details_window.grab_set() # Grab focus only if details window is open
             if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists():
                 self.current_detail_window.lift()
 
-        else:
-            print("DEBUG: lift_search_results_window - Details window NOT lifted (not existing or closed).")
+        #else:
+            #print("DEBUG: lift_search_results_window - Details window NOT lifted (not existing or closed).")
 
         # --- MODIFIED: Check for filters window existence before lifting ---
         if hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
-            print("DEBUG: lift_search_results_window - Filters window exists and Details window is CLOSED - lifting Filters window.")
+            #print("DEBUG: lift_search_results_window - Filters window exists and Details window is CLOSED - lifting Filters window.")
             self.filters_window.lift()
-        elif hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and self.is_details_window_open():
-             print("DEBUG: lift_search_results_window - Filters window exists BUT Details window is OPEN - NOT lifting Filters window (Details window has priority).")
+        #elif hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and self.is_details_window_open():
+             #print("DEBUG: lift_search_results_window - Filters window exists BUT Details window is OPEN - NOT lifting Filters window (Details window has priority).")
         elif hasattr(self, 'spawn_queue_window') and self.spawn_queue_window and self.spawn_queue_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
             self.spawn_queue_window.lift()
         elif hasattr(self, 'hidden_window') and self.hidden_window and self.hidden_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
             self.hidden_window.lift()
 
 
-        else:
-            print("DEBUG: lift_search_results_window - Filters window NOT lifted (not existing or Details window is open).")
+        #else:
+            #print("DEBUG: lift_search_results_window - Filters window NOT lifted (not existing or Details window is open).")
         # --- MODIFIED: Check for filters window existence before lifting ---
         
         # --- START: Dropdown menu destruction logic from on_main_window_click ---
@@ -8234,29 +9565,29 @@ class ConfigViewerApp:
         with existence checks and conditional lifting for details window.
         """
         if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
-            print("DEBUG: lift_search_results_window - Search Results window exists and is active - lifting.")
+            #print("DEBUG: lift_search_results_window - Search Results window exists and is active - lifting.")
             self.search_results_window.lift()
             self.lift_all_dropdowns()
 
         # --- MODIFIED: Check for details window existence AND if it's open before lifting ---
         if hasattr(self, 'details_window') and self.details_window and self.details_window.winfo_exists() and not self.details_window_closed:
-            print("DEBUG: lift_search_results_window - Details window exists and is OPEN - lifting and grabbing focus.")
+            #print("DEBUG: lift_search_results_window - Details window exists and is OPEN - lifting and grabbing focus.")
             self.details_window.lift()
             #self.details_window.grab_set() # Grab focus only if details window is open
             if hasattr(self, 'current_detail_window') and self.current_detail_window and self.current_detail_window.winfo_exists():
                 self.current_detail_window.lift()
 
-        else:
-            print("DEBUG: lift_search_results_window - Details window NOT lifted (not existing or closed).")
+        #else:
+            #print("DEBUG: lift_search_results_window - Details window NOT lifted (not existing or closed).")
 
         # --- MODIFIED: Check for filters window existence before lifting ---
         if hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
-            print("DEBUG: lift_search_results_window - Filters window exists and Details window is CLOSED - lifting Filters window.")
+            #print("DEBUG: lift_search_results_window - Filters window exists and Details window is CLOSED - lifting Filters window.")
             self.filters_window.lift()
             self.lift_all_dropdowns()
 
-        elif hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and self.is_details_window_open():
-             print("DEBUG: lift_search_results_window - Filters window exists BUT Details window is OPEN - NOT lifting Filters window (Details window has priority).")
+        #elif hasattr(self, 'filters_window') and self.filters_window and self.filters_window.winfo_exists() and self.is_details_window_open():
+             #print("DEBUG: lift_search_results_window - Filters window exists BUT Details window is OPEN - NOT lifting Filters window (Details window has priority).")
         elif hasattr(self, 'spawn_queue_window') and self.spawn_queue_window and self.spawn_queue_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
             self.spawn_queue_window.lift()
         elif hasattr(self, 'hidden_window') and self.hidden_window and self.hidden_window.winfo_exists() and not self.is_details_window_open(): # Added check for details window being closed
@@ -8265,8 +9596,8 @@ class ConfigViewerApp:
             self.lift_all_dropdowns()
 
 
-        else:
-            print("DEBUG: lift_search_results_window - Filters window NOT lifted (not existing or Details window is open).")
+        #else:
+            #print("DEBUG: lift_search_results_window - Filters window NOT lifted (not existing or Details window is open).")
         # --- MODIFIED: Check for filters window existence before lifting ---
 
 
@@ -8300,7 +9631,7 @@ class ConfigViewerApp:
 
         
         
-    def on_main_window_click(self, event):
+    def on_main_window_click(self, event, called_to_destroy=False):
         """Handles clicks on the main window to close dropdown menus and unfocus search bar."""
         if self.is_filter_dropdown_open():
             if not self.is_descendant_of(event.widget, self.filter_dropdown_window):
@@ -8314,22 +9645,25 @@ class ConfigViewerApp:
         if hasattr(self, 'settings_dropdown_window') and self.settings_dropdown_window and self.settings_dropdown_window.winfo_exists():
             if not self.is_descendant_of(event.widget, self.settings_dropdown_window) and event.widget != self.settings_button:
                 self.destroy_settings_dropdown()
+
+
         if self.is_category_list_dropdown_open(): # <-- ADDED THIS LINE
             if not self.is_descendant_of(event.widget, self.category_list_dropdown_window) and event.widget != self.category_list_button: # <-- AND THIS CONDITION
-                self.destroy_category_list_dropdown() # <-- AND THIS CALL
+                self.master.after(100, self.destroy_category_list_dropdown) # <-- AND THIS CALL
                 
 
         self.close_all_vehicle_dropdowns()   
 
-        if event.widget != self.search_entry:
-            self.master.focus_set()
+        if not called_to_destroy:
+            if event.widget != self.search_entry:
+                self.master.focus_set()
 
-        filter_names = ["brand", "name", "country", "author", "bodystyle", "type"]
-        for fname in filter_names:
-            if self.is_sidebar_filter_dropdown_open(fname):
-                dropdown_window = getattr(self, f"sidebar_{fname}_dropdown_window")
-                if not self.is_descendant_of(event.widget, dropdown_window):
-                    self.destroy_sidebar_filter_dropdown(fname)
+            filter_names = ["brand", "name", "country", "author", "bodystyle", "type"]
+            for fname in filter_names:
+                if self.is_sidebar_filter_dropdown_open(fname):
+                    dropdown_window = getattr(self, f"sidebar_{fname}_dropdown_window")
+                    if not self.is_descendant_of(event.widget, dropdown_window):
+                        self.destroy_sidebar_filter_dropdown(fname)
 
 
     def is_zip_search_dropdown_open(self):
@@ -8342,6 +9676,7 @@ class ConfigViewerApp:
         
     def show_search_mode_options_dropdown(self, event=None):
         if hasattr(self, 'search_mode_options_dropdown_window') and self.search_mode_options_dropdown_window and self.search_mode_options_dropdown_window.winfo_exists():
+            self.search_mode_options_dropdown_window.destroy()
             return
 
         if self.items_to_be_hidden:
@@ -8364,7 +9699,7 @@ class ConfigViewerApp:
         button_x = button.winfo_rootx()
         button_y = button.winfo_rooty() + button.winfo_height()
 
-        self.search_mode_options_dropdown_window = tk.Toplevel(self.master)
+        self.search_mode_options_dropdown_window = FadingToplevel(self.master, self)
         self.search_mode_options_dropdown_window.overrideredirect(True)
         self.search_mode_options_dropdown_window.tk.call('tk', 'scaling', 1.25)
         self.search_mode_options_dropdown_window.geometry(f"+{button_x}+{button_y}")
@@ -8378,7 +9713,7 @@ class ConfigViewerApp:
             if self.current_tooltip_window:
                 self.destroy_search_mode_option_tooltip_global_filter() # Destroy any existing tooltip
 
-            self.current_tooltip_window = tk.Toplevel(self.master)
+            self.current_tooltip_window = FadingToplevel(self.master, self)
             self.current_tooltip_window.overrideredirect(True) # No border for tooltip
             self.current_tooltip_window.tk.call('tk', 'scaling', 1.25)
 
@@ -8388,7 +9723,7 @@ class ConfigViewerApp:
             elif mode == "Configs":
                 tip_text = "Search for Config Name, Config File Name"
 
-            tooltip_label = tk.Label(self.current_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Darker bg for tooltip
+            tooltip_label = tk.Label(self.current_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "bold", "italic"), fg="#d9d9d9", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1) # Darker bg for tooltip
             tooltip_label.pack(padx=1, pady=1) # Padding inside tooltip
 
             # Position tooltip to the right of the button
@@ -8444,46 +9779,87 @@ class ConfigViewerApp:
 
             if self.search_mode == "Configs":
                 self.filters_button.config(
-                    command=None, # Disable command
-                    **disabled_button_style_args # Apply disabled style
+
+                    state=tk.DISABLED
                 )
                 self.filters_button.unbind("<Enter>") # Unbind hover
                 self.filters_button.unbind("<Leave>") # Unbind leave
                 self.filters_button.unbind("<Button-1>") # Unbind click
+
             else: # General mode
                 self.filters_button.config(
-                    command=self.show_filters_window, # Re-enable command
-                    **button_style_args # Apply normal style
-                )
-                on_button_hover_enter, on_button_hover_leave, on_button_click = self._create_button_event_handlers()
-                self._bind_button_events(self.filters_button, on_button_hover_enter, on_button_hover_leave, on_button_click) # Re-bind events
 
+                    state=tk.NORMAL
+                )
+
+                initial_bg = self._get_validated_current_color(self.filters_button, "bg")
+                initial_fg = self._get_validated_current_color(self.filters_button, "fg")
+
+                self._bind_animated_hover(
+                    button=self.filters_button,
+                    original_bg=initial_bg,
+                    original_fg=initial_fg,
+                    hover_target_fg="#FFFFFF",
+                    check_state=True
+                )
 
         search_modes = ["General", "Configs"]
-        dropdown_row = 0
-        for mode in search_modes:
-            bg_color = "#555555"
-            fg_color = "white"
-            if mode == self.search_mode:
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+        dropdown_row = 0 # Assuming this is used for layout if not pack
 
+        for mode in search_modes:
+            # --- Define Colors ---
+            default_bg_color = "#555555"
+            default_fg_color = "#FFFFFF"
+
+            selected_mode_bg = self.global_highlight_color
+            selected_mode_fg = "#FFFFFF" # Assuming white text on highlight
+
+            # Specific hover colors for these items
+            item_hover_bg = "#d9d9d9"
+            item_hover_fg = "black"
+
+            # --- Determine if this mode is currently selected ---
+            is_selected = (mode == self.search_mode) # Ensure self.search_mode exists and is current
+
+            # --- Button Creation ---
             dropdown_button = tk.Button(
-                self.search_mode_options_dropdown_window,
+                self.search_mode_options_dropdown_window, # Ensure this window exists
                 text=f"{mode}",
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda m=mode: on_search_mode_option_click(m),
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                command=lambda m=mode: on_search_mode_option_click(m), # Ensure this handler exists
                 borderwidth=1,
                 relief="solid",
                 anchor="w",
                 padx=10,
-                pady=5,
-                bg=bg_color,
-                fg=fg_color
+                pady=5
+                # bg and fg are set by _bind_animated_hover
+            )
+            # Set active colors (for instant click flash)
+            dropdown_button.config(
+                activebackground=item_hover_bg,
+                activeforeground=item_hover_fg
             )
             dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, m=mode: [btn.config(bg="lightgrey", fg="black"), show_search_mode_option_tooltip(m, btn)]) # Pass button widget to tooltip func
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: [btn.config(bg=original_bg, fg=original_fg), destroy_search_mode_option_tooltip()]) # Call destroy tooltip on leave
+
+            # --- Define Extra Commands for Tooltips ---
+            # Lambdas capture the current 'mode' and 'dropdown_button' for each iteration
+            enter_tooltip_command = lambda m=mode, btn=dropdown_button: show_search_mode_option_tooltip(m, btn)
+            leave_tooltip_command = lambda: destroy_search_mode_option_tooltip()
+
+            # --- Apply Smooth Hover Animation with Extra Commands ---
+            self._bind_animated_hover(
+                button=dropdown_button,
+                original_bg=default_bg_color,
+                original_fg=default_fg_color,
+                hover_target_bg=item_hover_bg,
+                hover_target_fg=item_hover_fg,
+                check_state=False, # Assuming not disabled
+                is_selected_initial=is_selected,
+                selected_bg=selected_mode_bg,
+                selected_fg=selected_mode_fg,
+                on_enter_extra_command=enter_tooltip_command, # Pass tooltip show command
+                on_leave_extra_command=leave_tooltip_command   # Pass tooltip destroy command
+            )
             dropdown_row += 1
 
         self.search_mode_options_dropdown_window.bind("<FocusOut>", self.destroy_search_mode_options_dropdown) # Bind focus out to window
@@ -8537,13 +9913,47 @@ class ConfigViewerApp:
 
 
 
-    def show_scanning_window(self, text="Changes detected, scanning..."):
+    def show_scanning_window(self, text="Changes detected, scanning...", tall=False, medium=False, click_dismiss=False, dev_notif=None):
         self.show_scanning_window_count += 1 # Increment the counter each time the function is called
 
-        
 
-        scanning_window = tk.Toplevel(self.master)
-        scanning_window.title("Ellexium's Mod Manager/Vehicle Selector")
+        if self.show_scanning_window_count <= 2 or \
+            "scan" in text.lower() or \
+            "disappears" in text.lower() or \
+            "loading" in text.lower() or \
+            "saving" in text.lower() or \
+            "rebuilding" in text.lower() or \
+            "updating" in text.lower() or \
+            "running" in text.lower() or \
+            "minimized" in text.lower() or \
+            "attempts" in text.lower() or \
+            "restarting" in text.lower() or \
+            "initial" in text.lower() or \
+            "dev notif" in text.lower() or \
+            "launching" in text.lower() or \
+            "empty" in text.lower():
+
+
+            #if self.dev_mode and "loading" in text.lower():
+            #    return
+            
+        
+            if self.show_scanning_window_count <= 2 or dev_notif:
+                scanning_window = tk.Toplevel(self.master)
+            else:
+                scanning_window = FadingToplevel(self.master, self, fade_in_duration_ms=0)
+        else:
+
+            scanning_window = FadingToplevel(self.master, self)
+
+
+
+        scanning_window.bind("<Button-1>", self.destroy_scanning_window)
+
+
+
+        
+        scanning_window.title("Ellexium's Advamced Vehicle Selector")
 
         icon_path = self.script_dir / "data/icon.png"
 
@@ -8564,18 +9974,28 @@ class ConfigViewerApp:
 
         # Check if text contains "restart the game" and adjust window size if it does
         if "restart the game" in text.lower(): # Convert text to lowercase for case-insensitive check
-            window_width = 700  # Smaller width
-            window_height = 140 # Smaller height
+            window_width = 700  # little wider than default
+            window_height = 140 # x2 regular scan win
 
         # Check if text contains "disappears" and adjust window size if it does
-        if "disappears" in text.lower(): # Convert text to lowercase for case-insensitive check
-            window_width = 600  # Smaller width
-            window_height = 140 # Smaller height
+        if "disappears" in text.lower() or "other categories" in text.lower(): # Convert text to lowercase for case-insensitive check
+            window_width = 600 
+            window_height = 140 
 
 
+        if medium:
+            window_width = 600 
+            window_height = 140 
 
-        # Set background color of the window
-        scanning_window.configure(bg="#333333")  # Set background color
+        if tall:
+            window_width = 700  
+            window_height = 160 
+
+
+        if dev_notif:
+            scanning_window.configure(bg="green")
+        else:
+            scanning_window.configure(bg="#333333")  # Set background color
 
         # Ensure the main window's geometry is updated
         self.master.update_idletasks()
@@ -8607,8 +10027,17 @@ class ConfigViewerApp:
             scanning_window.config(highlightthickness=5, highlightbackground="#555555") # Add border here
             # Schedule destroy_lingering_scanning_windows after 7 seconds
 
-            if not "scanning and refreshing data" in text.lower(): # Convert text to lowercase for case-insensitive check
-                scanning_window.after(7000, lambda window=scanning_window: window.destroy())
+            if "scanning and refreshing data" in text.lower(): # Convert text to lowercase for case-insensitive check
+                scanning_window.after(13000, lambda window=scanning_window: window.destroy())
+                # pass # do not destroy the window, something else will handle it
+
+            else:
+                if not click_dismiss:
+                    scanning_window.after(7000, lambda window=scanning_window: window.destroy())
+
+                #if click_dismiss:
+                #    scanning_window.bind("<Button-1>", self.destroy_warning_scanning_window)
+   
 
         # --- START: Added code to save position ---
         try:
@@ -8637,16 +10066,31 @@ class ConfigViewerApp:
         )
         lbl.pack(expand=True, padx=20, pady=20)
 
+        if click_dismiss:
+            self._start_fade_loop(lbl, self.warning_color_sidebar, self.default_sidebar_color)
+
+
         scanning_window.update()
 
         return scanning_window
 
-    def destroy_scanning_window(self):
+    def destroy_scanning_window(self, event=None):
         """Destroys the scanning window if it exists."""
-        self.scanning_window.destroy()
         
+        self.scanning_window.destroy()
+
+        if self.scanning_window:
+            self.scanning_window.destroy()
+            self.scanning_window = None
+
+        if self.warning_scanning_win:
+            self.warning_scanning_win.destroy()
+            self.warning_scanning_win = None
+
+
         return
 
+    
 
     ######################################################################
     #               start of interaction with beamng                  #
@@ -8761,8 +10205,10 @@ class ConfigViewerApp:
                 if not is_minimized:
                     win32gui.ShowWindow(beamng_window_handle, win32con.SW_SHOW) # SW_SHOW (5) activates
 
-            self.details_window_intentionally_closed = True
-            self.on_details_window_close() # Call your function regardless
+            if not self.leave_config_window_open:
+                self.details_window_intentionally_closed = True
+                
+                self.on_details_window_close() # Call your function regardless
             return True
 
 
@@ -9134,16 +10580,20 @@ class ConfigViewerApp:
         except FileNotFoundError:
 
             print(f"spawn queue file doesn't exist")
-            #messagebox.showerror("Error", f"Spawn queue file '{self.SPAWN_QUEUE_FILE}' not found.")
 
-            if scanning_window:
-                scanning_window.destroy()
-            scanning_win = self.show_scanning_window(text="Spawn queue empty.")
-            time.sleep(3.125)
-            scanning_win.destroy()
-            self.show_spawn_queue_window()
-            return
         
+            scanning_win = self.show_scanning_window(text="Spawn queue empty.")
+
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+                self.show_spawn_queue_window()
+            return
+
 
 
         if not self.is_beamng_running():
@@ -9300,9 +10750,12 @@ class ConfigViewerApp:
         pydirectinput.keyUp('ctrl')
         pydirectinput.keyUp('shift')
 
-        self.details_window_intentionally_closed = True        
+            
+        if not self.leave_config_window_open:
+            self.details_window_intentionally_closed = True        
 
-        self.master.after(2000, self.on_details_window_close)  # Go to the page before resize
+
+            self.master.after(2000, self.on_details_window_close)
         
 
         print(f"Transient Spawn Queue actions completed. ATTEMPT {attempt_number}") # Updated message
@@ -9343,16 +10796,36 @@ class ConfigViewerApp:
                 return self.run_spawn_queue_transient(retry=True, attempt_number=attempt_number + 1) # Recursive call, incrementing attempt_number
 
 
-    def spawn_random_vehicle(self, event=None):
+    def spawn_random_vehicle(self, event=None, vehicle_type=None, replace_current=False):
         """
-        Selects a random vehicle configuration from a whitelisted set of types
-        (car, truck, bus, van, aircraft), displays more informative feedback,
-        and attempts to spawn it using the transient spawn queue mechanism.
-        """
-        print("\n--- spawn_random_vehicle() ENTRY (Whitelisted + Better Info) ---")
+        Selects a random vehicle configuration from specified types,
+        displays informative feedback, prevents too many consecutive same-brand spawns,
+        optionally replaces the current vehicle, and uses the transient spawn queue.
 
-        allowed_types = {'car', 'truck', 'bus', 'van', 'aircraft'}
-        print(f"  Whitelisted types: {allowed_types}")
+        Args:
+            event: Optional event data (e.g., from Tkinter binding).
+            vehicle_type (str, optional): If specified, only vehicles of this type
+                                         (case-insensitive) are considered.
+                                         Defaults to None (uses the default whitelist).
+            replace_current (bool): If True, use 'replaceVehicle' instead of
+                                    'spawnNewVehicle'. Defaults to False.
+        """
+        print(f"\n--- spawn_random_vehicle() ENTRY (Type: {vehicle_type or 'Whitelisted'}, Replace: {replace_current}) ---")
+
+        # Determine allowed types
+        if vehicle_type:
+            # Use the specified type, making it lowercase and putting it in a set
+            try:
+                allowed_types = {vehicle_type.strip().lower()}
+                print(f"  Filtering for specific type: {allowed_types}")
+            except AttributeError:
+                 print(f"Error: Invalid vehicle_type provided: {vehicle_type}. Must be a string.")
+                 messagebox.showerror("Error", f"Invalid vehicle type specified: {vehicle_type}")
+                 return
+        else:
+            # Default whitelist
+            allowed_types = {'car', 'truck', 'bus', 'van', 'aircraft'}
+            print(f"  Using whitelisted types: {allowed_types}")
 
         # 1. Gather potential candidates (tuples) for allowed types
         #    Store: (spawn_cmd, info_data, folder_name, zip_file)
@@ -9361,6 +10834,11 @@ class ConfigViewerApp:
             print("Error: Vehicle data (original_full_data) not loaded.")
             messagebox.showerror("Error", "Vehicle data not loaded. Cannot spawn random vehicle.")
             return
+        # Ensure brand history list exists (important if __init__ wasn't run or was modified)
+        if not hasattr(self, '_last_spawned_brands'):
+            print("Warning: _last_spawned_brands not initialized. Initializing now.")
+            self._last_spawned_brands = []
+
 
         print("  Gathering and filtering potential candidates by type...")
         total_configs_checked = 0
@@ -9378,13 +10856,14 @@ class ConfigViewerApp:
                 if isinstance(config_tuple, (list, tuple)) and len(config_tuple) >= 5:
                     pic_path, spawn_cmd, zip_file, info_data, f_name = config_tuple
 
-                    vehicle_type = ""
+                    current_vehicle_type = ""
                     if info_data and isinstance(info_data, dict):
-                        vehicle_type = info_data.get("Type", "").strip().lower()
+                        # Ensure type matching is case-insensitive and ignores whitespace
+                        current_vehicle_type = info_data.get("Type", "").strip().lower()
                     else:
                         continue # Skip if no valid info_data
 
-                    if vehicle_type in allowed_types:
+                    if current_vehicle_type in allowed_types:
                         if spawn_cmd:
                             # Store the necessary tuple for later info retrieval
                             filtered_candidates.append((spawn_cmd, info_data, folder_name, zip_file))
@@ -9397,17 +10876,39 @@ class ConfigViewerApp:
         print(f"  Found {len(filtered_candidates)} candidates matching allowed types.")
 
         if not filtered_candidates:
-            print("Error: No valid candidates found for the allowed vehicle types.")
-            messagebox.showerror("Error", "No vehicles of the allowed types (Car, Truck, Bus, Van, Aircraft) found.")
+            type_str = f"type '{vehicle_type}'" if vehicle_type else "the allowed types"
+            print(f"Error: No valid candidates found for {type_str}.")
+            messagebox.showerror("Error", f"No vehicles of {type_str} found.")
             return
 
-        # 2. Choose a random candidate tuple
+        # 1.5. Apply consecutive brand filtering (before random choice)
+        eligible_candidates = filtered_candidates
+        forbidden_brand = None
+        # Check if the last two spawns were the same brand (case-insensitive)
+        if len(self._last_spawned_brands) == 2 and self._last_spawned_brands[0] and self._last_spawned_brands[0] == self._last_spawned_brands[1]:
+             forbidden_brand = self._last_spawned_brands[0] # Already stored lowercase
+             print(f"  Applying brand filter: Avoiding '{forbidden_brand}' due to consecutive spawns.")
+             # Filter the candidates, ensuring brand comparison is also lowercase
+             eligible_candidates = [
+                 cand for cand in filtered_candidates
+                 if cand[1].get("Brand", "").strip().lower() != forbidden_brand
+             ]
+             print(f"  Found {len(eligible_candidates)} candidates after brand filtering.")
+
+             # If filtering removed *all* candidates, fall back to the original list
+             # to avoid getting stuck if only one brand is available for the chosen type.
+             if not eligible_candidates:
+                 print(f"  Warning: Brand filtering removed all candidates. Falling back to allow '{forbidden_brand}'.")
+                 eligible_candidates = filtered_candidates # Use original list
+
+        # 2. Choose a random candidate tuple from the (potentially brand-filtered) list
         try:
-            chosen_candidate = random.choice(filtered_candidates)
+            # Use eligible_candidates which might be the same as filtered_candidates
+            chosen_candidate = random.choice(eligible_candidates)
             # Unpack the chosen candidate
             chosen_spawn_cmd, chosen_info_data, chosen_folder_name, chosen_zip_file = chosen_candidate
         except IndexError:
-            print("Error: Could not select a random candidate (filtered list empty unexpectedly).")
+            print("Error: Could not select a random candidate (list empty unexpectedly after filtering).")
             messagebox.showerror("Error", "Could not select a random vehicle from the allowed types.")
             return
         except Exception as e:
@@ -9415,7 +10916,7 @@ class ConfigViewerApp:
             messagebox.showerror("Error", f"An error occurred selecting a random vehicle: {e}")
             return
 
-        # 3. Determine the BEST display name for the message
+        # 3. Determine the BEST display name and update brand history
         brand_display = chosen_info_data.get("Brand", "").strip()
         pc_filename_base = self.extract_name_from_spawn_command(chosen_spawn_cmd) or "UnknownPC"
         config_display_name = pc_filename_base # Default to PC name
@@ -9447,30 +10948,50 @@ class ConfigViewerApp:
 
         print(f"  Selected vehicle for spawning: {vehicle_display_name_for_msg}")
 
+        # ---> Update Brand History <---
+        chosen_brand_lower = brand_display.lower() # Store lowercase for consistent comparison
+        self._last_spawned_brands.append(chosen_brand_lower)
+        if len(self._last_spawned_brands) > 2:
+            self._last_spawned_brands.pop(0) # Keep only the last two
+        print(f"  Updated brand history: {self._last_spawned_brands}")
+        # -----------------------------
+
 
         # 4. Prepare the spawn command (remove comments)
         prepared_spawn_cmd = ""
         try:
             modified_lines = []
             for line in chosen_spawn_cmd.splitlines():
+                # Remove comments like -- (USE...) or (USE...) if they exist
                 use_index = line.find('-- (USE')
                 if use_index != -1:
                     modified_lines.append(line[:use_index].strip())
-                elif line.strip().endswith(')'):
+                elif line.strip().endswith(')'): # Check for just (USE...) variant
                     use_index_alt = line.find('(USE')
-                    if use_index_alt != -1:
-                        modified_lines.append(line[:use_index_alt].strip())
+                    if use_index_alt != -1 and line.index(')', use_index_alt) == len(line.strip()) -1 : # Ensure it's at the end
+                         modified_lines.append(line[:use_index_alt].strip())
                     else:
-                        modified_lines.append(line.strip())
+                         modified_lines.append(line.strip()) # Keep line if (USE..) isn't the end comment
                 else:
                     modified_lines.append(line.strip())
-            prepared_spawn_cmd = '\n'.join(filter(None, modified_lines))
+            prepared_spawn_cmd = '\n'.join(filter(None, modified_lines)) # Join non-empty lines
 
             if not prepared_spawn_cmd:
                 print("Error: Prepared spawn command is empty after modification.")
                 messagebox.showerror("Error", "Failed to prepare the spawn command.")
                 return
-            print(f"  Prepared spawn command for queue: {prepared_spawn_cmd}")
+
+            # ---> Conditionally Replace Spawn Command <---
+            if replace_current:
+                if "spawnNewVehicle" in prepared_spawn_cmd:
+                    prepared_spawn_cmd = prepared_spawn_cmd.replace("spawnNewVehicle", "replaceVehicle")
+                    print("  Modified command to use 'replaceVehicle'.")
+                else:
+                    print("  Warning: 'spawnNewVehicle' not found in command, cannot replace.")
+            # -------------------------------------------
+
+            print(f"  Prepared spawn command for queue:\n---\n{prepared_spawn_cmd}\n---") # Print command for verification
+
         except Exception as e:
             print(f"Error preparing spawn command: {e}")
             messagebox.showerror("Error", f"Error preparing spawn command: {e}")
@@ -9479,21 +11000,48 @@ class ConfigViewerApp:
         # 5. Show "Attempting to spawn..." message with the better name
         scanning_window = None
         try:
+            action = "Replacing current vehicle with" if replace_current else "Attempting to spawn random vehicle:"
             scanning_window = self.show_scanning_window(
-                text=f"Attempting to spawn random vehicle:\n{vehicle_display_name_for_msg}\n" # Use the new display name
-                    "Please try not to click anything until this notification disappears."
+                text=f"{action}\n{vehicle_display_name_for_msg}\n"
+                     "Please try not to click anything until this notification disappears."
             )
             scanning_window.deiconify()
-            self.master.update_idletasks()
+            self.master.update_idletasks() # Assuming self.master is your Tk root or relevant widget
         except Exception as e:
             print(f"Warning: Could not show scanning window: {e}")
 
         # 6. Write the command to the transient spawn queue file
         try:
+            # Ensure the directory exists (optional, but good practice)
+            queue_dir = os.path.dirname(self.SPAWN_QUEUE_TRANSIENT_FILE)
+            if queue_dir: # Only create if not in the current directory
+                 os.makedirs(queue_dir, exist_ok=True)
+
+            # Write the standard header and the prepared command
             with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f:
-                f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
+                # This Lua code writes to a confirmation file *within the game's environment*
+                # Make sure the path mods/EllexiumModManager/data/ is accessible *by the game*
+                confirmation_path_lua = "mods/EllexiumModManager/data/commandconfirmation.txt"
+                # Escape backslashes for Lua string literal if needed (usually forward slashes work)
+                confirmation_path_lua = confirmation_path_lua.replace('\\', '\\\\')
+
+                f.write(f'local f = io.open("{confirmation_path_lua}", "w")\n')
+                f.write('if f then f:write("ok"); f:close(); end\n') # Write "ok" and close file
                 f.write(prepared_spawn_cmd + '\n')
-            print(f"  Random spawn command written to transient queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'")
+            print(f"  Spawn command written to transient queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'")
+
+            # **Crucially, delete any *old* confirmation file before triggering the spawn**
+            # Use the *actual* path relative to your Python script/working directory
+            # This path might be different from the Lua path depending on your setup
+            confirmation_file_python = confirmation_path_lua # Adjust if needed!
+            if os.path.exists(confirmation_file_python):
+                print(f"  Deleting existing confirmation file: {confirmation_file_python}")
+                try:
+                    os.remove(confirmation_file_python)
+                except OSError as e:
+                    print(f"  Warning: Could not delete existing confirmation file: {e}")
+
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to write to transient spawn queue file: {e}")
             print(f"ERROR: Failed to write spawn command: {e}")
@@ -9502,18 +11050,27 @@ class ConfigViewerApp:
 
         # 7. Trigger the spawn action
         print("  Triggering transient spawn queue execution...")
-        success = self.run_spawn_queue_transient(retry=False, attempt_number=1)
+        # Pass the *Python-accessible* path to the confirmation file if needed by run_spawn_queue_transient
+        success = self.run_spawn_queue_transient(retry=False, attempt_number=1) # Modify call if needed
 
         # 8. Handle result and close scanning window
         if success:
-            print("  Random vehicle spawn initiated successfully (BeamNG confirmation received).")
+            action_desc = "replacement" if replace_current else "spawn"
+            print(f"  Random vehicle {action_desc} initiated successfully (BeamNG confirmation received).")
         else:
-            print("  Random vehicle spawn failed or timed out (BeamNG confirmation not received).")
+            action_desc = "replacement" if replace_current else "spawn"
+            print(f"  Random vehicle {action_desc} failed or timed out (BeamNG confirmation not received).")
+            # Optionally show an error message to the user here
+            # messagebox.showwarning("Spawn Failed", "Could not confirm vehicle spawn/replacement in BeamNG.")
+
 
         if scanning_window and scanning_window.winfo_exists():
-            self.master.after(1000, lambda: scanning_window.destroy() if scanning_window and scanning_window.winfo_exists() else None)
+            # Add a slight delay before closing the window so the user can read it
+            delay_ms = 2000 if success else 3000 # Longer delay on failure?
+            self.master.after(delay_ms, lambda: scanning_window.destroy() if scanning_window and scanning_window.winfo_exists() else None)
 
-        print("--- spawn_random_vehicle() EXIT (Whitelisted + Better Info) ---")
+        print(f"--- spawn_random_vehicle() EXIT ---")
+
             
 
 ##################################################### SPAWNING VEHICLES 
@@ -9826,6 +11383,7 @@ class ConfigViewerApp:
         instead of copying to clipboard.
         """
         spawn_cmd = "core_multiSpawn.deleteVehicles()"
+        spawn_cmd2 = "dofile('mods/EllexiumModManager/data/delete_non_traffic.lua')"
 
 
         scanning_window = None # Initialize scanning_window outside try block
@@ -9840,6 +11398,7 @@ class ConfigViewerApp:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
                     f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
+                    f.write(spawn_cmd2 + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
                 self.run_spawn_queue_transient(retry=False, attempt_number=1)
@@ -9928,13 +11487,24 @@ class ConfigViewerApp:
                 
      
      
-    def on_spawn_traffic_vehicles_button_click(self):
+    def on_spawn_traffic_vehicles_button_click(self, event=None, type=None):
 
         """Handles click on the 'Spawn New' button in the details sidebar.
         Modified to write the spawn command to the transient spawn queue file
         instead of copying to clipboard.
         """
-        spawn_cmd = "gameplay_traffic.setupTraffic()"
+        
+        if type == "Both":
+            spawn_cmd = "gameplay_traffic.setupTraffic()"
+            spawn_cmd2 = "gameplay_parking.setupVehicles()"
+
+        elif type == "Traffic":
+            spawn_cmd = "gameplay_traffic.setupTraffic()"
+            spawn_cmd2 = ""
+
+        elif type == "Parked":
+            spawn_cmd = ""
+            spawn_cmd2 = "gameplay_parking.setupVehicles()"
 
 
         scanning_window = None # Initialize scanning_window outside try block
@@ -9949,6 +11519,7 @@ class ConfigViewerApp:
                 with open(self.SPAWN_QUEUE_TRANSIENT_FILE, 'w', encoding="utf-8") as f: # Open in write mode
                     f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
                     f.write(spawn_cmd + '\n') # Write command to file
+                    f.write(spawn_cmd2 + '\n') # Write command to file
                 #messagebox.showinfo("Spawn Queue", f"Configuration '{self.extract_name_from_spawn_command(spawn_cmd)}' added to transient spawn queue file: \n\n'{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Inform user
                 print(f"DEBUG: Command written to transient spawn queue file: '{self.SPAWN_QUEUE_TRANSIENT_FILE}'") # Debug
                 self.run_spawn_queue_transient(retry=False, attempt_number=1)
@@ -10146,10 +11717,14 @@ class ConfigViewerApp:
             scanning_win = None  # Initialize scanning_win
 
             scanning_win = self.show_scanning_window(text="Unable to spawn default vehicle configuration")
-            time.sleep(3.125)
             if scanning_win:
-                scanning_win.destroy()
-            return  # Exit on error
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
         if model_name:      
             spawn_cmd = f'core_vehicles.spawnNewVehicle("{model_name}", {{config = \'settings/default.pc\'}})'
@@ -10302,7 +11877,7 @@ class ConfigViewerApp:
 
 
         # **Spawn Queue Title**
-        title_label = tk.Label(dropdown_window, text="Spawn Queue", font=("Segoe UI", 13+self.font_size_add, "bold"), fg="white", bg="#333333") # Bold title
+        title_label = tk.Label(dropdown_window, text="Spawn Queue", font=("Segoe UI", 13+self.font_size_add, "bold"), fg="#FFFFFF", bg="#333333") # Bold title
         title_label.pack(pady=(10, 0)) # Add padding above the title
 
         main_frame = tk.Frame(dropdown_window, bg="#333333", padx=10, pady=10) # Main frame with padding
@@ -10344,27 +11919,73 @@ class ConfigViewerApp:
         button_frame = tk.Frame(dropdown_window, bg="#333333", pady=10) # Frame for buttons at bottom
         button_frame.pack(side="bottom", fill="x", anchor="s") # Anchor to bottom
 
-        # Define default button style and hover style
-        default_button_style = self.button_style_args if hasattr(self, 'button_style_args') else {'bg': '#444444', 'fg': 'white', 'relief': tk.RAISED, 'borderwidth': 2}
-        hover_button_style = {'bg': 'orange', 'fg': 'white', 'relief': tk.FLAT, 'borderwidth': 0}
+        button_original_style = {
+            'bg': '#555555',             # Default background
+            'fg': 'white',              # Default foreground
+            'activebackground': '#666666', # Standard active background
+            'activeforeground': 'white',  # Standard active foreground
+            'relief': tk.FLAT,          # Ensure flat relief for consistency
+            'bd': 0                     # Ensure no border for consistency
+            # Font applied below
+        }
+        # Try to merge/override with self.button_style_args if it exists
+        if hasattr(self, 'button_style_args') and isinstance(self.button_style_args, dict):
+            # Merge, giving preference to self.button_style_args but ensuring essentials
+            base_styles_to_keep = {'relief': tk.FLAT, 'bd': 0} # Ensure these are flat
+            merged_style = self.button_style_args.copy()
+             # Ensure active colors are present
+            if 'activebackground' not in merged_style: merged_style['activebackground'] = '#666666'
+            if 'activeforeground' not in merged_style: merged_style['activeforeground'] = 'white'
+            merged_style.update(base_styles_to_keep) # Ensure flatness overrides
+            button_original_style = merged_style
+        else:
+            print("Warning: self.button_style_args not found or invalid. Using default styles.")
 
-        spawn_button = tk.Button(button_frame, text="Spawn", font=("Segoe UI", 12+self.font_size_add), command=self.on_spawn_queue_spawn_button_click, **default_button_style)
-        clear_button = tk.Button(button_frame, text="Clear", font=("Segoe UI", 12+self.font_size_add), command=self.on_spawn_queue_clear_button_click, **default_button_style)
+        # Extract final original colors
+        original_bg = button_original_style['bg']
+        original_fg = button_original_style['fg']
+        hover_fg = "#FFFFFF" # Standard hover foreground
 
-        def on_enter(event):
-            event.widget.config(**hover_button_style)
 
-        def on_leave(event):
-            event.widget.config(**default_button_style)
+        # --- Create Spawn Button ---
+        spawn_button = tk.Button(
+            button_frame,
+            text="Spawn",
+            font=("Segoe UI", 12 + self.font_size_add),
+            command=self.on_spawn_queue_spawn_button_click, # Ensure method exists
+            **button_original_style # Apply the determined style
+        )
 
-        spawn_button.bind("<Enter>", on_enter)
-        spawn_button.bind("<Leave>", on_leave)
-        clear_button.bind("<Enter>", on_enter)
-        clear_button.bind("<Leave>", on_leave)
+        # --- Create Clear Button ---
+        clear_button = tk.Button(
+            button_frame,
+            text="Clear",
+            font=("Segoe UI", 12 + self.font_size_add),
+            command=self.on_spawn_queue_clear_button_click, # Ensure method exists
+            **button_original_style # Apply the determined style
+        )
 
+        # --- Bind Spawn Button using the helper function ---
+        self._bind_animated_hover(
+            button=spawn_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming always enabled
+        )
+
+        # --- Bind Clear Button using the helper function ---
+        self._bind_animated_hover(
+            button=clear_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming always enabled
+        )
 
         spawn_button.pack(side="left", fill="x", expand=True, padx=(10,5)) # Fill X and expand
         clear_button.pack(side="right", fill="x", expand=True, padx=(5,10)) # Fill X and expand
+
 
         # Populate the queue window with items
         self.populate_spawn_queue_window(scrollable_frame)
@@ -10533,33 +12154,59 @@ class ConfigViewerApp:
 
     def populate_spawn_queue_window(self, parent_frame):
         """Populates the Spawn Queue window with items from Spawn_Queue_Transient.txt."""
-        # --- NEW: Clear existing items in the scrollable frame ---
+        # --- Clear existing items ---
         for widget in parent_frame.winfo_children():
             widget.destroy()
-        self.spawn_queue_items = []
+        self.spawn_queue_items = [] # Reset the list tracking items
         print("DEBUG: populate_spawn_queue_window - Cleared existing items from scrollable frame.")
-        # --- NEW: Clear existing items in the scrollable frame ---
 
+        # --- Define Button Colors (Retrieve Safely ONCE before the loop) ---
+        try:
+            if not hasattr(self, 'button_style_args'):
+                 print("Warning: self.button_style_args missing. Using default button styles.")
+                 # Define a default style if necessary
+                 self.button_style_args = {'bg': '#555555', 'fg': 'white', 'activebackground': '#666666', 'activeforeground': 'white', 'relief': tk.FLAT, 'bd': 0}
+
+            remove_original_bg = self.button_style_args.get('bg', "#555555")
+            remove_original_fg = self.button_style_args.get('fg', "#FFFFFF")
+            # Ensure active colors exist for click feedback
+            if 'activebackground' not in self.button_style_args:
+                 self.button_style_args['activebackground'] = '#666666'
+            if 'activeforeground' not in self.button_style_args:
+                 self.button_style_args['activeforeground'] = 'white'
+
+        except Exception as e:
+             print(f"Error accessing self.button_style_args: {e}. Using default colors.")
+             remove_original_bg = "#555555"
+             remove_original_fg = "#FFFFFF"
+             # Reset style args to a safe default
+             self.button_style_args = {'bg': remove_original_bg, 'fg': remove_original_fg, 'activebackground': '#666666', 'activeforeground': 'white', 'relief': tk.FLAT, 'bd': 0}
+
+        remove_hover_fg = "#FFFFFF" # Standard hover foreground
+
+        # --- Read Commands ---
         try:
             with open(self.SPAWN_QUEUE_FILE, 'r', encoding="utf-8") as f:
                 commands = f.readlines()
         except FileNotFoundError:
+            print(f"Warning: Spawn queue file not found: {self.SPAWN_QUEUE_FILE}")
             commands = []
 
-        self.spawn_queue_items = []
 
+        # --- Loop through commands ---
         for command_line in commands:
             command_line = command_line.strip()
-            if not command_line:
+            if not command_line or command_line.lower().startswith("local"):
+                if command_line.lower().startswith("local"):
+                     print(f"DEBUG: Skipping line starting with 'local': {command_line}")
                 continue
 
-            if command_line.lower().startswith("local"): # Using lower() for case-insensitive check
-                print(f"DEBUG: Skipping line starting with 'local': {command_line}")
-                continue # Skip to the next line
-
+            # --- Create Frame for the item ---
             item_frame = tk.Frame(parent_frame, bg="#444444", pady=5)
+            # Pack the item_frame immediately so it appears
             item_frame.pack(fill="x", padx=10, pady=2)
 
+            # --- Extract Info (Regex logic unchanged) ---
             model_match = re.search(r'core_vehicles\.spawnNewVehicle\("([^"]+)"', command_line)
             config_match = re.search(r'config\s*=\s*\'([^\']+)\'', command_line)
             picture_path_match = re.search(r'USE 1\|\|\|(.*?)\|\|\|', command_line)
@@ -10568,21 +12215,28 @@ class ConfigViewerApp:
             config_path = config_match.group(1) if config_match else "settings/default.pc"
             config_name_base = os.path.splitext(os.path.basename(config_path))[0]
             picture_path_str = picture_path_match.group(1) if picture_path_match else None
-
             config_display_name = config_name_base
 
+            # --- Load Config Info (Unchanged) ---
             info_data = {}
             if picture_path_str:
-                config_info_path = self.get_config_info_path_from_picture_path(picture_path_str)
-                if config_info_path:
-                    info_data, _ = self._load_individual_info(config_info_path)
-                    config_display_name = info_data.get("Configuration", config_name_base)
+                try: # Add try-except around potentially failing file operations
+                    config_info_path = self.get_config_info_path_from_picture_path(picture_path_str)
+                    if config_info_path:
+                        info_data, _ = self._load_individual_info(config_info_path)
+                        config_display_name = info_data.get("Configuration", config_name_base)
+                except Exception as e:
+                    print(f"Error processing info for {picture_path_str}: {e}")
 
-            # --- Placeholder image loading ---**
-            placeholder_image = Image.new("RGB", (110, 60), "lightgrey")
-            placeholder_photo = ImageTk.PhotoImage(placeholder_image)
 
-            # --- Image Loading Logic ---
+            # --- Image Loading (Placeholder and Actual - Unchanged) ---
+            try:
+                placeholder_image = Image.new("RGB", (110, 60), "#d9d9d9")
+                placeholder_photo = ImageTk.PhotoImage(placeholder_image)
+            except Exception as e:
+                 print(f"Error creating placeholder image: {e}")
+                 placeholder_photo = None # Handle error gracefully
+
             image_photo = placeholder_photo
             if picture_path_str:
                 try:
@@ -10591,32 +12245,50 @@ class ConfigViewerApp:
                     image_photo = ImageTk.PhotoImage(image)
                 except FileNotFoundError:
                     print(f"Warning: Image file not found: {picture_path_str}")
+                    image_photo = placeholder_photo # Fallback to placeholder
                 except Exception as e:
                     print(f"Error loading image from {picture_path_str}: {e}")
+                    image_photo = placeholder_photo # Fallback
 
-            image_label = tk.Label(item_frame, image=image_photo, bg="#444444")
-            image_label.image = image_photo
-            image_label.pack(side="left", padx=5, pady=5)
+            # --- Image Label (Create and Pack) ---
+            if image_photo: # Only create label if image exists
+                image_label = tk.Label(item_frame, image=image_photo, bg="#444444")
+                image_label.image = image_photo # Keep reference
+                image_label.pack(side="left", padx=5, pady=5)
 
-            config_label = tk.Label(item_frame, text=config_display_name, font=("Segoe UI", 10+self.font_size_add, "bold"), fg="white", bg="#444444", anchor="w", wraplength=250, justify=tk.LEFT)
+            # --- Config Label (Create and Pack) ---
+            config_label = tk.Label(item_frame, text=config_display_name, font=("Segoe UI", 10+self.font_size_add, "bold"), fg="#FFFFFF", bg="#444444", anchor="w", wraplength=250, justify=tk.LEFT)
             config_label.pack(side="top", fill="x", padx=5)
 
-            # --- Hover Functionality for Remove Button ---
-            def on_enter(event):
-                event.widget.config(bg=self.global_highlight_color, fg="white") # Hover color
+            # --- Remove Button ---
+            # REMOVED: Old local handler functions
 
-            def on_leave(event):
-                event.widget.config(bg=self.button_style_args["bg"], fg=self.button_style_args["fg"]) # Revert to default
+            # Create the button
+            remove_button = tk.Button(
+                item_frame,
+                text="Remove",
+                font=("Segoe UI", 9 + self.font_size_add),
+                command=lambda cmd=command_line, frame=item_frame: self.on_remove_queue_item(cmd, frame),
+                **self.button_style_args # Apply common style (includes active colors)
+            )
 
-            remove_button = tk.Button(item_frame, text="Remove", font=("Segoe UI", 9+self.font_size_add), command=lambda cmd=command_line, frame=item_frame: self.on_remove_queue_item(cmd, frame), **self.button_style_args)
+            # Bind smooth hover effects using the helper
+            self._bind_animated_hover(
+                button=remove_button,
+                original_bg=remove_original_bg, # Use color retrieved before loop
+                original_fg=remove_original_fg, # Use color retrieved before loop
+                hover_target_fg=remove_hover_fg,
+                check_state=False # Assuming button is always enabled
+            )
+
+            # Pack the button AFTER creating and binding
             remove_button.pack(side="bottom", padx=5, pady=(2, 0), anchor="w", fill="x")
+            # REMOVED: Old direct bindings
 
-            remove_button.bind("<Enter>", on_enter)
-            remove_button.bind("<Leave>", on_leave)
-            # --- End Hover Functionality ---
-
+            # --- Store item info ---
             self.spawn_queue_items.append({'frame': item_frame, 'command': command_line, 'picture_path': picture_path_str})
 
+        print(f"DEBUG: populate_spawn_queue_window - Finished populating. Items created: {len(self.spawn_queue_items)}")
 
             
             
@@ -10802,7 +12474,6 @@ class ConfigViewerApp:
         self.sidebar_author_label.pack_forget() # Hide Author category
         self.sidebar_author_info_label.pack_forget() # Hide Author info
         # --- NEW: Hide Author Labels ---
-        
 
 
     def process_lines(self, lines, full_data, is_custom):
@@ -10820,7 +12491,8 @@ class ConfigViewerApp:
         return None
         
         
-    def update_sidebar_content(self, info_data, picture_path, zip_file, folder_name):
+
+    def update_sidebar_content(self, info_data, picture_path, zip_file, folder_name, hovered_category=None):
         """
         Updates sidebar with car name, picture, zip/folder name, and JSON details, now including Author.
         """
@@ -10871,7 +12543,7 @@ class ConfigViewerApp:
         finally:
              self.sidebar_loading_label.pack_forget()
 
-        self.update_sidebar_zip_name(zip_file, folder_name)
+        self.update_sidebar_zip_name(zip_file, folder_name, hovered_category=hovered_category)
 
         # --- NEW: Update Sidebar JSON Info Labels - CORRECT ASSIGNMENT (including Author) ---
         # Brand Name, Country, Derby Class are already set in sidebar_car_name_label
@@ -10930,7 +12602,7 @@ class ConfigViewerApp:
         # --- NEW: Author Section Update ---
             
             
-    def update_sidebar_zip_name(self, zip_file, folder_name):
+    def update_sidebar_zip_name(self, zip_file, folder_name, hovered_category=None):
             """Updates the zip file or folder name label in the sidebar to display ALL associated ZIPs."""
             if zip_file == "user_custom_configs":
                 if self.is_search_results_window_active:
@@ -10953,12 +12625,18 @@ class ConfigViewerApp:
 
                 if self.is_search_results_window_active:
                     text_to_display = f"{zip_list_text}\n({folder_name})"
+
                 if not self.is_search_results_window_active:
-                    text_to_display = f"{zip_list_text}\n({folder_name})\n(Right Click to hide/unhide vehicle)"
+                    if hovered_category=="Favorites":
+                        text_to_display = f"{zip_list_text}\n({folder_name})"
+                    else:
+                        text_to_display = f"{zip_list_text}\n({folder_name})\n(Right Click to hide/unhide vehicle)"
 
                 # --- NEW: Get all associated zip files from full_data ---
 
             self.sidebar_zip_name_label.config(text=text_to_display)
+            
+
 
     # ------------------------------------------------------------
     # Cycle Filter
@@ -10997,6 +12675,10 @@ class ConfigViewerApp:
     def on_scroll_debounce_complete_main_grid(self):
          return on_scroll_debounce_complete_main_grid(self)
         
+
+    def on_scroll_debounce_complete_main_grid_unhide_mouse(self):
+         return on_scroll_debounce_complete_main_grid_unhide_mouse(self)
+
     def is_descendant_of(self, widget, ancestor):
        return is_descendant_of(self, widget, ancestor)
 
@@ -11017,6 +12699,9 @@ class ConfigViewerApp:
    
     def on_mousewheel_search_results(self, event):
         """Handle mouse wheel events for smooth scrolling in the search results window."""
+
+
+
         if self.search_results_canvas.winfo_exists():
             if os.name == 'nt':
                 delta = int(-1 * (event.delta / 120))
@@ -11024,13 +12709,16 @@ class ConfigViewerApp:
                 delta = int(-1 * (event.delta))
             # --- MODIFIED: Initiate smooth scroll animation for search results ---
             self.start_smooth_scroll_search_results(delta, self.search_results_canvas) # Call smooth scroll for search results
-            #self.search_results_canvas.yview_scroll(delta, "units") # Original non-smooth scroll
+        
+
+
 
     def start_smooth_scroll_search_results(self, delta_units, canvas_sub):
         """Starts smooth scrolling animation for the search results canvas - NORMALIZED SPEED."""
         if self.scroll_animation_timer:
             self.search_results_window.after_cancel(self.scroll_animation_timer)  # Cancel any existing animation
-
+        
+        
         self.scroll_delta_units = delta_units  # Store delta in UNITS
 
         current_yview = canvas_sub.yview()  # Get current yview
@@ -11063,34 +12751,133 @@ class ConfigViewerApp:
         self.scrollbar_thumb_start_y = self.custom_scrollbar_canvas.coords(self.scrollbar_thumb)[1]
         self.scrollbar_mouse_start_y = event.y
 
+        self._last_drag_event_time = time.time()
+        self._last_drag_event_y = event.y
+
+
+        if self._throttled_after_id:
+            self.canvas.after_cancel(self._throttled_after_id)
+            self._throttled_after_id = None
+        self._scroll_pending = False
+
+
+
 
     def custom_scrollbar_drag(self, event):
-        """Drag thumb and update canvas view."""
+        """Drag thumb and update canvas view (throttled with dynamic FPS)."""
         if not self.scrollbar_thumb_dragging:
             return
 
+        current_time = time.time()
         mouse_y = event.y
-        delta_y = mouse_y - self.scrollbar_mouse_start_y
-        new_thumb_y = self.scrollbar_thumb_start_y + delta_y
+        
+        # --- Calculate drag speed and adjust throttle ---
+        delta_t = current_time - self._last_drag_event_time
+        delta_y_for_speed = mouse_y - self._last_drag_event_y
 
-        canvas_height = self.canvas.winfo_height()
-        scroll_range = self.canvas.bbox("all")
-        if scroll_range:
-            scrollable_height = scroll_range[3] - scroll_range[1]
+        current_speed = 0.0
+        if delta_t > self.min_delta_t_for_speed_calc: # Ensure delta_t is not too small
+            current_speed = abs(delta_y_for_speed) / delta_t # Pixels per second
+        elif abs(delta_y_for_speed) > 0: # Movement happened even if delta_t is tiny
+            current_speed = self.speed_threshold_high + 1.0 # Treat as very high speed
+        
+        # Determine new throttle based on speed
+        drag_mode_label = "MEDIUM" # Default for interpolation
+        if current_speed <= self.speed_threshold_low:
+            self._scroll_throttle_ms = self.min_throttle_ms
+            drag_mode_label = "SLOW"
+        elif current_speed >= self.speed_threshold_high:
+            self._scroll_throttle_ms = self.max_throttle_ms
+            drag_mode_label = "FAST"
         else:
-            scrollable_height = canvas_height
+            # Linear interpolation
+            if self.speed_threshold_high > self.speed_threshold_low: # Avoid division by zero
+                factor = (current_speed - self.speed_threshold_low) / \
+                        (self.speed_threshold_high - self.speed_threshold_low)
+                self._scroll_throttle_ms = int(self.min_throttle_ms + factor * (self.max_throttle_ms - self.min_throttle_ms))
+                # drag_mode_label remains "MEDIUM"
+            else: # Fallback if thresholds are misconfigured
+                self._scroll_throttle_ms = self.min_throttle_ms
+                drag_mode_label = "SLOW (threshold error)" # Or some other indicator
+        
+        # --- DEBUG PRINT STATEMENTS ---
+        print(f"Drag Mode: {drag_mode_label} | Speed: {current_speed:.2f} px/s | Throttle: {self._scroll_throttle_ms} ms | Delta_Y: {delta_y_for_speed} | Delta_T: {delta_t:.4f} s")
+        # --- END DEBUG ---
+        
+        # Update last event info for the next speed calculation in this drag sequence
+        self._last_drag_event_time = current_time
+        self._last_drag_event_y = mouse_y
+        
+        # --- Original logic for thumb positioning and visual update ---
+        delta_y_total = mouse_y - self.scrollbar_mouse_start_y
+        intended_new_thumb_y = self.scrollbar_thumb_start_y + delta_y_total
 
-        if scrollable_height <= canvas_height:
-            return # No scrolling needed if content fits
+        canvas_height = self.custom_scrollbar_canvas.winfo_height()
+        if canvas_height <= 0: return
 
-        thumb_height = self.custom_scrollbar_canvas.coords(self.scrollbar_thumb)[3] - self.custom_scrollbar_canvas.coords(self.scrollbar_thumb)[1]
-        max_thumb_y = canvas_height - thumb_height
-        new_thumb_y = max(0, min(max_thumb_y, new_thumb_y)) # Clamp thumb position
+        thumb_coords = self.custom_scrollbar_canvas.coords(self.scrollbar_thumb)
+        if not thumb_coords: return
 
-        self.custom_scrollbar_canvas.coords(self.scrollbar_thumb, 0, new_thumb_y, 15, new_thumb_y + thumb_height)
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height)
 
-        scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        new_thumb_y_clamped = max(0, min(max_thumb_y, intended_new_thumb_y))
+
+        self.custom_scrollbar_canvas.coords(self.scrollbar_thumb, 0, new_thumb_y_clamped, 15, new_thumb_y_clamped + thumb_height)
+        self._last_thumb_y = new_thumb_y_clamped
+
+        # --- Schedule Canvas Scroll (throttled) ---
+        if not self._scroll_pending:
+            self._scroll_pending = True
+            if self._throttled_after_id:
+                self.canvas.after_cancel(self._throttled_after_id)
+            self._throttled_after_id = self.canvas.after(self._scroll_throttle_ms, self._perform_throttled_scroll)
+
+
+
+    def _perform_throttled_scroll(self):
+        """Performs the actual canvas scroll after the throttle delay."""
+        # If the drag ended while this was waiting, the release handler will do the final scroll
+        if not self.scrollbar_thumb_dragging:
+             self._scroll_pending = False
+             self._throttled_after_id = None
+             return
+
+        # Perform the scroll based on the *last visually updated* thumb position
+        # (stored in self._last_thumb_y by custom_scrollbar_drag)
+        self._perform_scroll(self._last_thumb_y)
+
+        # Reset the pending flag so a new scroll can be scheduled on the next drag event
+        self._scroll_pending = False
+        self._throttled_after_id = None # Clear the ID
+
+
+    def _perform_scroll(self, thumb_y):
+        """Calculates and performs the yview_moveto based on thumb position."""
+        canvas_height = self.custom_scrollbar_canvas.winfo_height() # Use scrollbar canvas height
+        thumb_coords = self.custom_scrollbar_canvas.coords(self.scrollbar_thumb)
+        if canvas_height <= 0 or not thumb_coords:
+            return # Cannot calculate fraction if canvas height is zero or thumb missing
+
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height) # Avoid div by zero
+
+        # Avoid division by zero if the content isn't scrollable or thumb fills the space
+        if max_thumb_y <= 0:
+             scroll_fraction = 0
+        else:
+             # Fraction is the thumb's current Y position divided by the maximum possible Y position
+             scroll_fraction = thumb_y / max_thumb_y
+
+        # Ensure fraction is within [0, 1] range
+        scroll_fraction = max(0.0, min(1.0, scroll_fraction))
+
+        # Perform the actual canvas scroll
         self.canvas.yview_moveto(scroll_fraction)
+
+
+
+
 
 
     def custom_scrollbar_release(self, event):
@@ -11105,36 +12892,105 @@ class ConfigViewerApp:
         self.scrollbar_mouse_start_y_details = event.y
 
 
+
+
+
+
     def custom_details_scrollbar_drag(self, event):
-        """Drag thumb and update canvas view for DETAILS WINDOW."""
+        """Drag thumb and update canvas view for DETAILS WINDOW (throttled)."""
         if not self.scrollbar_thumb_dragging_details:
             return
 
         mouse_y = event.y
         delta_y = mouse_y - self.scrollbar_mouse_start_y_details
-        new_thumb_y = self.scrollbar_thumb_start_y_details + delta_y
+        # Calculate *intended* new thumb position based on drag delta
+        intended_new_thumb_y = self.scrollbar_thumb_start_y_details + delta_y
 
-        canvas_height = self.details_canvas_sub.winfo_height()
-        scroll_range = self.details_canvas_sub.bbox("all")
-        if scroll_range:
-            scrollable_height = scroll_range[3] - scroll_range[1]
+        # --- Update Thumb Visually (always immediate) ---
+        # Use the details scrollbar canvas height
+        canvas_height = self.custom_scrollbar_canvas_details.winfo_height()
+        if canvas_height <= 0: return # Avoid issues if canvas isn't visible yet
+
+        # Get details thumb coords
+        thumb_coords = self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details)
+        if not thumb_coords: return # Avoid issues if thumb isn't created
+
+        # Check if content fits (can reuse existing logic, or simplify if scroll_range is reliable)
+        # It's generally better to let custom_details_scrollbar_set handle visibility/max_thumb_y calculation based on canvas scrollregion
+        # But for dragging, we calculate based on the scrollbar canvas height
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height) # Ensure max_thumb_y is not negative
+
+        # If there's no scrollable range (thumb fills the space), just return
+        # This check isn't strictly necessary here if max_thumb_y is 0, as the fraction will be 0
+        # and the throttling won't schedule unless max_thumb_y > 0, but leaving it can save calculations.
+        # Let's rely on max_thumb_y check later.
+
+        # Clamp the intended position for visual update
+        new_thumb_y_clamped = max(0, min(max_thumb_y, intended_new_thumb_y))
+
+        # Update the thumb's visual position instantly on the details scrollbar canvas
+        self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details, 0, new_thumb_y_clamped, 15, new_thumb_y_clamped + thumb_height)
+
+        # Store the latest clamped thumb position for the throttled update
+        self._last_details_thumb_y = new_thumb_y_clamped
+
+        # --- Schedule Canvas Scroll (throttled) ---
+        # Only schedule a new scroll command if one is not already pending AND there's actually something to scroll
+        if max_thumb_y > 0 and not self._details_scroll_pending:
+            self._details_scroll_pending = True
+            # Schedule _perform_throttled_details_scroll after the delay
+            # Use the details canvas or root window for after scheduling
+            self._details_throttled_after_id = self.details_canvas_sub.after(self._scroll_throttle_ms, self._perform_throttled_details_scroll)
+            # Or use: self.root.after(self._scroll_throttle_ms, self._perform_throttled_details_scroll)
+
+        # The old direct call is removed:
+        # scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        # self.details_canvas_sub.yview_moveto(scroll_fraction) # <-- REMOVE THIS
+
+
+
+    def _perform_throttled_details_scroll(self):
+        """Performs the actual DETAILS canvas scroll after the throttle delay."""
+        # If the drag ended while this was waiting, the release handler will do the final scroll
+        if not self.scrollbar_thumb_dragging_details: # Use the details dragging flag
+            self._details_scroll_pending = False
+            self._details_throttled_after_id = None
+            return
+
+        # Perform the scroll based on the *last visually updated* details thumb position
+        # (stored in self._last_details_thumb_y by custom_details_scrollbar_drag)
+        self._perform_details_scroll(self._last_details_thumb_y)
+
+        # Reset the details pending flag so a new scroll can be scheduled
+        self._details_scroll_pending = False
+        self._details_throttled_after_id = None # Clear the ID
+
+
+    def _perform_details_scroll(self, thumb_y):
+        """Calculates and performs the yview_moveto for DETAILS canvas based on thumb position."""
+        # Use the details scrollbar canvas height for fraction calculation
+        canvas_height = self.custom_scrollbar_canvas_details.winfo_height()
+        thumb_coords = self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details)
+
+        if canvas_height <= 0 or not thumb_coords:
+            return # Cannot calculate fraction if canvas height is zero or thumb missing
+
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height) # Avoid div by zero
+
+        # Avoid division by zero if the content isn't scrollable or thumb fills the space
+        if max_thumb_y <= 0:
+            scroll_fraction = 0
         else:
-            scrollable_height = canvas_height
+            # Fraction is the thumb's current Y position divided by the maximum possible Y position
+            scroll_fraction = thumb_y / max_thumb_y
 
-        if scrollable_height <= canvas_height:
-            return # No scrolling needed if content fits
+        # Ensure fraction is within [0, 1] range
+        scroll_fraction = max(0.0, min(1.0, scroll_fraction))
 
-        thumb_height = self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details)[3] - self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details)[1]
-        max_thumb_y = canvas_height - thumb_height
-        new_thumb_y = max(0, min(max_thumb_y, new_thumb_y)) # Clamp thumb position
-
-        self.custom_scrollbar_canvas_details.coords(self.scrollbar_thumb_details, 0, new_thumb_y, 15, new_thumb_y + thumb_height)
-
-        scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        # Perform the actual canvas scroll on the DETAILS canvas
         self.details_canvas_sub.yview_moveto(scroll_fraction)
-
-
-
 
 
     def custom_details_scrollbar_release(self, event):
@@ -11222,7 +13078,7 @@ class ConfigViewerApp:
         self.scrollbar_thumb_start_y_search_results = self.custom_scrollbar_canvas_search_results.coords(self.scrollbar_thumb_search_results)[1]
         self.scrollbar_mouse_start_y_search_results = event.y
 
-
+    '''
     def custom_search_results_scrollbar_drag(self, event):
         """Drag thumb and update canvas view for SEARCH RESULTS WINDOW."""
         if not self.scrollbar_thumb_dragging_search_results:
@@ -11250,6 +13106,102 @@ class ConfigViewerApp:
 
         scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
         self.search_results_canvas.yview_moveto(scroll_fraction)
+        '''
+
+    def custom_search_results_scrollbar_drag(self, event):
+        """Drag thumb and update canvas view for SEARCH RESULTS WINDOW (throttled)."""
+        if not self.scrollbar_thumb_dragging_search_results:
+            return
+
+        mouse_y = event.y
+        delta_y = mouse_y - self.scrollbar_mouse_start_y_search_results
+        # Calculate *intended* new thumb position based on drag delta
+        intended_new_thumb_y = self.scrollbar_thumb_start_y_search_results + delta_y
+
+        # --- Update Thumb Visually (always immediate) ---
+        # Use the search results scrollbar canvas height
+        canvas_height = self.custom_scrollbar_canvas_search_results.winfo_height()
+        if canvas_height <= 0: return # Avoid issues if canvas isn't visible yet
+
+        # Get search results thumb coords
+        thumb_coords = self.custom_scrollbar_canvas_search_results.coords(self.scrollbar_thumb_search_results)
+        if not thumb_coords: return # Avoid issues if thumb isn't created
+
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height) # Ensure max_thumb_y is not negative
+
+        # If there's no scrollable range, return
+        if max_thumb_y <= 0:
+            return # No scrolling needed if content fits (thumb should be max size anyway)
+
+
+        # Clamp the intended position for visual update
+        new_thumb_y_clamped = max(0, min(max_thumb_y, intended_new_thumb_y))
+
+        # Update the thumb's visual position instantly on the search results scrollbar canvas
+        self.custom_scrollbar_canvas_search_results.coords(self.scrollbar_thumb_search_results, 0, new_thumb_y_clamped, 15, new_thumb_y_clamped + thumb_height)
+
+        # Store the latest clamped thumb position for the throttled update
+        self._last_search_results_thumb_y = new_thumb_y_clamped
+
+        # --- Schedule Canvas Scroll (throttled) ---
+        # Only schedule a new scroll command if one is not already pending
+        if not self._search_results_scroll_pending:
+            self._search_results_scroll_pending = True
+            # Schedule _perform_throttled_search_results_scroll after the delay
+            # Use the search results canvas or root window for after scheduling
+            self._search_results_throttled_after_id = self.search_results_canvas.after(self._scroll_throttle_ms, self._perform_throttled_search_results_scroll)
+            # Or use: self.root.after(self._scroll_throttle_ms, self._perform_throttled_search_results_scroll)
+
+        # The old direct call is removed:
+        # scroll_fraction = new_thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        # self.search_results_canvas.yview_moveto(scroll_fraction) # <-- REMOVE THIS
+        
+    def _perform_search_results_scroll(self, thumb_y):
+        """Calculates and performs the yview_moveto for SEARCH RESULTS canvas based on thumb position."""
+        # Use the search results scrollbar canvas height for fraction calculation
+        canvas_height = self.custom_scrollbar_canvas_search_results.winfo_height()
+        thumb_coords = self.custom_scrollbar_canvas_search_results.coords(self.scrollbar_thumb_search_results)
+
+        if canvas_height <= 0 or not thumb_coords:
+            return # Cannot calculate fraction if canvas height is zero or thumb missing
+
+        thumb_height = thumb_coords[3] - thumb_coords[1]
+        max_thumb_y = max(0, canvas_height - thumb_height) # Avoid div by zero
+
+        # Avoid division by zero if the content isn't scrollable or thumb fills the space
+        if max_thumb_y <= 0:
+            scroll_fraction = 0
+        else:
+            # Fraction is the thumb's current Y position divided by the maximum possible Y position
+            scroll_fraction = thumb_y / max_thumb_y
+
+        # Ensure fraction is within [0, 1] range
+        scroll_fraction = max(0.0, min(1.0, scroll_fraction))
+
+        # Perform the actual canvas scroll on the SEARCH RESULTS canvas
+        self.search_results_canvas.yview_moveto(scroll_fraction)
+
+
+
+    def _perform_throttled_search_results_scroll(self):
+        """Performs the actual SEARCH RESULTS canvas scroll after the throttle delay."""
+        # If the drag ended while this was waiting, the release handler will do the final scroll
+        if not self.scrollbar_thumb_dragging_search_results: # Use the correct dragging flag
+            self._search_results_scroll_pending = False
+            self._search_results_throttled_after_id = None
+            return
+
+        # Perform the scroll based on the *last visually updated* search results thumb position
+        # (stored in self._last_search_results_thumb_y by custom_search_results_scrollbar_drag)
+        self._perform_search_results_scroll(self._last_search_results_thumb_y)
+
+        # Reset the search results pending flag so a new scroll can be scheduled
+        self._search_results_scroll_pending = False
+        self._search_results_throttled_after_id = None # Clear the ID
+
+
+
 
 
     def custom_search_results_scrollbar_release(self, event):
@@ -11434,205 +13386,323 @@ class ConfigViewerApp:
     def manual_gc_collect(self):
         """
         Manually triggers garbage collection and prints a message to the console.
-        This is for debugging purposes to help identify potential memory leaks.
+        This is for debugging purposes to help identify potential memory leaks. 
+        Also prints important data and sends it to the console
         """
         print("--- Manual Garbage Collection Triggered ---")
         collected = gc.collect()
         print(f"Garbage collector: collected {collected} objects.")
         print("--- Manual Garbage Collection Completed ---\n")
+        print(f"{self.data}")
    
     # ------------------------------------------------------------
     # Format Grouped Data
     # ------------------------------------------------------------
 
-    #@profile 
-    def format_grouped_data(self, data_list):
 
-        stack = inspect.stack()
-        caller_function_name = "<unknown>"
-        caller_filename = "<unknown>"
-        caller_lineno = 0
-        if len(stack) > 1:
-            # stack[0] is the current frame (update_grid_layout)
-            # stack[1] is the caller's frame
-            caller_frame_record = stack[1]
-            caller_function_name = caller_frame_record.function
-            caller_filename = caller_frame_record.filename
-            caller_lineno = caller_frame_record.lineno
-            # You can even get the specific code line that made the call:
-            caller_code_context = caller_frame_record.code_context
-            print(f"    Code context: {caller_code_context}") # Might be None
-
-        print(f"--- load_image_item_search_results CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
-
-
-        print("\n--- format_grouped_data() DEBUG ENTRY ---")
-        print(f"DEBUG: format_grouped_data - self.sort_by_install_date: {self.sort_by_install_date}")
-        print(f"DEBUG: format_grouped_data - self.collapse_categories_by_default: {self.collapse_categories_by_default}")
-
-        #scanning_win = None  # Initialize scanning_win
-
-        #scanning_win = self.show_scanning_window(text="Processing data...")
-
-
-        grouped = {}
-        zip_creation_times = {}
-        folder_zip_latest_mtimes = {}
-
-        if self.sort_by_install_date:
-            parent_dir = os.path.dirname(self.repo_folder)
-            for item in data_list:
-                zip_file = item[2]
-                folder_name = item[4]
-
-                if zip_file != "user_custom_configs":
-                    if not zip_file.lower().endswith(".zip"):
-                        zip_file_name = zip_file + ".zip"
-                    else:
-                        zip_file_name = zip_file
-                    zip_path_repo = os.path.join(self.repo_folder, zip_file_name)
-                    zip_path_parent = os.path.join(parent_dir, zip_file_name)
-                    modification_time = 0
-                    if os.path.exists(zip_path_repo):
-                        modification_time = os.path.getmtime(zip_path_repo)
-                    elif os.path.exists(zip_path_parent):
-                        modification_time = os.path.getmtime(zip_path_parent)
-                    zip_creation_times[zip_file] = modification_time
-
-                    if folder_name not in folder_zip_latest_mtimes:
-                        folder_zip_latest_mtimes[folder_name] = modification_time
-                    else:
-                        folder_zip_latest_mtimes[folder_name] = max(folder_zip_latest_mtimes[folder_name], modification_time)
-
-
-        for item in data_list:
-            pic, spawn_cmd, zip_file, info_data, folder_name = item
-            if info_data:
-                brand = info_data.get("Brand", "").strip()
-                vehicle_type = info_data.get("Type", "").strip()
-                country = info_data.get("Country", "").strip() # <-- Get country from info_data
-            else:
-                brand = ""
-                vehicle_type = ""
-                country = "" # <-- Initialize country to empty string if no info_data
-
-            if self.categorization_mode == 'Brand':
-                if zip_file == "user_custom_configs":
-                    if (brand or vehicle_type):
-                        category = brand if brand else vehicle_type
-                    else:
-                        category = "Custom"
-                else:
-                    if brand:
-                        category = brand
-                    elif vehicle_type:
-                        category = f"{vehicle_type} (Brand Unavailable)"
-                    else:
-                        category = "|Unknown|"
-            elif self.categorization_mode == 'Country': # <-- NEW elif block for "Country"
-                if country: # Group by country if country info is available
-                    category = country
-                else:
-                    category = "|Unknown Country|" # Fallback category if country is missing
-            elif self.categorization_mode == 'None':
-                category = "All Items"
-            else: # Assuming this is 'Type' mode
-                if vehicle_type:
-                    category = vehicle_type
-                else:
-                    category = "|Unknown Type|"
-
-            grouped.setdefault(category, []).append(item)
-
-
-        print("\n--- format_grouped_data() DEBUGGING: Representative Image Selection ---")
-        print("  DEBUG: Clearing Main Grid Image Cache BEFORE representative image selection...")
-        self.clear_main_grid_cache()
-        print("  DEBUG: Main Grid Cache Cleared.")
-
-        updated_data_items = []
-
-        for category, items in grouped.items():
-            if items:
-                representative_picture = None
-                folder_name_for_category = items[0][4]
-
-                print(f"  DEBUG: Category: {category} - Finding representative image from folder: {folder_name_for_category}")
-                representative_picture_path_from_folder = self.find_representative_image_in_folder(folder_name_for_category)
-                print(f"  DEBUG: Representative image path from folder (returned): {representative_picture_path_from_folder}")
-
-                if representative_picture_path_from_folder:
-                    representative_picture = representative_picture_path_from_folder
-                else:
-                    if items[0][2] == "user_custom_configs":
-                        representative_picture = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
-                        print(f"  DEBUG: No suitable image found in folder. Using CUSTOM placeholder: {os.path.basename(representative_picture)}")
-                    else:
-                        representative_picture = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
-                        print(f"  DEBUG: No suitable image found in folder. Using ZIP placeholder: {os.path.basename(representative_picture)}")
-
-                for item in items:
-                    updated_item = (
-                        representative_picture,
-                        item[1],
-                        item[2],
-                        item[3],
-                        item[4]
-                    )
-                    updated_data_items.append(updated_item)
-
-        print("--- format_grouped_data() DEBUGGING: Representative Image Selection END ---\n")
-
-
-        # --- MODIFIED: Collapse Categories by Default Logic - PERSISTENT STATES ---
-        print("DEBUG: format_grouped_data - Applying Collapse Categories Logic (Persistent).")
-        for category in grouped:
-            if self.collapse_categories_by_default:
-                print(f"  DEBUG: Category '{category}' - Defaulting to COLLAPSED if not already set.")
-                self.category_hidden_states.setdefault(category, True) # Collapse by default if not set
-            else:
-                print(f"  DEBUG: Category '{category}' - Defaulting to EXPANDED if not already set.")
-                self.category_hidden_states.setdefault(category, False) # Expand by default if not set
-        # --- MODIFIED: Collapse Categories by Default Logic - PERSISTENT STATES ---
-
-
-        for category, items in grouped.items():
-            if self.sort_by_install_date:
-                items.sort(key=lambda x: (
-                    zip_creation_times.get(x[2], 0) if x[2] != "user_custom_configs" else float('inf'),
-                    x[4] if x[2] == "user_custom_configs" else "",
-                    x[3].get("Brand", ""),
-                    x[3].get("Name", "")
-                ), reverse=True)
-            else:
-                if category == "Custom":
-                    items.sort(key=lambda x: (x[4], os.path.splitext(os.path.basename(x[0]))[0]))
-                else:
-                    items.sort(key=lambda x: (x[3].get("Brand", ""), x[3].get("Name", "")))
-
-        if self.sort_by_install_date:
-            category_sort_keys = {}
-            for category, items in grouped.items():
-                latest_mtime = folder_zip_latest_mtimes.get(category, 0)
-                category_sort_keys[category] = latest_mtime
-            sorted_categories = sorted(
-                grouped.keys(),
-                key=lambda c: category_sort_keys.get(c, 0),
-                reverse=True
-            )
-            grouped = {category: grouped[category] for category in sorted_categories}
-
-
-        #if scanning_win:
-        #    scanning_win.destroy()
-            
-        print("--- format_grouped_data() DEBUG EXIT ---\n")  
-        return grouped
 
  
 
 
+    def format_grouped_data(self, data_list):
+        print("\n--- format_grouped_data() [WITH FAVORITES LOGIC] DEBUG ENTRY ---")
+        print(f"  DEBUG: self.sort_by_install_date: {self.sort_by_install_date}")
+        print(f"  DEBUG: self.collapse_categories_by_default: {self.collapse_categories_by_default}")
+        print(f"  DEBUG: self.show_pinned_favorites_category: {self.show_pinned_favorites_category}")
+        print(f"  DEBUG: self.categorization_mode: {self.categorization_mode}")
+
+        grouped = {}
+        zip_creation_times = {} # For sorting items within categories by install date
+        folder_zip_latest_mtimes = {} # For sorting categories themselves by install date
+
+        # --- Determine if we need to create and populate the "Favorites" category ---
+        create_favorites_category_active = self.show_pinned_favorites_category and \
+                                           self.categorization_mode in ["Type", "Country", "None"]
         
+        print(f"  DEBUG: create_favorites_category_active: {create_favorites_category_active}")
+
+        folders_added_to_favorites_pin = set() # To ensure a folder rep is added only once to the pinned "Favorites"
+
+        # --- 1. Populate zip_creation_times and folder_zip_latest_mtimes (if sorting by install date) ---
+        if self.sort_by_install_date:
+            parent_dir = os.path.dirname(self.repo_folder) # Assuming self.repo_folder is valid
+            for item_for_time_check in data_list: # Iterate over the full data_list once for times
+                # Ensure item_for_time_check has the expected structure
+                if not (isinstance(item_for_time_check, (list, tuple)) and len(item_for_time_check) == 5):
+                    continue
+                
+                zip_file_for_time = item_for_time_check[2]
+                folder_name_for_time = item_for_time_check[4]
+
+                if zip_file_for_time != "user_custom_configs":
+                    zip_file_name_actual = zip_file_for_time
+                    if not zip_file_name_actual.lower().endswith(".zip"):
+                        zip_file_name_actual += ".zip"
+                    
+                    zip_path_repo = os.path.join(self.repo_folder, zip_file_name_actual)
+                    zip_path_parent_mods = os.path.join(parent_dir, zip_file_name_actual) # Path in mods/
+                    
+                    modification_time = 0
+                    if os.path.exists(zip_path_repo):
+                        modification_time = os.path.getmtime(zip_path_repo)
+                    elif os.path.exists(zip_path_parent_mods): # Check in mods/ folder
+                        modification_time = os.path.getmtime(zip_path_parent_mods)
+                    
+                    # Store modification time for the specific zip_file (original name, not with .zip)
+                    zip_creation_times[zip_file_for_time] = modification_time
+                    
+                    # Update the latest modification time for the folder
+                    current_latest_for_folder = folder_zip_latest_mtimes.get(folder_name_for_time, 0)
+                    folder_zip_latest_mtimes[folder_name_for_time] = max(current_latest_for_folder, modification_time)
+
+        
+
+
+        # --- 2. Iterate through data_list to group items and populate "Favorites" ---
+        for item in data_list:
+            # Ensure item has the expected structure before unpacking
+            if not (isinstance(item, (list, tuple)) and len(item) == 5):
+                print(f"  WARN: Skipping malformed item in data_list: {str(item)[:100]}")
+                continue
+
+            pic, spawn_cmd, zip_file, info_data, folder_name = item
+            
+            # a. Determine normal category and add item
+            normal_category_key = "Unknown Category" # Default
+            if info_data: # Ensure info_data is not None
+                brand = info_data.get("Brand", "").strip()
+                vehicle_type = info_data.get("Type", "").strip()
+                country = info_data.get("Country", "").strip()
+
+                if self.categorization_mode == 'Brand':
+                    if zip_file == "user_custom_configs":
+                        normal_category_key = brand if brand else (vehicle_type if vehicle_type else "Custom")
+                    else:
+                        normal_category_key = brand if brand else (f"{vehicle_type} (Brand Unavailable)" if vehicle_type else "Unknown Brand")
+                elif self.categorization_mode == 'Country':
+                    normal_category_key = country if country else "Unknown Country"
+                elif self.categorization_mode == 'None':
+                    normal_category_key = "All Items"
+                else: # Default to 'Type'
+                    normal_category_key = vehicle_type if vehicle_type else "Unknown Type"
+            
+            grouped.setdefault(normal_category_key, []).append(item)
+
+            # b. Conditionally add to pinned "Favorites" category
+            if create_favorites_category_active and folder_name not in folders_added_to_favorites_pin:
+                if folder_name in self.full_data:
+                    folder_data_entry = self.full_data[folder_name]
+                    all_configs_in_folder_list = []
+                    if isinstance(folder_data_entry, list):
+                        all_configs_in_folder_list = folder_data_entry
+                    elif isinstance(folder_data_entry, dict) and 'configs' in folder_data_entry:
+                        all_configs_in_folder_list = folder_data_entry.get('configs', [])
+
+                    for config_tuple_in_folder in all_configs_in_folder_list:
+                        if not isinstance(config_tuple_in_folder, (list, tuple)) or len(config_tuple_in_folder) < 2:
+                            continue
+                        config_spawn_cmd = config_tuple_in_folder[1]
+                        if not isinstance(config_spawn_cmd, str):
+                            continue
+                        
+                        pc_filename_for_fav_check = self.extract_name_from_spawn_command(config_spawn_cmd) + ".pc"
+                        if self.is_favorite(folder_name, pc_filename_for_fav_check):
+                            grouped.setdefault("Favorites", []).append(item) # Add the FOLDER REPRESENTATIVE
+                            folders_added_to_favorites_pin.add(folder_name)
+                            print(f"  DEBUG: Added '{folder_name}' to pinned 'Favorites' because '{pc_filename_for_fav_check}' is a favorite.")
+                            break 
+        
+        # Cleanup empty "Favorites" category if it was created but no items were added
+        if "Favorites" in grouped and not grouped["Favorites"]:
+            del grouped["Favorites"]
+            print(f"  DEBUG: Removed empty pinned 'Favorites' category.")
+
+        # --- 3. Representative Image Selection (Your existing logic) ---
+        # This will also apply to the "Favorites" category if it exists.
+        # The representative image for "Favorites" will be based on the first item added to it.
+        print("\n  --- Representative Image Selection ---")
+        # self.clear_main_grid_cache() # Already called in your original, ensure it's intended here
+        # updated_data_items = [] # Not used in your provided code snippet for this part
+        for category, items_in_cat in grouped.items():
+            if items_in_cat: # Ensure category is not empty
+
+                representative_picture = None # Placeholder
+                # Correctly get folder_name for representative image search
+                folder_name_for_rep_img = items_in_cat[0][4] if items_in_cat[0] and len(items_in_cat[0]) == 5 else None
+
+                if folder_name_for_rep_img:
+                    representative_picture_path_from_folder = self.find_representative_image_in_folder(folder_name_for_rep_img)
+                    if representative_picture_path_from_folder:
+                        representative_picture = representative_picture_path_from_folder
+                    else: # Fallback to placeholders
+                        is_custom_cat_item = items_in_cat[0][2] == "user_custom_configs" if items_in_cat[0] and len(items_in_cat[0]) >= 3 else False
+                        if is_custom_cat_item:
+                            representative_picture = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
+                        else:
+                            representative_picture = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
+                else: # Fallback if folder_name_for_rep_img couldn't be determined
+                    representative_picture = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
+
+
+                # Update picture_path for all items in this category for main grid display
+                for i in range(len(items_in_cat)):
+                    # Ensure item_in_cat[i] is a tuple and can be modified (convert to list if needed)
+                    if isinstance(items_in_cat[i], tuple) and len(items_in_cat[i]) == 5:
+                        item_list_mutable = list(items_in_cat[i])
+                        item_list_mutable[0] = representative_picture
+                        items_in_cat[i] = tuple(item_list_mutable)
+        print("  --- Representative Image Selection END ---")
+
+        # --- 4. Collapse Categories by Default Logic (Your existing logic) ---
+        print("  DEBUG: Applying Collapse Categories Logic (Persistent).")
+        for category_key_for_collapse in grouped: # Iterate over keys in grouped
+            self.category_hidden_states.setdefault(category_key_for_collapse, self.collapse_categories_by_default)
+        # Special handling for "Favorites" - if it exists, it should respect collapse_categories_by_default
+        # or you can force it to be expanded if self.show_pinned_favorites_category is True
+        if "Favorites" in grouped:
+            self.category_hidden_states["Favorites"] = self.collapse_categories_by_default
+            print(f"  DEBUG: 'Favorites' category hidden state set to: {self.category_hidden_states['Favorites']}")
+
+
+        # # --- 5. Sort items WITHIN each category ---
+        # print("  DEBUG: Sorting items WITHIN each category...")
+        # for category_key_for_sort, items_to_sort in grouped.items():
+        #     if self.sort_by_install_date:
+        #         # Sort by install date (primary), then folder name (for user_custom within date), then Brand, then Name
+        #         items_to_sort.sort(key=lambda x: (
+        #             zip_creation_times.get(x[2], 0) if x[2] != "user_custom_configs" else -1, # Custom configs last if no real date
+        #             x[4].lower() if x[2] == "user_custom_configs" else "", # Folder name for custom
+        #             x[3].get("Brand", "").lower(), # Brand
+        #             x[3].get("Name", "").lower()   # Name
+        #         ), reverse=True) # Latest first
+        #     else:
+        #         # Alphabetical sort by Brand, then Name (or folder for "Custom")
+        #         if category_key_for_sort == "Custom": # Should not happen if Brand/Type is used for custom
+        #             items_to_sort.sort(key=lambda x: (x[4].lower(), os.path.splitext(os.path.basename(x[0]))[0].lower()))
+        #         else:
+        #             items_to_sort.sort(key=lambda x: (x[3].get("Brand", "").lower(), x[3].get("Name", "").lower()))
+        # print("  DEBUG: Sorting items WITHIN categories COMPLETE.")
+
+
+
+        # --- 5. Sort items WITHIN each category ---
+        print("  DEBUG: Sorting items WITHIN each category...")
+        for category_key_for_sort, items_to_sort in grouped.items():
+            if self.sort_by_install_date:
+                # Sort by install date (primary), then folder name (for user_custom within date), then Brand, then Name
+                items_to_sort.sort(key=lambda x: (
+                    zip_creation_times.get(x[2], 0) if x[2] != "user_custom_configs" else -1, # Custom configs last if no real date
+                    x[4].lower() if x[2] == "user_custom_configs" else "", # Folder name for custom
+                    x[3].get("Brand", "").lower(), # Brand
+                    x[3].get("Name", "").lower()   # Name
+                ), reverse=True) # Latest first
+            # <<<< MODIFICATION START >>>>
+            elif self.categorization_mode == 'None' and category_key_for_sort == "All Items":
+                # This 'elif' block handles the specific case:
+                # - Categorization mode is 'None' (so category is "All Items")
+                # - AND we are NOT sorting by install date (the 'if' above was false)
+                # - AND the current category being processed is indeed "All Items".
+                print(f"  DEBUG: Applying IMPLICIT custom sort order for items in '{category_key_for_sort}'")
+
+                def get_implicit_sort_group_for_item(item_tuple):
+                    # item_tuple structure: (pic, spawn_cmd, zip_file, info_data, folder_name)
+                    # info_data is item_tuple[3]
+                    item_info_data = item_tuple[3] 
+                    
+                    if not item_info_data: # Handles if info_data dict itself is None
+                        return 3 # Default to "Other Items" group
+
+                    vehicle_type_raw = item_info_data.get("Type", "").strip()
+                    vehicle_type_lower = vehicle_type_raw.lower()
+
+                    if vehicle_type_lower in ["car", "truck", "bus", "aircraft"]:
+                        return 0 # Implicit group 0: "main vehicles list"
+                    elif vehicle_type_lower == "trailer":
+                        return 1 # Implicit group 1: "trailer"
+                    elif vehicle_type_lower == "prop":
+                        return 2 # Implicit group 2: "prop"
+                    else:
+                        return 3 # Implicit group 3: "everything else"
+                
+                # Sort items: 
+                # Primary key: implicit group order (0, 1, 2, 3)
+                # Secondary key: Brand (alphabetical)
+                # Tertiary key: Name (alphabetical)
+                items_to_sort.sort(key=lambda x_item: (
+                    get_implicit_sort_group_for_item(x_item),
+                    x_item[3].get("Brand", "").lower() if x_item[3] else "", 
+                    x_item[3].get("Name", "").lower() if x_item[3] else ""  
+                ))
+            # <<<< MODIFICATION END >>>>
+            else:
+                # Original alphabetical sort for:
+                # - Categorization modes 'Type', 'Brand', 'Country' (when not sorting by install date)
+                # - Or for categories like "Favorites" when categorization_mode is 'None' and not sorting by date.
+                if category_key_for_sort == "Custom": # Should not happen if Brand/Type is used for custom
+                    items_to_sort.sort(key=lambda x: (x[4].lower(), os.path.splitext(os.path.basename(x[0]))[0].lower()))
+                else:
+                    items_to_sort.sort(key=lambda x: (x[3].get("Brand", "").lower(), x[3].get("Name", "").lower()))
+        print("  DEBUG: Sorting items WITHIN categories COMPLETE.")
+
+
+        # --- 6. Sort the CATEGORIES themselves ---
+        print("  DEBUG: Sorting CATEGORIES (Refined Logic - Install Date only for intra-category sort)...")
+        ordered_category_keys = []
+        
+        # Always pin "Favorites" to the top if it exists and is active
+        if "Favorites" in grouped: # Assumes "Favorites" is only in grouped if create_favorites_category_active was true
+            ordered_category_keys.append("Favorites")
+            print(f"  DEBUG: Pinned 'Favorites' to top of category order.")
+
+        # Get other categories (excluding "Favorites" if already added)
+        other_categories_to_sort = [cat_key for cat_key in grouped.keys() if cat_key != "Favorites"]
+
+        # Define your predefined order
+        category_order_main_grid = ["car", "truck", "bus", "trailer", "aircraft", "prop"] # Add any other types you want in a specific order
+
+        # Separate known "Unknown" categories
+        unknown_categories = []
+        regular_categories = [] # Categories that are not "Favorites" and not "Unknown"
+
+        for cat_name in other_categories_to_sort:
+            if cat_name.startswith("Unknown"):
+                unknown_categories.append(cat_name)
+            else:
+                regular_categories.append(cat_name)
+        
+        print(f"  DEBUG: Regular categories to sort: {regular_categories}")
+        print(f"  DEBUG: Unknown categories to sort: {unknown_categories}")
+
+        # Sort the "regular" categories:
+        # Primary sort: by index in category_order_main_grid if present
+        # Secondary sort: alphabetically by category name
+        sorted_regular_categories = sorted(
+            regular_categories,
+            key=lambda x: (
+                category_order_main_grid.index(x.lower()) if x.lower() in category_order_main_grid else len(category_order_main_grid),
+                x.lower()
+            )
+        )
+        ordered_category_keys.extend(sorted_regular_categories)
+        print(f"  DEBUG: Regular categories sorted and appended: {sorted_regular_categories}")
+
+        # Sort the "unknown" categories alphabetically and add them last
+        sorted_unknown_categories = sorted(unknown_categories, key=lambda x: x.lower())
+        ordered_category_keys.extend(sorted_unknown_categories)
+        print(f"  DEBUG: Unknown categories sorted and appended: {sorted_unknown_categories}")
+        
+        print(f"  DEBUG: Final proposed category order before reconstruction: {ordered_category_keys}")
+
+        # Reconstruct grouped dictionary to ensure order for UI iteration
+        final_ordered_grouped_data = {cat_key: grouped[cat_key] for cat_key in ordered_category_keys if cat_key in grouped}
+        grouped = final_ordered_grouped_data # Replace original with ordered one
+        
+        print(f"  DEBUG: Final category order after reconstruction: {list(grouped.keys())}")
+        print("  DEBUG: Sorting CATEGORIES COMPLETE.")
+
+        print("--- format_grouped_data() [WITH FAVORITES LOGIC] DEBUG EXIT ---\n")  
+        return grouped
+
         
 
     def find_representative_image_in_folder(self, folder_name):
@@ -11669,7 +13739,7 @@ class ConfigViewerApp:
 
 
     # ------------------------------------------------------------
-    # Toggle Categorization Mode
+    # Categorization Mode
     # ------------------------------------------------------------
     def toggle_categorization_mode(self):
         """Toggles the categorization mode, added search window update."""
@@ -11721,12 +13791,18 @@ class ConfigViewerApp:
         button_y = button.winfo_rooty()
         button_height = button.winfo_height()
 
-        self.category_list_dropdown_window = dropdown_window = tk.Toplevel(self.master)
+        self.category_list_dropdown_window = dropdown_window = FadingToplevel(self.master, self)
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
-        #dropdown_window.geometry(f"+{button_x}+{button_y - 208}")
         dropdown_window.config(bg="#333333")
         dropdown_window.config(highlightthickness=3, highlightbackground="#666666")
+
+        def set_category_list_clicked_to_true(event=None):
+            self.category_list_button_clicked = True
+            print("cat_list_window_clicked")
+
+        dropdown_window.bind("<Button-1>", set_category_list_clicked_to_true, add='+')
+
 
         canvas = tk.Canvas(dropdown_window, bg="#333333", highlightthickness=0, width=250, height=200)
         scrollbar = tk.Scrollbar(dropdown_window, orient="vertical", command=canvas.yview)
@@ -11753,6 +13829,8 @@ class ConfigViewerApp:
         print(f"DEBUG: Stored original category states: {self.original_category_states}")
 
         def toggle_category_in_dropdown(category):
+
+
             current_text = category_vars[category].get()
 
             if " (Shown)" in current_text:
@@ -11760,25 +13838,46 @@ class ConfigViewerApp:
             elif " (Hidden)" in current_text:
                 category_vars[category].set(category.replace(" (Hidden)", "") + " (Shown - Pending)")
             elif " (Hidden - Pending)" in current_text or " (Shown - Pending)" in current_text:
-                # Revert to original state
                 original_state = self.original_category_states[category]
                 category_vars[category].set(category + " (Shown)" if original_state == "Shown" else category + " (Hidden)")
-            else:  # Should not reach here normally, but as a fallback, set to hidden pending
+            else:
                 category_vars[category].set(category + " (Hidden - Pending)")
 
-            # ADDED: Update the corresponding button's color based on the new text
+            # --- MODIFIED SECTION ---
+            # Re-apply hover/selected logic using _bind_animated_hover
+            # This ensures consistent state management.
             try:
                 btn = category_buttons[category]
-                if "- Pending" in category_vars[category].get():
-                    btn.config(bg=self.global_highlight_color, fg="white")
-                    btn.unbind("<Leave>")
-                    btn.bind("<Leave>", lambda event: event.widget.config(bg=self.global_highlight_color, fg="white"))
-                else:
-                    btn.config(bg="#555555", fg="white")
-                    btn.unbind("<Leave>")
-                    btn.bind("<Leave>", lambda event: event.widget.config(bg="#555555", fg="white"))
+                new_text = category_vars[category].get()
+                is_now_pending = "- Pending" in new_text
+
+                # Define the colors as used in update_category_buttons
+                default_original_bg = "#555555"
+                default_original_fg = "#FFFFFF"
+                pending_state_bg = self.global_highlight_color
+                pending_state_fg = "#FFFFFF"
+                item_hover_bg = "#FFFFFF"
+                item_hover_fg = "black"
+
+                # Call _bind_animated_hover to correctly set appearance and event bindings
+                self._bind_animated_hover(
+                    button=btn,
+                    original_bg=default_original_bg,
+                    original_fg=default_original_fg,
+                    hover_target_bg=item_hover_bg,
+                    hover_target_fg=item_hover_fg,
+                    check_state=False, # Assuming same as in update_category_buttons
+                    is_selected_initial=is_now_pending, # THIS IS THE KEY CHANGE
+                    selected_bg=pending_state_bg,
+                    selected_fg=pending_state_fg
+                )
             except KeyError:
+                # This can happen if the button isn't currently displayed (e.g., due to search filter)
+                # In that case, when update_category_buttons runs next, it will pick up the correct state.
+                print(f"DEBUG: toggle_category_in_dropdown - Button for '{category}' not found in category_buttons. "
+                      f"Likely filtered out by search. State will update on next refresh.")
                 pass
+            # --- END MODIFIED SECTION ---
 
         def update_category_buttons(search_query=""):
             print(f"DEBUG: update_category_buttons - START - search_query: '{search_query}'")
@@ -11794,46 +13893,69 @@ class ConfigViewerApp:
             print("  DEBUG: update_category_buttons - Starting button creation loop")
             for category in categories:
                 if not search_query or search_query.lower() in category.lower():
-                    # Check if there's an existing StringVar for this category
+                    # --- StringVar and Initial Text Logic (Mostly Unchanged) ---
                     if category in category_vars:
                         current_var = category_vars[category]
                     else:
                         current_var = tk.StringVar()
-                        category_vars[category] = current_var  # Initialize if it doesn't exist yet
+                        category_vars[category] = current_var
 
-                    # Determine the initial text based on category_vars if it exists, otherwise default to hidden state
-                    if category in category_vars and category_vars[category].get():  # Check if StringVar has a value
-                        initial_button_text = category_vars[category].get()  # Use existing text (preserves pending state)
-                        print(f"    DEBUG: update_category_buttons - Category: {category}, Using existing category_vars text: '{initial_button_text}'")
+                    if category in category_vars and category_vars[category].get():
+                        initial_button_text_from_var = category_vars[category].get()
+                        # print(f"    DEBUG: update_category_buttons - Category: {category}, Using existing category_vars text: '{initial_button_text_from_var}'")
                     else:
                         is_category_hidden = self.category_hidden_states.get(category, False)
-                        initial_button_text = category + (" (Shown)" if not is_category_hidden else " (Hidden)")  # Default based on hidden state
-                        print(f"    DEBUG: update_category_buttons - Category: {category}, No existing category_vars text, using hidden state: {is_category_hidden}, text: '{initial_button_text}'")
+                        initial_button_text_from_var = category + (" (Shown)" if not is_category_hidden else " (Hidden)")
+                        # print(f"    DEBUG: update_category_buttons - Category: {category}, No existing category_vars text, using hidden state: {is_category_hidden}, text: '{initial_button_text_from_var}'")
 
-                    category_vars[category].set(initial_button_text)  # Ensure category_vars is updated with the determined text
+                    current_var.set(initial_button_text_from_var)
+                    button_text_for_logic = current_var.get() # Used for "Pending" check
 
-                    button_text = category_vars[category].get()
+                    # --- Define Colors ---
+                    default_original_bg = "#555555"
+                    default_original_fg = "#FFFFFF"
 
-                    cat_button = tk.Button(scrollable_frame, textvariable=category_vars[category],
-                                           font=("Segoe UI", 10+self.font_size_add, "bold"),
-                                           command=lambda cat=category: toggle_category_in_dropdown(cat),
-                                           bg="#555555", fg="white", relief=tk.FLAT, bd=1, anchor="w", padx=10)
+                    pending_state_bg = self.global_highlight_color # This is the "selected" bg for pending items
+                    pending_state_fg = "#FFFFFF"                   # FG for pending items
 
-                    original_button_bg = "#555555"
-                    original_button_fg = "white"
+                    # Hover colors for these specific buttons
+                    item_hover_bg = "#FFFFFF" # White background on hover
+                    item_hover_fg = "black"   # Black foreground on hover
 
-                    if "- Pending" in button_text:
-                        cat_button.config(bg=self.global_highlight_color, fg="white")
-                        original_button_bg = self.global_highlight_color
-                        original_button_fg = "white"
+                    # --- Determine if this button starts in the "Pending" (selected-like) state ---
+                    is_initially_pending = ("- Pending" in button_text_for_logic)
 
-                    cat_button.bind("<Enter>", lambda event: event.widget.config(bg="white", fg="black"))
-                    cat_button.bind("<Leave>", lambda event, bg=original_button_bg, fg=original_button_fg: event.widget.config(bg=bg, fg=fg))
+                    # --- Button Creation ---
+                    # Initial bg/fg will be set by _bind_animated_hover based on is_initially_pending
+                    cat_button = tk.Button(
+                        scrollable_frame,
+                        textvariable=current_var, # Use the specific var for this button
+                        font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                        command=lambda cat=category: toggle_category_in_dropdown(cat), # Ensure toggle_category_in_dropdown exists
+                        # bg, fg, relief, bd, anchor, padx are now handled by styles or _bind_animated_hover
+                        relief=tk.FLAT, # Kept from original
+                        bd=1,           # Kept from original (though might be overridden by flat if no highlightthickness)
+                        anchor="w",     # Kept from original
+                        padx=10         # Kept from original
+                    )
+
+                    # --- Apply Smooth Hover Animation & Initial "Pending" State ---
+                    self._bind_animated_hover(
+                        button=cat_button,
+                        original_bg=default_original_bg,
+                        original_fg=default_original_fg,
+                        hover_target_bg=item_hover_bg,      # Custom hover BG (white)
+                        hover_target_fg=item_hover_fg,      # Custom hover FG (black)
+                        check_state=False,                  # Assuming these don't have a separate tk.DISABLED state for hover
+                        is_selected_initial=is_initially_pending, # Is it in "Pending" state?
+                        selected_bg=pending_state_bg,       # Visuals for "Pending" state
+                        selected_fg=pending_state_fg
+                    )
 
                     cat_button.pack(fill="x", pady=1)
                     cat_buttons.append(cat_button)
-                    category_buttons[category] = cat_button  # ADDED: Store the button in the category_buttons dictionary
-                    print(f"    DEBUG: update_category_buttons - Created button for: {category}, text: '{button_text}'")
+                    category_buttons[category] = cat_button
+                    #print(f"    DEBUG: update_category_buttons - Created button for: {category}, text: '{button_text}'")
             print("  DEBUG: update_category_buttons - Button creation loop END")
             print(f"  DEBUG: update_category_buttons - cat_buttons after creation loop: {cat_buttons}")
 
@@ -11876,16 +13998,16 @@ class ConfigViewerApp:
         button_frame.pack(fill="x", side="bottom")
 
         search_query_var = tk.StringVar()
-        search_entry = tk.Entry(button_frame, textvariable=search_query_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black")
+        search_entry = tk.Entry(button_frame, textvariable=search_query_var, font=("Segoe UI", 10+self.font_size_add), bg="#FFFFFF", fg="black")
         search_entry.pack(pady=2, fill="x")
 
         search_entry.bind("<KeyRelease>", lambda event: update_category_buttons(search_query_var.get()))
         search_entry.bind("<KeyRelease>", lambda event, canvas=canvas: canvas.yview_moveto(0), add='+')
 
 
-        hide_all_button = tk.Button(button_frame, text="Hide All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=hide_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
-        show_all_button = tk.Button(button_frame, text="Show All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=show_all_categories_in_dropdown, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
-        apply_button = tk.Button(button_frame, text="Apply", font=("Segoe UI", 10+self.font_size_add, "bold"), command=apply_category_visibility, bg="#555555", fg="white", relief=tk.RAISED, bd=1)
+        hide_all_button = tk.Button(button_frame, text="Hide All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=hide_all_categories_in_dropdown, bg="#555555", fg="#FFFFFF", relief=tk.RAISED, bd=1)
+        show_all_button = tk.Button(button_frame, text="Show All", font=("Segoe UI", 10+self.font_size_add, "bold"), command=show_all_categories_in_dropdown, bg="#555555", fg="#FFFFFF", relief=tk.RAISED, bd=1)
+        apply_button = tk.Button(button_frame, text="Apply", font=("Segoe UI", 10+self.font_size_add, "bold"), command=apply_category_visibility, bg="#555555", fg="#FFFFFF", relief=tk.RAISED, bd=1)
 
         hide_all_button.pack(fill="x", pady=2, in_=button_frame)
         show_all_button.pack(fill="x", pady=2, in_=button_frame)
@@ -11912,8 +14034,65 @@ class ConfigViewerApp:
 
 
 
+    def toggle_show_pinned_favorites_category(self, called_via_shortcut=None):
+        """Toggles the 'favorites_category' setting, updates UI, and saves setting.""" # Modified docstring
 
 
+        if self.items_to_be_hidden:
+            print("--- self.items_to_be_hidden = True ---\n")
+
+            scanning_win = None  # Initialize scanning_win
+
+            scanning_win = self.show_scanning_window(text="Cannot adjust this setting while there are pending hidden vehicles.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
+
+
+        if self.search_results_window:
+
+            scanning_win = self.show_scanning_window(text="This setting will take effect when search or filtering is no longer active.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+
+
+        if not called_via_shortcut:
+            self.show_pinned_favorites_category = not self.show_pinned_favorites_category
+        else:
+            self.categorization_mode = "Brand"
+
+        self.grouped_data = self.format_grouped_data(self.data) # Re-group and re-sort
+        if not self.is_search_results_window_active:
+
+            print("    toggle_show_pinned_favorites_category is calling self.update_grid_layout()")
+            self.update_grid_layout()
+            self.canvas.yview_moveto(0)
+            print("    toggle_show_pinned_favorites_category is calling self.perform_search()")
+            self.perform_search()
+            self.canvas.yview_moveto(0)
+            self._update_filters_label_status()
+
+        if self.is_search_results_window_active:
+            self.delayed_sort_by_install_date_or_favorites_category_toggle = True
+            print(f"toggle_show_pinned_favorites_category - the search results window was OPEN, therefore delaying the visual refresh until the search results window is destroyed")
+            print(f" --- therefore for the flag has been set - self.delayed_sort_by_install_date_or_favorites_category_toggle = True")
+
+        self.update_settings_dropdown_button_text() # Call function to update button text
+        self.save_settings() # Save setting to file - ADDED
+
+
+
+        
 
     def toggle_sort_by_install_date(self):
         """Toggles the 'Sort by Install Date' setting, updates UI, and saves setting.""" # Modified docstring
@@ -11946,13 +14125,7 @@ class ConfigViewerApp:
 
                 scanning_win.after(3125, close_scanning_window)
 
-
-
-        print(f"toggle_sort_by_install_date - BEFORE toggle: self.sort_by_install_date = {self.sort_by_install_date}") # Debugging print
         self.sort_by_install_date = not self.sort_by_install_date
-        print(f"toggle_sort_by_install_date - AFTER toggle: self.sort_by_install_date = {self.sort_by_install_date}") # Debugging print
-        # Removed button text update as button is no longer in top_frame
-        # --- MODIFIED: Re-group and re-sort based on the *current* self.data ---
 
 
         self.grouped_data = self.format_grouped_data(self.data) # Re-group and re-sort
@@ -11967,9 +14140,9 @@ class ConfigViewerApp:
             self._update_filters_label_status()
 
         if self.is_search_results_window_active:
-            self.delayed_sort_by_install_date = True
+            self.delayed_sort_by_install_date_or_favorites_category_toggle = True
             print(f"toggle_sort_by_install_date - the search results window was OPEN, therefore delaying the visual refresh until the search results window is destroyed")
-            print(f" --- therefore for the flag has been set - self.delayed_sort_by_install_date = True")
+            print(f" --- therefore for the flag has been set - self.delayed_sort_by_install_date_or_favorites_category_toggle = True")
 
         self.update_settings_dropdown_button_text() # Call function to update button text
         self.save_settings() # Save setting to file - ADDED
@@ -11977,9 +14150,9 @@ class ConfigViewerApp:
 
 
     def trigger_toggle_sort_by_install_date_after_search_results_window_close(self):
-        if self.delayed_sort_by_install_date:
-            self.delayed_sort_by_install_date = False
-            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close ENTRY - self.delayed_sort_by_install_date = True")
+        if self.delayed_sort_by_install_date_or_favorites_category_toggle:
+            self.delayed_sort_by_install_date_or_favorites_category_toggle = False
+            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close ENTRY - self.delayed_sort_by_install_date_or_favorites_category_toggle = True")
             print("    trigger_toggle_sort_by_install_date_after_search_results_window_close is calling self.update_grid_layout()")
             self.update_grid_layout()
             self.canvas.yview_moveto(0)
@@ -11989,7 +14162,7 @@ class ConfigViewerApp:
             self.canvas.yview_moveto(0)
             self._update_filters_label_status()
 
-            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close EXIT - self.delayed_sort_by_install_date = False")
+            print(f"--- trigger_toggle_sort_by_install_date_after_search_results_window_close EXIT - self.delayed_sort_by_install_date_or_favorites_category_toggle = False")
         else:
             return
 
@@ -12258,7 +14431,7 @@ class ConfigViewerApp:
     def _create_bodystyle_dropdown_content(self, scrollable_frame, dynamic_bodystyle_options, button, dropdown_window, canvas):
         """Creates the content of the bodystyle dropdown: search entry and options, ensuring 'All BodyStyles' is always first."""
         search_var = tk.StringVar()
-        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="white", fg="black", width=18)
+        search_entry = tk.Entry(scrollable_frame, textvariable=search_var, font=("Segoe UI", 10+self.font_size_add), bg="#FFFFFF", fg="black", width=18)
         search_entry.pack(pady=(5, 2), padx=5, fill="x")
         search_entry.focus_set()
         
@@ -12316,32 +14489,63 @@ class ConfigViewerApp:
 
 
     def _create_bodystyle_option_buttons(self, scrollable_frame, current_options, button, dropdown_window):
-        """Creates and packs option buttons in the scrollable frame for bodystyle."""
-        for option in current_options:
-            bg_color = "#555555"
-            fg_color = "white"
-            current_button_text = button.cget("text")
-            if option == current_button_text:
-                bg_color = self.global_highlight_color
-                fg_color = "white"
+        """Creates and packs option buttons in the scrollable frame for bodystyle with smooth hover."""
 
-            dropdown_button = tk.Button(
+        # --- Define Colors ---
+        default_bg_color = "#555555"    # Normal, non-selected background
+        default_fg_color = "#FFFFFF"    # Normal, non-selected foreground
+
+        selected_option_bg = self.global_highlight_color # Background for the currently "selected" option
+        selected_option_fg = "#FFFFFF"                   # Foreground for the "selected" option
+
+        # Specific hover colors for these dropdown items
+        dropdown_item_hover_bg = "#d9d9d9"
+        dropdown_item_hover_fg = "black"
+
+        # Get the text of the main button that opened this dropdown, to determine current selection
+        current_main_button_text = button.cget("text")
+
+        for option in current_options:
+            # --- Determine if this option is currently selected ---
+            is_selected = (option == current_main_button_text)
+
+            # --- Button Creation ---
+            # Initial bg/fg will be set by _bind_animated_hover based on is_selected
+            dropdown_option_button = tk.Button( # Renamed to avoid confusion with 'button' from args
                 scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda opt=option, fname="bodystyle": self._on_bodystyle_dropdown_button_click(opt, fname=fname, fbutton=button, fdropdown_window=dropdown_window), # Call _on_bodystyle_dropdown_button_click
-                borderwidth=1,
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                # The command lambda captures necessary arguments for the click handler
+                command=lambda opt=option, main_btn=button, dd_win=dropdown_window: \
+                    self._on_bodystyle_dropdown_button_click(opt, fname="bodystyle", fbutton=main_btn, fdropdown_window=dd_win),
+                borderwidth=1,      # Keep specific styling
                 relief="solid",
                 anchor="w",
                 padx=10,
                 pady=2,
-                bg=bg_color,
-                fg=fg_color,
-                width=240
+                width=240 # If you need fixed width, keep it. Otherwise, remove for dynamic width.
+                # bg and fg are now set by _bind_animated_hover
             )
-            dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+            # Set active colors (for instant click flash) - optional
+            dropdown_option_button.config(
+                activebackground=dropdown_item_hover_bg,
+                activeforeground=dropdown_item_hover_fg
+            )
+
+            dropdown_option_button.pack(fill="x")
+
+            # --- Apply Smooth Hover Animation using the modified binder ---
+            self._bind_animated_hover(
+                button=dropdown_option_button,
+                original_bg=default_bg_color,       # The "true" original, non-selected bg
+                original_fg=default_fg_color,       # The "true" original, non-selected fg
+                hover_target_bg=dropdown_item_hover_bg, # Custom hover BG for these items
+                hover_target_fg=dropdown_item_hover_fg, # Custom hover FG for these items
+                check_state=False,                    # Assuming these are not individually disabled
+                is_selected_initial=is_selected,      # Is this button initially "selected"?
+                selected_bg=selected_option_bg,       # Color if selected
+                selected_fg=selected_option_fg        # Color if selected
+            )
 
 
     def _on_bodystyle_dropdown_button_click(self, option_text, fname, fbutton, fdropdown_window):
@@ -12356,69 +14560,7 @@ class ConfigViewerApp:
         print("    DEBUG: _on_bodystyle_dropdown_button_click() END") # Debug
         
         
-    # ------------------------------------------------------------
-    # Add Mods action
-    # ------------------------------------------------------------
-    def add_mods_action(self):
-        mod_folder = os.path.join(self.script_dir, os.pardir)
-        if not os.path.exists(mod_folder):
-            try:
-                os.makedirs(mod_folder)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to create 'mods' folder: {e}")
-                return
 
-        file_paths = filedialog.askopenfilenames(
-            title="Select Mod Zip Files",
-            filetypes=[("Zip files", "*.zip")],
-            initialdir=os.path.expanduser("~")
-        )
-        if not file_paths:
-            #messagebox.showinfo("Info", "No files selected.")
-            
-
-            scanning_win = None  # Initialize scanning_win
-
-            scanning_win = self.show_scanning_window(text="No files selected.")
-            time.sleep(3.125)
-            if scanning_win:
-                scanning_win.destroy()
-            return
-
-        moved_files = []
-        for file_path in file_paths:
-            try:
-                destination_path = os.path.join(mod_folder, os.path.basename(file_path))
-                shutil.move(file_path, destination_path)
-                moved_files.append(os.path.basename(file_path))
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to move '{os.path.basename(file_path)}': {e}")
-
-        # try:
-        #     skip_custom_file = os.path.join(self.script_dir, "SkipCustomForceModCheck.txt")
-        #     with open(skip_custom_file, "w") as f:
-        #         f.write("This file tells the script to skip custom config scanning and force mod checking.")
-        # except Exception as e:
-        #     messagebox.showerror("Error", f"Failed to create SkipCustomForceModCheck.txt: {e}")
-
-        if moved_files:
-            try:
-                new_mods_file = os.path.join(self.script_dir, "data/NewMods.txt")
-                with open(new_mods_file, "w", encoding="utf-8") as f:
-                    for file_name in moved_files:
-                        f.write(f"{file_name}\n")
-                        
-                        
-                # messagebox.showinfo("Success",
-                #                    f"Moved {len(moved_files)} file(s) to 'mods' folder. "
-                #                    "Application will now restart to refresh the listing.")
-                # self.restart_script()
-                # ----------RESTART NO LONGER NECESSARY
-                
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to create NewMods.txt: {e}")
-        else:
-            messagebox.showinfo("Info", "No files were moved.")
 
     # ------------------------------------------------------------
     # Perform Search
@@ -12849,11 +14991,6 @@ class ConfigViewerApp:
         print(f"  DEBUG: perform_search - self.filter_state == 0 (View All): {self.filter_state == 0}")
         print(f"  DEBUG: perform_search - not self.is_data_subset_active (Global Filters OFF): {not self.is_data_subset_active}")
 
-
-
-
-
-
         if not query and self.filter_state == 0 and not self.is_data_subset_active:
             print("  DEBUG: perform_search - Condition MET for Search Results window DESTRUCTION.") # Debug - Condition Met
             if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
@@ -12862,6 +14999,10 @@ class ConfigViewerApp:
                 self.destroy_search_results_window()
                 self.search_results_window = None
                 self.is_search_results_window_active = False
+                print(f"!!!!!!!!!! self.is_search_results_window_active SET TO FALSE by perform_search. Timestamp: {time.time()} !!!!!!!!!!")
+
+
+
                 print("DEBUG: perform_search - Search Results window DESTROYED (Empty query AND View All filter AND Global Filters OFF).")
             else:
                 print("DEBUG: perform_search - Search Results window NOT open, no need to destroy (Empty query AND View All filter AND Global Filters OFF).") # Debug - Window Not Open
@@ -12902,6 +15043,8 @@ class ConfigViewerApp:
             self.destroy_search_results_window()
             self.search_results_window = None
             self.is_search_results_window_active = False
+            print(f"!!!!!!!!!! self.is_search_results_window_active SET TO FALSE by perform_search. Timestamp: {time.time()} !!!!!!!!!!")
+
 
         if self.search_mode == "Configs":
             categories_to_remove = []
@@ -12942,7 +15085,8 @@ class ConfigViewerApp:
         """Creates and configures the Search Results window with smooth scrolling and dynamic resizing.
         MODIFIED to include CUSTOM SCROLLBAR for search results window.
         """
- 
+        print(f"!!!!!!!!!! show_search_results_window CALLED! Timestamp: {time.time()} !!!!!!!!!!")
+
         stack = inspect.stack()
         caller_function_name = "<unknown>"
         caller_filename = "<unknown>"
@@ -12958,21 +15102,31 @@ class ConfigViewerApp:
             caller_code_context = caller_frame_record.code_context
             print(f"    Code context: {caller_code_context}") # Might be None
 
-        print(f"--- destroy_search_results_window() CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+        print(f"--- show_search_results_window() CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+        self.loading_search_results_window = True
+
+        scanning_win = self.show_scanning_window(text="Loading...")
+
+        self.scanning_window = scanning_win
 
 
         self.search_results_window_on_screen = True
-
-
         self.canvas.yview_moveto(0) # Reset main grid scroll to top
 
-        search_results_window = tk.Toplevel(self.master)
-        search_results_window.overrideredirect(True)  # Remove window decorations
-        search_results_window.tk.call('tk', 'scaling', 1.25)
-        search_results_window.title("Search Results")
-        #search_results_window.transient(self.master)
+        # Store the window reference on self so the callback can access it if needed
+        self.search_results_window = FadingToplevel(self.master, self, end_alpha=0.0)
+        # 1. START FULLY TRANSPARENT
+        self.search_results_window.attributes('-alpha', 0.0)
+        self.search_results_window.overrideredirect(True)
+        self.search_results_window.tk.call('tk', 'scaling', 1.25)
+        self.search_results_window.title("Search Results")
+
+
+        print(f"!!!!!!!!!! self.is_search_results_window_active SET TO TRUE by show_search_results_window. Timestamp: {time.time()} !!!!!!!!!!")
         self.is_search_results_window_active = True
-        
+
         disabled_button_style_args = self.button_style_args.copy()
         disabled_button_style_args["fg"] = "grey"
         disabled_button_style_args["activebackground"] = "#555555"
@@ -12982,72 +15136,115 @@ class ConfigViewerApp:
             self.categorize_button.config(state=tk.DISABLED, **disabled_button_style_args)
         if hasattr(self, 'category_list_button'):
             self.category_list_button.config(state=tk.DISABLED, **disabled_button_style_args)
-        
 
-        # Main Canvas for Search Results Window
-        self.search_results_canvas = tk.Canvas(search_results_window, bg="#444444", highlightthickness=0, yscrollincrement=10)
-        self.search_results_canvas.configure(yscrollcommand=self.custom_search_results_scrollbar_set) # Use CUSTOM SCROLLBAR SET
+        self.search_results_canvas = tk.Canvas(self.search_results_window, bg="#444444", highlightthickness=0, yscrollincrement=10)
+        self.search_results_canvas.configure(yscrollcommand=self.custom_search_results_scrollbar_set)
 
-        # Custom Scrollbar Canvas for Search Results Window
-        self.custom_scrollbar_canvas_search_results = tk.Canvas(search_results_window, bg="#555555", highlightthickness=0, width=15) # Grey track
-        self.scrollbar_thumb_search_results = self.custom_scrollbar_canvas_search_results.create_rectangle(0, 0, 15, 20, fill=self.global_highlight_color, outline="") # Orange thumb
-        self.scrollbar_thumb_dragging_search_results = False # Initialize dragging flag
+        self.custom_scrollbar_canvas_search_results = tk.Canvas(self.search_results_window, bg="#555555", highlightthickness=0, width=15)
+        self.scrollbar_thumb_search_results = self.custom_scrollbar_canvas_search_results.create_rectangle(0, 0, 15, 20, fill=self.global_highlight_color, outline="")
+        self.scrollbar_thumb_dragging_search_results = False
         self.scrollbar_thumb_start_y_search_results = 0
         self.scrollbar_mouse_start_y_search_results = 0
+
+
+        self._search_results_scroll_pending = False
+        self._search_results_throttled_after_id = None
+        self._last_search_results_thumb_y = 0 # Store the last clamped thumb Y for search results
+
 
         self.custom_scrollbar_canvas_search_results.bind("<ButtonPress-1>", self.custom_search_results_scrollbar_click)
         self.custom_scrollbar_canvas_search_results.bind("<B1-Motion>", self.custom_search_results_scrollbar_drag)
         self.custom_scrollbar_canvas_search_results.bind("<ButtonRelease-1>", self.custom_search_results_scrollbar_release)
 
-
         self.search_results_scrollable_frame = tk.Frame(self.search_results_canvas, bg="#444444")
-
 
         self.search_results_scrollable_frame.bind(
             "<Configure>",
             lambda e: self.search_results_canvas.configure(scrollregion=self.search_results_canvas.bbox("all"))
         )
         self.search_results_canvas.create_window((0, 0), window=self.search_results_scrollable_frame, anchor="nw")
-        self.search_results_canvas.configure(yscrollcommand=self.custom_search_results_scrollbar_set) # Configure canvas to use CUSTOM scrollbar
+        self.search_results_canvas.configure(yscrollcommand=self.custom_search_results_scrollbar_set)
 
+        self.search_results_canvas.pack(side="left", fill="both", expand=True)
+        self.custom_scrollbar_canvas_search_results.pack(side="right", fill="y")
 
-        self.search_results_canvas.pack(side="left", fill="both", expand=True) # Canvas takes up most space on the LEFT
-        self.custom_scrollbar_canvas_search_results.pack(side="right", fill="y") # Custom scrollbar on the RIGHT edge
-
-
-        # --- NEW: Bind Mousewheel to the search results canvas for smooth scrolling ---
         self.search_results_canvas.bind("<Enter>", lambda e: self.search_results_canvas.bind_all("<MouseWheel>", self.on_mousewheel_search_results))
         self.search_results_canvas.bind("<Leave>", lambda e: self.search_results_canvas.unbind_all("<MouseWheel>"))
-        # --- NEW: Bind Mousewheel to the search results canvas for smooth scrolling ---
-
-        # --- Bind main window's <Configure> event to update search results window position and size ---
-        #self.master.bind("<Configure>", self.update_window_geometries)
-        # --- Bind main window's <Configure> event to update search results window position and size ---
+        self.search_results_window.bind("<FocusOut>", self.on_search_results_focus_out, add='+')
 
 
-        # --- MODIFIED: Populate with final_list (or last search results) ---
-        data_to_populate = final_list # Use final_list if provided
+        data_to_populate = final_list
         if data_to_populate is None:
-            data_to_populate = self.search_results_data # Fallback to last search results if final_list is None
-            print("DEBUG: show_search_results_window - Using self.search_results_data for population (final_list was None).") # Debug
+            data_to_populate = self.search_results_data
+            print("DEBUG: show_search_results_window - Using self.search_results_data for population (final_list was None).")
         else:
-            print("DEBUG: show_search_results_window - Using provided final_list for population.") # Debug
-
+            print("DEBUG: show_search_results_window - Using provided final_list for population.")
 
         if hasattr(self, 'search_results_scrollable_frame') and self.search_results_scrollable_frame:
             for widget in self.search_results_scrollable_frame.winfo_children():
                 widget.destroy()
-            self.populate_search_results_window(self.search_results_scrollable_frame, final_list)
+            # 2. POPULATE CONTENT
+            self.populate_search_results_window(self.search_results_scrollable_frame, data_to_populate) # Pass correct data
 
+        # 2. SET GEOMETRY
         self.update_window_geometries() # Call it once initially to set correct position and size
 
-        search_results_window.bind("<Button-1>", self.debounced_on_search_results_window_click)
+        self.search_results_window.bind("<Button-1>", self.debounced_on_search_results_window_click)
 
-        self.master.after(50, self.inherit_category_visibility_search_results)
+        # 3. FORCE TKINTER TO RENDER EVERYTHING
+        # This ensures all widgets are drawn and sized correctly before the fade starts.
+        self.search_results_window.update_idletasks()
+        self.search_results_window.update() # Use if update_idletasks isn't enough, but be cautious
 
-  
+        # 4. FADE THE WINDOW IN
+        # Define fade parameters (you can make these class attributes or pass them)
+        def start_fade_animation():
+            if not self.search_results_window or not self.search_results_window.winfo_exists():
+                print("DEBUG: Search results window destroyed before fade could start.")
+                return
 
-        return search_results_window # Return the newly created window
+            FADE_IN_DURATION_MS = 40
+            FADE_STEPS = 20
+            self._fade_window(self.search_results_window,
+                                0.0,  # Start alpha
+                                1.0,  # End alpha
+                                FADE_IN_DURATION_MS,
+                                FADE_STEPS,
+                                callback=self._on_search_results_fade_in_complete)
+
+        # Introduce a small delay (e.g., 50-150ms). Experiment with this value!
+        # This gives the OS and Tkinter a moment to fully "paint" the window
+        # in its transparent state before the animation begins.
+        DELAY_BEFORE_FADE_MS = 300 # Start with 50 or 100 and adjust
+        self.master.after(DELAY_BEFORE_FADE_MS, start_fade_animation)
+        # --- END MODIFICATION ---
+
+        return self.search_results_window
+
+        
+    def on_search_results_focus_out(self, event=None):
+        return
+
+    def _on_search_results_fade_in_complete(self):
+        """Callback function after search results window finishes fading in."""
+        print("DEBUG: Search results window fade-in complete.")
+
+        if self.scanning_window:
+            self.scanning_window.destroy()
+
+        self.scanning_window = None
+
+        self.loading_search_results_window = False
+
+        # Safely call inherit_category_visibility_search_results
+        if hasattr(self, 'master') and self.master.winfo_exists():
+            # Ensure the search_results_window itself also still exists if needed by the method
+            if hasattr(self, 'search_results_window') and self.search_results_window.winfo_exists():
+                 self.master.after(10, self.inherit_category_visibility_search_results) # Small delay if needed
+            else:
+                print("DEBUG: Search results window destroyed before inherit_category_visibility could run.")
+        else:
+            print("DEBUG: Master window destroyed before inherit_category_visibility could run.")
 
 
 
@@ -13116,10 +15313,9 @@ class ConfigViewerApp:
         # --- END: Dropdown menu destruction logic from on_main_window_click ---
 
 
-        
-        
-    def destroy_search_results_window(self):
 
+
+    def destroy_search_results_window(self):
 
 
         stack = inspect.stack()
@@ -13143,37 +15339,121 @@ class ConfigViewerApp:
             print("    destroy_search_results_window() - filter_state != 0, not destroying search results window.")
             return # Don't destroy if filter is not "View All"
 
-        if hasattr(self, 'search_results_window') and self.search_results_window and self.search_results_window.winfo_exists():
-            self.search_results_window.destroy()
+        if hasattr(self, 'search_results_window') and self.search_results_window:
+            # Get a reference to the window object we intend to destroy
+            window_to_destroy = self.search_results_window
+
+            # --- Define the actual destruction logic in a nested function ---
+            def do_actual_destroy():
+                print(f"    -> do_actual_destroy(): Executing scheduled destruction for {window_to_destroy}")
+                destruction_occurred = False
+                try:
+                    # Check existence again right before destroying
+                    if window_to_destroy.winfo_exists():
+                        window_to_destroy.destroy()
+                        print(f"    -> do_actual_destroy(): Destruction successful.")
+                        destruction_occurred = True
+                    else:
+                         print(f"    -> do_actual_destroy(): Window {window_to_destroy} was already destroyed before scheduled execution.")
+                         destruction_occurred = True # Treat as if destroyed for state reset
+
+                except tk.TclError as e:
+                    print(f"ERROR during scheduled destroy of {window_to_destroy}: {e}")
+                    # Even if destroy fails with TclError, the window is likely unusable,
+                    # so proceed with state reset and button re-enabling.
+                    destruction_occurred = True
+                except Exception as e:
+                    print(f"Unexpected ERROR during scheduled destroy of {window_to_destroy}: {e}")
+                    destruction_occurred = True # Assume state needs reset
+
+                # --- Reset state and re-enable buttons AFTER attempt/confirmation ---
+                # This block now runs regardless of the self.search_results_window check
+                # as long as the destroy was attempted or window confirmed gone.
+                if destruction_occurred:
+                    print("    -> do_actual_destroy(): Resetting state and re-enabling buttons...")
+
+
+
+                    # --- Re-enable buttons (with existence checks) ---
+                    if not hasattr(self, 'button_style_args'):
+                        self.button_style_args = self._create_button_style() # Example
+                    else:
+                        button_style_args = self.button_style_args.copy()
+
+                    if hasattr(self, 'categorize_button') and self.categorize_button.winfo_exists():
+                        if hasattr(self.categorize_button, 'update_state'):
+                            print("       Updating categorize_button state")
+                            self.categorize_button.update_state(is_disabled=False)
+                        else:
+                            print("       Configuring categorize_button state")
+                            self.categorize_button.config(state=tk.NORMAL, **button_style_args)
+
+                    if hasattr(self, 'category_list_button') and self.category_list_button.winfo_exists():
+                        if hasattr(self.category_list_button, 'update_state'):
+                            print("       Updating category_list_button state")
+                            self.category_list_button.update_state(is_disabled=False)
+                        else:
+                            print("       Configuring category_list_button state")
+                            self.category_list_button.config(state=tk.NORMAL, **button_style_args)
+
+                    # --- Schedule subsequent actions if needed ---
+                    if hasattr(self, 'window_size_changed_during_search_results_window') and self.window_size_changed_during_search_results_window:
+
+                        print("    -> do_actual_destroy(): Scheduling condcheck...")
+                        if hasattr(self, 'condcheck'): # Check if condcheck exists
+                           self.master.after(1000, self.condcheck)
+
+
+
+
+            # --- Schedule the destruction using after_idle ---
+            print(f"    destroy_search_results_window(): Scheduling destruction of {window_to_destroy} via after_idle.")
+            # Mark as pending destruction / gone IMMEDIATELY
             self.search_results_window = None
             self.is_search_results_window_active = False
+            print(f"!!!!!!!!!! self.is_search_results_window_active SET TO FALSE by destroy_search_results_window. Timestamp: {time.time()} !!!!!!!!!!")
 
-            # Enable categorize by and category list buttons when search results window is closed
-            button_style_args = self.button_style_args.copy() # Get base style back
-            if hasattr(self, 'categorize_button'):
-                self.categorize_button.config(state=tk.NORMAL, **button_style_args)
-            if hasattr(self, 'category_list_button'):
-                self.category_list_button.config(state=tk.NORMAL, **button_style_args)
-
-            #if self.window_was_resized and self.filter_state == 0 and not self.search_var.get().strip() and not self.is_data_subset_active and self.all_filters_all:
-            
             self.search_results_window_on_screen = False
 
+            # Schedule the actual destroy task
 
-            if self.window_size_changed_during_search_results_window:
-                self.master.after(1000, self.condcheck())
+
+            self.master.after_idle(do_actual_destroy)
+
+            if self.update_grid_after_size_rechange:
+                print("self.update_grid_after_size_rechange has been set to False, updating grid layout")
+
+                self.update_grid_after_size_rechange = False
+                self.master.after(1000, self.format_grouped_data(self.data))
+                self.master.after(1100, self.update_grid_layout) 
+
+        else:
+            # This case handles if self.search_results_window was already None
+            print("    destroy_search_results_window(): Instance variable self.search_results_window is already None or invalid.")
+            # Optionally, still ensure buttons are enabled here if state might be inconsistent
+            if not self.is_search_results_window_active: # If state says it's inactive, ensure buttons reflect that
+                 print("    destroy_search_results_window(): Ensuring buttons are enabled as window state is inactive.")
 
             
             #self.trigger_toggle_sort_by_install_date_after_search_results_window_close()
 
-
-
-
+        
 
 
     def condcheck(self):
 
-        self.window_size_changed_during_search_results_window = False
+        
+        print("--- condcheck() CALLED BY: ---")
+        for frame_info in inspect.stack()[1:3]: # Look at immediate caller and its caller
+            print(f"  File \"{frame_info.filename}\", line {frame_info.lineno}, in {frame_info.function}")
+        print("-----------------------------")
+
+
+        # Inside condcheck
+        active_flag_in_condcheck = self.is_search_results_window_active
+        print(f"!!!!!!!!!! condcheck READING self.is_search_results_window_active: {active_flag_in_condcheck}. Timestamp: {time.time()} !!!!!!!!!!")
+
+
 
         if self.filter_state != 0 or  self.search_var.get().strip() or self.is_data_subset_active or not self.all_filters_all:
             print(f"cond check not met, not updating the grid, a search results window is open and we don't want to update the grid layout under it?")
@@ -13186,6 +15466,7 @@ class ConfigViewerApp:
             print(f"  DEBUG COND CHECK 3: not self.search_var.get().strip() (Actual Text: '{search_text_value}') = {not search_text_value}")
             print(f"  DEBUG COND CHECK 4: not self.is_data_subset_active (Actual Value: {self.is_data_subset_active}) = {not self.is_data_subset_active}")
             print(f"  DEBUG COND CHECK 5: self.all_filters_all = {self.all_filters_all}")
+            print(f"  DEBUG COND CHECK - is a search results window still open? if so, there's an issue. Value of self.is_search_results_window_active: {self.is_search_results_window_active}")
 
 
         else:
@@ -13203,6 +15484,9 @@ class ConfigViewerApp:
             print("    destroy_search_results_window is calling self.update_grid_layout() - after 500ms")
             print("    because this condition was met ")
             self.master.after(100, self.update_grid_layout) 
+
+
+        self.window_size_changed_during_search_results_window = False
 
 
 
@@ -13251,28 +15535,58 @@ class ConfigViewerApp:
                             # --- MODIFIED: Retain count in header text if present ---
                             header_label.config(text=header_text_with_hidden)
                             print(f"    DEBUG: Header label text updated to: '{header_text_with_hidden}'") # Debug - Header Text Update
-                else:
+                else: # Category is shown in main window
                     print(f"  DEBUG: Category '{category}' is shown in main window. Showing in search results and updating header text.") # Debug - Showing Category
                     if category in self.search_results_category_hidden_states and self.search_results_category_hidden_states[category]: # Prevent redundant toggling
                          self.toggle_category_visibility_search_results(category, self.search_results_scrollable_frame)
                     if header_label: # Update header label text to remove "Hidden" indicator
                         current_text = header_label.cget("text")
-                        header_text_shown = f"{category}"
-                         # --- MODIFIED: Retain count in header text when showing ---
-                        match = re.search(r'^(.*?) \((Hidden|Shown)\) \((\d+)\)$', current_text) # Regex to find existing count
-                        if match:
-                            base_text, _, count = match.groups()
-                            header_text_shown = f"{base_text} ({count})" # Reconstruct with count
-
-                        else:
-                             match_hidden_no_count = re.search(r'^(.*?) \(Hidden\)$', current_text) # Regex to find if only "Hidden" is present
-                             if match_hidden_no_count:
-                                 base_text_hidden_no_count = match_hidden_no_count.groups()[0]
-                                 header_text_shown = f"{base_text_hidden_no_count} (0)" # Reconstruct with default count 0
-
+                        
                         # --- MODIFIED: Retain count in header text when showing ---
+                        # Initialize default values for base text and count
+                        final_base_text = category  # Default to the canonical category name
+                        count_str = "0"             # Default count if not found in current_text
+
+                        # Attempt to parse current_text for base name and count
+                        # Regex 1: Matches "Name (Hidden|Shown) (Digits)"
+                        match_state_count = re.search(r'^(.*?) \((?:Hidden|Shown)\) \((\d+)\)$', current_text)
+                        if match_state_count:
+                            final_base_text = match_state_count.group(1).strip() # Get the base text part
+                            count_str = match_state_count.group(2)
+                        else:
+                            # Regex 2: Matches "Name (Digits)"
+                            # This might also catch "Name (Hidden) (Digits)" if Regex 1 didn't,
+                            # so the base part needs cleaning.
+                            match_just_count = re.search(r'^(.*?)\s*\((\d+)\)$', current_text)
+                            if match_just_count:
+                                potential_base = match_just_count.group(1)
+                                # Clean off (Hidden) or (Shown) if they are part of this group
+                                final_base_text = potential_base.replace(" (Hidden)", "").replace(" (Shown)", "").strip()
+                                count_str = match_just_count.group(2)
+                            else:
+                                # Regex 3: Matches "Name (Hidden|Shown)" (no explicit count)
+                                match_just_state = re.search(r'^(.*?) \((?:Hidden|Shown)\)$', current_text)
+                                if match_just_state:
+                                    final_base_text = match_just_state.group(1).strip()
+                                    # count_str remains "0" (default)
+                                else:
+                                    # Fallback: current_text might be just the category name, or something else.
+                                    # Clean any state indicators and ensure we use the canonical category name.
+                                    # The count_str remains "0" (default).
+                                    # We can parse the current_text for a base, or simply use `category`.
+                                    # Using `category` is safer for the base text in this fallback.
+                                    final_base_text = category # Fallback to using the category name directly
+                                    # If current_text was "CategoryName" or "CategoryName (junk)", count_str is "0".
+
+                        # For consistency, when showing, you might always want the base text to be the canonical category name.
+                        # If so, you can simplify the above to only extract 'count_str' and always use 'category' as base.
+                        # For example: header_text_shown = f"{category} ({count_str})"
+                        # The current logic tries to preserve the base_text parsed from the label.
+
+                        header_text_shown = f"{final_base_text} ({count_str})"
+                        
                         header_label.config(text=header_text_shown)
-                        print(f"    DEBUG: Header label text updated to: '{header_text_shown}'") # Debug - Header Text Update
+                        print(f"    DEBUG: Header label text updated to: '{header_text_shown}'")
             else:
                 print(f"  DEBUG: Category '{category}' not found in main window's hidden states. Defaulting to shown.") # Debug - Category Not Found
 
@@ -13439,8 +15753,12 @@ class ConfigViewerApp:
         name_for_main = info_data.get("Name")
         if not name_for_main or not name_for_main.strip():
             # Fallback: Extract from spawn_cmd if Name is missing/empty
-            extracted_name = self.extract_name_from_spawn_command(spawn_cmd)
-            name_for_main = extracted_name if extracted_name else folder_name # Use folder_name as final fallback
+            
+            
+            name_for_main = folder_name
+            
+            #extracted_name = self.extract_name_from_spawn_command(spawn_cmd)
+            #name_for_main = extracted_name if extracted_name else folder_name # Use folder_name as final fallback
 
 
 
@@ -13525,6 +15843,10 @@ class ConfigViewerApp:
                 label_text = f"{brand_for_main} - {name_for_main} - [{folder_name}]"
             # --- END REVISED Label Text ---
 
+            subgrid_item_count = 0
+            if folder_name in self.full_data: # Assuming self.full_data exists
+                subgrid_item_count = len(self.full_data[folder_name])
+            label_text = f"{label_text} - [{subgrid_item_count}]"
 
             parent_frame.after(0, lambda: self._update_search_item_frame_ui(
                 parent_frame,
@@ -13546,6 +15868,12 @@ class ConfigViewerApp:
     def _on_search_item_hover_enter(self, event, item_frame, info_data, picture_path, zip_file, folder_name, spawn_cmd):
         """Handles hover enter specifically for search result items."""
         # Find the image and label widgets within the item_frame passed by the event
+
+
+        if self.disable_hover_temporarily:
+            print(f"exiting early, hover disabled (search)")
+            return
+
         lbl_img = None
         lbl_name = None
         for child in item_frame.winfo_children():
@@ -13576,6 +15904,12 @@ class ConfigViewerApp:
     def _on_search_item_hover_leave(self, event, item_frame):
         """Handles hover leave specifically for search result items."""
         # Find the image and label widgets within the item_frame passed by the event
+
+        if self.disable_hover_temporarily:
+            print(f"exiting early, hover disabled (search)")
+            return
+
+
         lbl_img = None
         lbl_name = None
         for child in item_frame.winfo_children():
@@ -13599,7 +15933,6 @@ class ConfigViewerApp:
             self.main_grid_sidebar_debounce_timer = None
 
 
-
     def _update_search_item_frame_ui(self, parent_frame, pil_image, label_text, spawn_cmd, info_data, zip_file, picture_path, folder_name):
         """
         (REVISED) Creates the actual Tkinter image and label widgets
@@ -13616,16 +15949,16 @@ class ConfigViewerApp:
             photo = ImageTk.PhotoImage(pil_image)
 
             # --- Create Image Label ---
-            lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="white")
+            lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="#FFFFFF")
             lbl_img.image = photo
             lbl_img.pack(padx=0, pady=0)
             # --- STORE Default BG Color ---
-            lbl_img.default_bg_color = "white"
+            lbl_img.default_bg_color = "#FFFFFF"
 
             # --- Determine Text Color ---
-            label_color = "white" # Default
+            label_color = "#FFFFFF" # Default
             if "_user--" in picture_path:
-                label_color = "lightblue"
+                label_color = "#ADD8E6"
             else:
                 found_double_basename = False
                 if hasattr(self, 'ZIP_BASE_NAMES') and self.ZIP_BASE_NAMES:
@@ -13678,7 +16011,7 @@ class ConfigViewerApp:
             print(f"TclError updating search item UI (parent likely destroyed): {e}")
         except Exception as e_ui:
             print(f"General error updating search item UI for '{label_text}': {e_ui}")
-            import traceback
+
             traceback.print_exc() # Print full traceback for unexpected UI errors
 
 
@@ -13719,6 +16052,10 @@ class ConfigViewerApp:
         print(f"DEBUG: populate_search_results_window - data_list received (count): {len(data_list)}")
 
         grouped_data = self.format_grouped_data(data_list)
+
+
+
+
         self.columns_search_results = self.columns
         self.column_padding_search_results = self.column_padding
         self.image_counts_search_results = {}
@@ -13730,6 +16067,16 @@ class ConfigViewerApp:
 
         for category in grouped_data:
             category_items = grouped_data[category]
+
+
+            if category == "Favorites" and \
+               self.show_pinned_favorites_category and \
+               self.categorization_mode in ["Type", "Country", "None"]:
+                print(f"  DEBUG: populate_search_results_window - SKIPPING 'Favorites' category for display in search results.")
+                continue # Skip to the next category, effectively not rendering "Favorites"
+
+
+
             if not category_items:
                 continue
 
@@ -13747,10 +16094,10 @@ class ConfigViewerApp:
             item_count = len(category_items)
             header_text_with_count = f"{category} ({item_count})"
 
-            header_label = tk.Label(header_frame, text=header_text_with_count, font=("Segoe UI", 14+self.font_size_add, "bold"), bg="#444444", fg="lightgrey", anchor="w", cursor="hand2") # Added cursor="hand2" for visual feedback
+            header_label = tk.Label(header_frame, text=header_text_with_count, font=("Segoe UI", 14+self.font_size_add, "bold"), bg="#444444", fg="#d9d9d9", anchor="w", cursor="hand2") # Added cursor="hand2" for visual feedback
             header_label.pack(side=tk.LEFT, padx=10, pady=(10, 0))
 
-            separator = tk.Frame(header_frame, height=4, bd=1, relief="sunken", bg="lightgrey", cursor="hand2") # Added cursor="hand2" for visual feedback
+            separator = tk.Frame(header_frame, height=4, bd=1, relief="sunken", bg="#d9d9d9", cursor="hand2") # Added cursor="hand2" for visual feedback
             separator.pack(side=tk.BOTTOM, fill="x", padx=10, pady=(0, 10))
 
             # Create subframe for images - pack AFTER header, store reference
@@ -13803,26 +16150,47 @@ class ConfigViewerApp:
             print(f"  DEBUG: toggle_category_visibility_search_results - Showing category subframe: {category}, Packing AFTER header_frame.")
             # --- MODIFIED: Pack subframe AFTER its header frame to maintain order ---
 
+
     def on_category_hover_enter_search_results(self, event, category, header_label, separator, count):
-        """Handles mouse hover enter event for category headers in Search Results window."""
-        separator.config(bg=self.global_highlight_color)
-        header_label.config(fg=self.global_highlight_color)
+        """Handles mouse hover enter event for category headers in Search Results window with animation."""
+        # --- Instant Text Change ---
         if self.search_results_category_hidden_states.get(category, False):
             header_label.config(text=f"{category} (Show) ({count})")
         else:
             header_label.config(text=f"{category} (Hide) ({count})")
 
+        # --- Start Animation ---
+        # Using a slightly different prefix for the group key is optional,
+        # but can help if you need to debug animation states later.
+        group_key = ("search_category_header", category)
+        property_config_list_target = [
+            {'widget': separator, 'property': 'bg', 'target_color': self.global_highlight_color},
+            {'widget': header_label, 'property': 'fg', 'target_color': self.global_highlight_color}
+        ]
+        self._start_generic_animation(group_key, property_config_list_target)
+
+
     def on_category_hover_leave_search_results(self, event, category, header_label, separator, count):
-        """Handles mouse hover leave event for category headers in Search Results window."""
-        separator.config(bg="lightgrey")
-        header_label.config(fg="lightgrey")
+        """Handles mouse hover leave event for category headers in Search Results window with animation."""
+        original_color_hex = "#d9d9d9" # This is already a hex color
+
+        # --- Instant Text Change ---
         if self.search_results_category_hidden_states.get(category, False):
             header_label.config(text=f"{category} (Hidden) ({count})")
         else:
             header_text = category
-            if self.search_results_category_hidden_states.get(category, False):
-                header_text += " (Hidden)"
+            # This inner check for (Hidden) seems redundant if the outer one already handles it
+            # if self.search_results_category_hidden_states.get(category, False):
+            #     header_text += " (Hidden)"
             header_label.config(text=f"{header_text} ({count})")
+
+        # --- Start Animation Back ---
+        group_key = ("search_category_header", category)
+        property_config_list_target = [
+            {'widget': separator, 'property': 'bg', 'target_color': original_color_hex},
+            {'widget': header_label, 'property': 'fg', 'target_color': original_color_hex}
+        ]
+        self._start_generic_animation(group_key, property_config_list_target)
       
 
 
@@ -13853,179 +16221,12 @@ class ConfigViewerApp:
     #######################################################
 
         
-    def is_placeholder(self, picture_path):
-        missing_custom_pic_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
-        missing_zip_pic_path = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
-        return picture_path in [missing_custom_pic_path, missing_zip_pic_path]
-
-    # ------------------------------------------------------------
-    # Populate Initial Grid
-    # ------------------------------------------------------------
-    def populate_initial_grid(self):
-        self.load_floating_window_position()
-        print("    populate_initial_grid is calling self.perform_search()")
-        self.perform_search()
-        print("    populate_initial_grid is calling self.update_grid_layout()")
-        self.update_grid_layout()
-        self.all_main_grid_images_cached = self.are_all_main_grid_images_cached()
-        print(f"populate_initial_grid - all_main_grid_images_cached set to: {self.all_main_grid_images_cached}")
-
-    def are_all_main_grid_images_cached(self):
-        """
-        Checks if all images intended for the main grid in the current dataset are already in the image cache.
-        """
-        # print("Checking are_all_main_grid_images_cached...")
-        all_picture_paths = set()
-        for category_name, category_items in self.grouped_data.items():
-            # print(f"  Category: {category_name}")
-            for item in category_items:
-                picture_path = None
-                if isinstance(item, dict) and 'configs' in item:
-                    for config in item['configs']:
-                        picture_path = config[0]
-                elif len(item) == 5:
-                    picture_path = item[0]
-
-                if picture_path:
-                    all_picture_paths.add(picture_path)
-
-        print(f"  Total picture paths to check: {len(all_picture_paths)}")
-
-        for picture_path in all_picture_paths:
-            # --- Normalize picture_path BEFORE checking cache ---
-            normalized_picture_path = os.path.normpath(os.path.abspath(picture_path)) # Normalize Path - ADDED NORMALIZATION HERE!
-
-            is_cached = normalized_picture_path in self.image_cache # Check CACHE using NORMALIZED PATH
-            is_placeholder_img = self.is_placeholder(picture_path)
-            # print(f"  Checking: {os.path.basename(picture_path)}, Normalized Path: {normalized_picture_path}, Cached: {is_cached}, Placeholder: {is_placeholder_img}")
-            if not is_cached and not is_placeholder_img:
-                # print("    NOT all images cached - returning False")
-                return False
-        print("  All images cached (or placeholder) - returning True")
-        return True
-
-        
-    #@profile
-    def load_next_batch(self):
-
-        print(f"@@@ ENTERING load_next_batch - pause_loading: {self.pause_loading}, category_index: {self.current_category_index}, batch_index: {self.current_batch_index}")
-        if self.scanning_win:
-            self.scanning_win.destroy()
-
- 
-        self.scanning_win = None
-        
-        if self.pause_loading:
-            # If loading is paused, try again after 100ms
-            self.master.after(100, self.load_next_batch)
-            # print("Load Next Batch - PAUSED (Main Grid - Paused Flag Active)") # Debug Print - MODIFIED message
-            return  # EXIT if loading is paused
-
-        if self.current_category_index >= len(self.category_batches):
-            # All categories loaded
-            self.canvas.config(scrollregion=self.canvas.bbox("all"))
-            # Stop loading animation
-            self.stop_loading_animation()
-            self.hide_progress_bar_main() # ADDED back to hide progress bar when all done
-            # --- NEW: Call cache check AFTER loading completes ---
-            self.check_all_main_grid_images_cached()  # CALL CACHE CHECK HERE!
-            return
-
-        category, batches, category_subframe = self.category_batches[self.current_category_index]
-
-        # --- NEW: Check if category is hidden (collapsed) ---
-        if self.category_hidden_states.get(category, False):
-            print(f"DEBUG: load_next_batch - Category '{category}' is collapsed. Skipping image loading.")
-            self.current_category_index += 1  # Move to the next category
-            self.current_batch_index = 0      # Reset batch index for the next category
-            self.current_main_batch_index_in_sequence = 0 # Reset sequence index for new category
-            self.master.after(0, self.load_next_batch) # Schedule next category batch
-            return  # Skip loading for this category
-
-        if self.current_batch_index >= len(batches):
-            # Finished batches in current category, move to next category
-            self.current_category_index += 1
-            self.current_batch_index = 0
-            self.current_main_batch_index_in_sequence = 0 # Reset sequence index for new category
-            self.master.after(0, self.load_next_batch)  # Schedule next category batch
-            return
-
-        batch = batches[self.current_batch_index]
-        self.current_batch_index += 1
-
-        # --- NEW: Dynamic Batch Size Logic + Cached Images Batching ---
-        if self.all_main_grid_images_cached:
-            batch_size_to_load = 100 # Load in larger batches if all cached
-            # print("  Using batch_size_to_load = 50 (all_main_grid_images_cached is True)") # ADDED
-        elif self.current_main_batch_index_in_sequence < len(self.main_grid_batch_sizes):
-            batch_size_to_load = self.main_grid_batch_sizes[self.current_main_batch_index_in_sequence]
-            # print(f"  Using batch_size_to_load = {batch_size_to_load} (dynamic batch size sequence)") # ADDED
-        else:
-            batch_size_to_load = self.default_batch_size # Use default after sequence
-            # print(f"  Using batch_size_to_load = {batch_size_to_load} (default batch size)") # ADDED
-
-        items_to_load_this_time = batch[:batch_size_to_load] # Load only up to batch_size_to_load items
-        batch = batch[batch_size_to_load:] # Update batch to remove loaded items - for next iteration
-        batches[self.current_batch_index - 1] = batch # Update the batches list in category_batches
-
-        if not items_to_load_this_time: # If no more items to load in this batch (batch is now empty)
-            self.current_main_batch_index_in_sequence += 1 # Move to next batch size in sequence
-            self.master.after(100, self.load_next_batch) # Schedule next batch load immediately
-            return
-
-        total_items_in_grid = sum(len(b) for _, batches, _ in self.category_batches for b in batches)
-        items_loaded_so_far = 0
-
-        # Recalculate items_loaded_so_far more accurately
-        for cat_index in range(self.current_category_index): # Loop through previous categories
-            cat_batches = self.category_batches[cat_index][1] # Get batches for category
-            for bat in cat_batches:
-                if isinstance(bat, list):
-                    items_loaded_so_far += len(bat)
-        # Add items from already loaded batches in the current category
-        current_cat_batches = self.category_batches[self.current_category_index][1] # Get batches for current category
-        for batch_index in range(self.current_batch_index - 1): # Loop through previous batches in current category
-            bat = current_cat_batches[batch_index]
-            if isinstance(bat, list):
-                items_loaded_so_far += len(bat)
-        # Add items to be loaded in this batch
-        items_loaded_so_far += len(items_to_load_this_time)
-
-        self.update_progress_bar_main(items_loaded_so_far, total_items_in_grid)
-
-        for item in items_to_load_this_time: # Iterate over items to load in THIS batch iteration
-            if item is None:
-                continue
-            if isinstance(item, dict) and 'configs' in item:
-                for config in item['configs']:
-                    self.load_image_item(config, category_subframe, category)
-            else:
-                if len(item) == 5:
-                    picture_path, spawn_cmd, zip_file, info_data, folder_name = item
-                    self.load_image_item(item, category_subframe, category)
-                else:
-                    continue
-
-        self.current_main_batch_index_in_sequence += 1 # Move to next batch size in sequence
-
-        # Schedule the next batch after a short delay (e.g., 150 milliseconds)
-        if self.all_main_grid_images_cached:
-            self.master.after(0, self.load_next_batch) # Load next batch immediately if all cached
-            # print("load_next_batch EXIT (Scheduled next batch - all cached - after 0ms)") # ADDED
-        else:
-            self.master.after(150, self.load_next_batch) # Schedule the next batch after a short delay (e.g., 150 milliseconds)
-            # print("load_next_batch EXIT (Scheduled next batch - not all cached - after 150ms)") # ADDED
-    
-    
-
-
-
 
 
 
 
     def create_progress_bar_main(self, parent_frame):
-        self.progress_bar_bg_main = tk.Frame(parent_frame, height=15, width=200, bg="white", bd=1, relief=tk.SOLID)
+        self.progress_bar_bg_main = tk.Frame(parent_frame, height=15, width=200, bg="#FFFFFF", bd=1, relief=tk.SOLID)
         self.progress_bar_fill_main = tk.Frame(self.progress_bar_bg_main, height=13, width=0, bg=self.global_highlight_color)
         self.progress_bar_fill_main.place(x=1, y=1)
         self.progress_bar_bg_main.pack(side="right", padx=10, fill=tk.X, expand=False)
@@ -14072,6 +16273,21 @@ class ConfigViewerApp:
 #        self.scanning_win = None
 
 
+        if self.warning_scanning_win:
+            self.warning_scanning_win.destroy()
+
+        if self.update_grid_layout_run:
+
+            if ConfigViewerApp.item_number >= self.grid_layout_split_value:
+                print(f"DEBUG: load_image_item - temp test limit hit")
+
+                self.warning_scanning_win = self.show_scanning_window(text= "Some items at the bottom of the main list may not be shown due to cutoff. Please make\n"
+                                                                            "the window wider, collapse some categories, or change UI scale to a smaller value to\n"
+                                                                            "prevent visual cutoff at the bottom of the list if items appear to be missing."
+
+                                                                            "\n\nClick here to dismiss this notification.", tall=True, click_dismiss=True)
+        self.update_grid_layout_run = False
+
 
     def hide_progress_bar_details(self):
         self.progress_bar_bg_details.pack_forget()
@@ -14082,7 +16298,7 @@ class ConfigViewerApp:
 
 
     def create_progress_bar_details(self, parent_frame):
-        self.progress_bar_bg_details = tk.Frame(parent_frame, height=15, width=200, bg="white", bd=1, relief=tk.SOLID)
+        self.progress_bar_bg_details = tk.Frame(parent_frame, height=15, width=200, bg="#FFFFFF", bd=1, relief=tk.SOLID)
         self.progress_bar_fill_details = tk.Frame(self.progress_bar_bg_details, height=13, width=0, bg=self.global_highlight_color)
         self.progress_bar_fill_details.place(x=1, y=1)
         self.progress_bar_bg_details.pack(side="right", padx=10, fill=tk.X, expand=False)
@@ -14193,7 +16409,7 @@ class ConfigViewerApp:
         self.details_page_label.config(fg=self.global_highlight_color)
         def reset_header_color():
             # --- MODIFIED: Reset color of new label ---
-            self.details_showing_configs_label.config(fg="white") # <--- RESET HEADER COLOR to WHITE (NEW LABEL)
+            self.details_showing_configs_label.config(fg="#FFFFFF") # <--- RESET HEADER COLOR to WHITE (NEW LABEL)
             # --- MODIFIED: Reset color of new label ---
             self.details_page_label.config(fg=self.details_page_label_original_color)
 
@@ -14241,6 +16457,790 @@ class ConfigViewerApp:
             self.details_window.after(500, change_color)
 
         change_color()
+    
+
+
+
+
+
+
+    def generate_matches_config_txt(self, config_info_folder, script_dir):
+        """
+        Generates "matches_config.txt" using regex to extract Configuration values,
+        skipping files that DO NOT contain "--INDIVIDUAL--" in their filename.
+        """
+        matches_file_path = os.path.join(self.script_dir, "data/Matches.txt")
+        matches_config_file_path = os.path.join(self.script_dir, "data/matches_config.txt")
+
+
+        if os.path.exists(matches_config_file_path):
+            print(f"{matches_config_file_path} already exists. Skipping generation.")
+            return  # Exit the function without overwriting
+
+        try:
+            with open(matches_file_path, 'r', encoding="utf-8") as matches_file, \
+                 open(matches_config_file_path, 'w', encoding="utf-8") as config_output_file:
+
+                current_filename = None
+                current_content_lines = []
+                reading_content = False
+
+                for line in matches_file:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    if not reading_content:
+                        if line == '}': # Check if a '}' appears unexpectedly as a filename
+                            continue # Skip this line and move to the next
+                        current_filename = line
+
+                        # --- NEW: Skip files without "--INDIVIDUAL--" in filename ---
+                        if "--INDIVIDUAL--" not in current_filename:
+                            reading_content = False # Skip reading content for this file
+                            current_filename = None # Reset filename
+                            continue # Go to the next line in matches_file
+                        # --- NEW: Skip files without "--INDIVIDUAL--" in filename ---
+
+                        reading_content = True
+                    elif line == '}':
+                        current_content_lines.append(line)
+                        content = "\n".join(current_content_lines)
+                        config_name = "N/A" # Default value if "Configuration" not found
+
+                        # --- Use regex to extract Configuration value ---
+                        config_match = re.search(r'"Configuration"\s*:\s*"([^"]*)"', content, re.IGNORECASE)
+                        if config_match:
+                            config_name = config_match.group(1).strip()
+                        else:
+                            config_name = "REGEX_ERROR" # Indicate regex extraction error
+                        # --- Use regex to extract Configuration value ---
+
+                        output_line = f"{current_filename}||{config_name}"
+                        config_output_file.write(output_line + '\n')
+
+                        current_filename = None
+                        current_content_lines = []
+                        reading_content = False
+                    elif reading_content:
+                        current_content_lines.append(line)
+
+            print(f"Successfully generated {matches_config_file_path}")
+
+        except FileNotFoundError:
+            print(f"Error: {matches_file_path} not found. Cannot generate matches_config.txt.")
+        except Exception as e:
+            print(f"Error generating matches_config.txt: {e}")
+
+
+
+
+
+
+    def load_matches_config_data(self):
+        """Loads matches_config.txt into a dictionary for fast lookup."""
+        matches_config_file_path = os.path.join(self.script_dir, "data/matches_config.txt")
+        config_map = {}
+        try:
+            with open(matches_config_file_path, 'r', encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        parts = line.split("||")
+                        if len(parts) == 2:
+                            filename_part = parts[0].strip()
+                            config_name = parts[1].strip()
+                            config_map[filename_part] = config_name
+            print(f"Loaded {len(config_map)} entries from matches_config.txt") # Debug print
+        except FileNotFoundError:
+            print(f"Warning: {matches_config_file_path} not found.")
+        except Exception as e:
+            print(f"Error loading matches_config.txt: {e}")
+        return config_map
+
+
+
+
+
+
+    def start_loading_animation(self):
+        """Starts the pulsating 'Loading...' animation."""
+        if not self.loading_animation_running:
+            self.loading_animation_running = True
+            #self.loading_label.pack(side="left", padx=(10, 0))  # Show the label
+            self.animate_loading()
+
+    def stop_loading_animation(self):
+        """Stops the pulsating 'Loading...' animation."""
+        self.loading_animation_running = False
+        self.loading_label.pack_forget()  # Hide the label
+
+    def animate_loading(self):
+        """Animates the 'Loading...' text with a pulsating effect."""
+        if not self.loading_animation_running:
+            return
+
+        colors = ["blue", "black"]
+        cycle = itertools.cycle(colors)
+
+        def change_color():
+            if not self.loading_animation_running:
+                return
+            self.loading_label.config(fg=next(cycle))
+            self.master.after(500, change_color)
+
+        change_color()
+    # ------------------------------------------------------------
+    # Extract Name from Spawn Command
+    # ------------------------------------------------------------
+    def extract_name_from_spawn_command(self, spawn_command):
+        match = re.search(r"config\s*=\s*'vehicles/[^/]+/([^\.]+)\.pc'", spawn_command)
+        if match:
+            return match.group(1)
+        else:
+            return os.path.splitext(os.path.basename(spawn_command))[0].split('--')[-1]
+
+    # ------------------------------------------------------------
+    # Load & Display Image 
+    # ------------------------------------------------------------
+
+
+
+    def load_and_display_image(self, picture_path, parent_frame, zip_file, spawn_cmd, info_data, folder_name, category_context):
+        try:
+            if picture_path is None:
+                print(f"DEBUG: load_and_display_image - picture_path is None. Skipping.")
+                return
+
+            normalized_picture_path = os.path.normpath(os.path.abspath(picture_path))
+            cache_key = normalized_picture_path
+
+            # --- Optimized Cache: Check Memory Cache (LRU) FIRST ---
+            photo_from_cache = None
+            cache_hit_initial = False
+            with self.cache_access_lock: # <<< Protect cache access
+                if cache_key in self.image_cache:
+                    photo_from_cache = self.image_cache[cache_key]
+                    self.image_cache.move_to_end(cache_key) # Update LRU
+                    cache_hit_initial = True
+            
+            if cache_hit_initial:
+                print(f"DEBUG: load_and_display_image - Memory Cache HIT for: {category_context} - {picture_path}\n")
+                # Use photo_from_cache
+                if self.pause_loading:
+                    self.main_grid_skipped_updates_queue.append((parent_frame, photo_from_cache, None, zip_file, spawn_cmd, info_data, picture_path, folder_name, category_context))
+                    return
+                
+                if parent_frame.winfo_exists():
+                    self.master.after(
+                        0,
+                        lambda pf=parent_frame, pht=photo_from_cache, zf=zip_file, sc=spawn_cmd, idt=info_data, pp=picture_path, fn=folder_name, cc=category_context:
+                            self.create_main_item_widgets(pf, pht, None, zf, sc, idt, pp, fn, cc)
+                    )
+                return
+
+            # --- Acquire path-specific lock to serialize disk access ---
+            with self._dict_lock:
+                path_specific_lock = self.image_load_locks.setdefault(cache_key, threading.Lock())
+
+            with path_specific_lock:
+                # --- Re-check Memory Cache (LRU) INSIDE path_specific_lock ---
+                photo_from_cache_after_lock = None
+                cache_hit_after_path_lock = False
+                with self.cache_access_lock: # <<< Protect cache access
+                    if cache_key in self.image_cache:
+                        photo_from_cache_after_lock = self.image_cache[cache_key]
+                        self.image_cache.move_to_end(cache_key)
+                        cache_hit_after_path_lock = True
+
+                if cache_hit_after_path_lock:
+                    print(f"DEBUG: load_and_display_image - Memory Cache HIT (after path_specific_lock) for: {picture_path}")
+                    # Use photo_from_cache_after_lock
+                    if self.pause_loading:
+                        self.main_grid_skipped_updates_queue.append((parent_frame, photo_from_cache_after_lock, None, zip_file, spawn_cmd, info_data, picture_path, folder_name, category_context))
+                        return
+                    
+                    if parent_frame.winfo_exists():
+                        self.master.after(
+                            0,
+                            lambda pf=parent_frame, pht=photo_from_cache_after_lock, zf=zip_file, sc=spawn_cmd, idt=info_data, pp=picture_path, fn=folder_name, cc=category_context:
+                                self.create_main_item_widgets(pf, pht, None, zf, sc, idt, pp, fn, cc)
+                        )
+                    return
+
+                # --- If still not in cache, proceed with disk loading ---
+                try:
+                    if not os.path.exists(normalized_picture_path):
+                        print(f"DEBUG: load_and_display_image - Path does not exist (under lock): {normalized_picture_path}")
+                        with self._dict_lock: # Remove from image_load_locks if path DNE
+                            if self.image_load_locks.get(cache_key) == path_specific_lock:
+                                del self.image_load_locks[cache_key]
+                        return
+
+                    img = Image.open(normalized_picture_path).convert("RGBA")
+                    img = img.resize((250, 140), self.RESAMPLE_FILTER)
+                    pil_image = img.copy()
+
+                    self.master.after(
+                        0,
+                        lambda p_img=pil_image, pf=parent_frame, zf=zip_file, sc=spawn_cmd, idt=info_data, pp=normalized_picture_path, fn=folder_name, ck=cache_key, cat_ctx=category_context:
+                            self._create_photo_image_and_update_ui(p_img, pf, zf, sc, idt, pp, fn, ck, save_to_disk_cache=False, cat_ctx=cat_ctx)
+                    )
+                except Exception as e_load:
+                    print(f"Error loading image {normalized_picture_path} (under path_specific_lock): {e_load}")
+                    print(f"Exception type: {type(e_load)}, repr: {repr(e_load)}")
+                    print(traceback.format_exc())
+                    with self._dict_lock: # Remove from image_load_locks if loading failed
+                        if self.image_load_locks.get(cache_key) == path_specific_lock:
+                            del self.image_load_locks[cache_key]
+            
+        except Exception as e_outer:
+            path_for_error_msg = picture_path if 'picture_path' in locals() and picture_path is not None else "Unknown"
+            print(f"Outer error in load_and_display_image for {path_for_error_msg}: {e_outer}")
+            print(f"Exception type: {type(e_outer)}, repr: {repr(e_outer)}")
+            print(traceback.format_exc())
+
+
+
+
+    def _create_photo_image_and_update_ui(self, pil_image, parent_frame, zip_file, spawn_cmd, info_data, picture_path, folder_name, cache_key, save_to_disk_cache=False, cat_ctx=None): # Disk cache disabled for now
+         """Helper function to create PhotoImage, update UI in main thread, and optionally save to disk cache."""
+         try:
+             photo = ImageTk.PhotoImage(pil_image) # PhotoImage creation in main thread
+
+             # --- Optimized Cache: Add to Memory Cache (LRU) ---
+             self._add_to_cache(cache_key, photo)
+             # --- Optimized Cache: Add to Memory Cache (LRU) ---
+
+
+             if parent_frame.winfo_exists():
+                 # Schedule GUI update in the main thread
+                self.master.after(
+                    0,
+                    # Modified lambda to accept an optional event arg 'e' and ignore it
+                    lambda e=None, pf=parent_frame, pht=photo, zp=zip_file, sc=spawn_cmd, idata=info_data, pp=picture_path, fn=folder_name, cc=cat_ctx:
+                        self.create_main_item_widgets(pf, pht, None, zp, sc, idata, pp, fn, cc)
+                )
+
+         except Exception as e:
+             print(f"Error creating PhotoImage or updating UI: {e}")
+             
+             
+
+########################
+
+
+    def _add_to_cache(self, cache_key, photo_image):
+        """Adds a PhotoImage to the LRU cache, evicting the least recently used if full."""
+        with self.cache_access_lock: # <<< Protect all cache modifications
+            self.image_cache[cache_key] = photo_image # Add/update item
+            self.image_cache.move_to_end(cache_key)   # Mark as recently used
+
+            if len(self.image_cache) > self.image_cache_capacity:
+
+                lru_key, _ = self.image_cache.popitem(last=False) 
+                print(f"DEBUG: _add_to_cache - Evicted {lru_key} due to capacity.") # Log which key was evicted
+                self.eviction_count += 1
+                if not self.eviction_timer_running:
+                    self._start_eviction_timer()
+
+
+    def _start_eviction_timer(self):
+        """Starts the eviction summary timer if not already running."""
+        if not self.eviction_timer_running:
+            self.eviction_timer_running = True
+            self.master.after(self.eviction_batch_delay_ms, self._print_eviction_summary)
+
+    def _print_eviction_summary(self):
+        """Prints the eviction summary and resets the counter and timer flag."""
+        if self.eviction_count > 0:
+            print(f"DEBUG: _add_to_cache - Evicted {self.eviction_count} items in the last {self.eviction_batch_delay_ms/1000} seconds.")
+            self.eviction_count = 0
+        self.eviction_timer_running = False # Reset timer flag - allows timer to be restarted on next eviction
+
+########################
+
+
+
+    def create_main_item_widgets(self, parent_frame, photo, pil_image, zip_file, spawn_cmd, info_data, picture_path, folder_name, category_context=None):
+        """
+        Creates and configures the widgets for a single image item in the main grid window,
+        with animated hover effects.
+        """
+        if not parent_frame.winfo_exists():
+            return
+
+        # --- Image Label (similar to details view) ---
+        lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="white") # <--- DARKER GRAY bg for lbl_img, MODIFIED HERE
+        lbl_img.image = photo
+        lbl_img.pack(padx=0, pady=0)
+
+        # --- NEW: Store default image background color ---
+        lbl_img.default_bg_color = "white" # Store the default bg color for image label - background - border for images
+        # --- NEW: Store default image background color ---
+
+
+        # --- Text Label (info label) ---
+        brand_for_main = info_data.get("Brand", "Unknown")
+        if not brand_for_main.strip():
+            brand_for_main = "Unknown"
+        type_for_main = info_data.get("Type", "Unknown")
+        if not type_for_main.strip():
+            type_for_main = "Unknown"
+
+        if brand_for_main == "Unknown":
+            brand_for_main = type_for_main
+
+        name_for_main = info_data.get("Name")
+        if not name_for_main or not name_for_main.strip():
+            name_for_main = folder_name
+
+
+        if "user--" in picture_path:
+            text_color = "lightblue"
+
+        elif "user--" not in picture_path: # Only check for double basename if "user--" is NOT present
+            found_double_basename = False
+            for base_name in self.ZIP_BASE_NAMES:
+                if picture_path.count(f"--{base_name}_{base_name}.zip") > 0: # Check for the specific pattern
+                    found_double_basename = True
+                    break # No need to check further once one is found
+            if found_double_basename:
+                text_color = "#f7efd7" # color for default zips/folder combo
+            else:
+                text_color = "white" # Still default to white if double basename not found
+
+
+        if not self.show_folder_settings:
+            combined_text = f"{brand_for_main} - {name_for_main}"
+
+        if self.show_folder_settings:
+            combined_text = f"{brand_for_main} - {name_for_main} - [{folder_name}]"
+
+        # --- Count items in subgrid data for this folder ---
+        subgrid_item_count = 0
+        if folder_name in self.full_data:
+            subgrid_item_count = len(self.full_data[folder_name])
+        # --- Count items in subgrid data for this folder ---
+
+        # --- Append count to label text ---
+        label_text_with_count = f"{combined_text} - [{subgrid_item_count}]" # Append count in brackets
+
+
+        lbl_info = tk.Label(
+            parent_frame,
+            text=label_text_with_count, # Use text with count
+            wraplength=200, #label length, don't remove current
+            justify="center",
+            fg=text_color, # Use DEFAULT text color here - HIGHLIGHTING IS HANDLED SEPARATELY
+            font=("Segoe UI", 10+self.font_size_add, "bold"),
+            cursor="hand2",
+            bg="#444444", # <--- DARKER GRAY bg for lbl_info
+            height=3,
+            anchor=tk.N
+        )
+        if not self.omit_label:
+            lbl_info.pack(padx=00, pady=(2, 0))
+
+
+        self.main_grid_labels.append(lbl_info) # Append lbl_info to the list
+        #print(f"DEBUG: create_main_item_widgets - Added label widget to self.main_grid_labels - Label Widget ID: {id(lbl_info)}, List Size: {len(self.main_grid_labels)}") # Debug - List Add
+
+
+
+        # --- NEW: Store default text color as attribute ---
+        lbl_info.default_fg_color = text_color  # Store the default text color
+        # --- NEW: Store default text color as attribute ---
+
+        # --- NEW: Disable hover flag and timer ---
+        self.disable_hover_temporarily = False
+
+        self.hover_disable_timer = None
+        # --- NEW: Disable hover flag and timer ---
+
+
+        # --- Hover effect for both image and text labels (similar to details) ---
+        original_text_color = text_color # Store original text color (could be highlighted or default)
+        hover_text_color = self.global_highlight_color
+        hover_bg_color = self.global_highlight_color # Background color for image hover
+        original_bg_color_img = "white" # Original bg color for image label - DARKER GRAY
+
+
+        def on_hover_enter(event):
+
+
+            if self.disable_hover_temporarily:
+                #print(f"exiting early, hover disabled")
+                return
+
+            event.widget.config(highlightbackground="blue", highlightthickness=0)
+            # Check if lbl_img is already red before changing bg
+            current_bg = lbl_img.cget("bg")
+            if not current_bg != "red": # Only change bg if it's not already red
+                pass
+
+            else:
+                lbl_info.config(fg=hover_text_color)
+                lbl_img.config(bg=hover_bg_color) # Change image label background on hover
+
+
+        # --- DEBOUNCED sidebar update ---
+            if self.main_grid_sidebar_debounce_timer:
+                self.master.after_cancel(self.main_grid_sidebar_debounce_timer)  # Cancel existing timer
+            self.main_grid_sidebar_debounce_timer = self.master.after(
+                200,  # Debounce delay (e.g., 400ms) - adjust as needed
+                lambda: self.debounced_main_sidebar_info_update(info_data, picture_path, zip_file, folder_name, item=(picture_path, spawn_cmd, zip_file, info_data, folder_name), hovered_category=category_context)
+            )
+            # --- DEBOUNCED sidebar update ---
+
+
+        def on_hover_leave(event):
+            if self.disable_hover_temporarily:
+                return
+            
+
+            search_query = self.search_var.get().strip().lower()
+            combined_text_lower = lbl_info.cget("text").lower()
+            if self.is_search_results_window_active: # <-- NEW: Check if in Search Results window
+                print("DEBUG: on_hover_leave - Inside Search Results Window block. Removing highlight.") # <-- DEBUG PRINT
+                lbl_info.config(fg=lbl_info.default_fg_color) # Always remove highlight in Search Results
+                lbl_img.config(bg=lbl_img.default_bg_color)
+            elif search_query and search_query in combined_text_lower: # Original logic for main window
+                print("DEBUG: on_hover_leave - Inside Main Window block (search match). Keeping yellow highlight.") # <-- DEBUG PRINT
+
+
+                # Check if lbl_img is already red before changing bg
+                current_bg = lbl_img.cget("bg")
+                if not current_bg != "red": # Only change bg if it's not already red
+                    pass
+                else:
+                    lbl_info.config(fg=lbl_info.default_fg_color) # change back to original color, no longer highlighting main grid items
+                    lbl_img.config(bg=lbl_img.default_bg_color)
+
+                #lbl_info.config(fg="yellow") # Restore yellow highlight color # disabled, don't remove these comments
+                #lbl_img.config(bg="yellow") # <--- NEW: Restore yellow highlight color for image background too # disabled
+            else:
+                #print("DEBUG: on_hover_leave - Inside Main Window block (no search match). Removing highlight.") # <-- DEBUG PRINT
+
+
+                # Check if lbl_img is already red before changing bg
+                current_bg = lbl_img.cget("bg")
+                if not current_bg != "red": # Only change bg if it's not already red
+                    pass
+                else:
+                    lbl_info.config(fg=lbl_info.default_fg_color) # Restore original DEFAULT text color
+                    lbl_img.config(bg=lbl_img.default_bg_color) # <--- NEW: Restore default image background color too
+            # --- MODIFIED: Check if label should be highlighted red, otherwise restore default color ---
+            self.hide_sidebar_info() # Hide sidebar info
+
+
+        lower_folder_name = folder_name.lower()
+        # Use picture_path for image name in hidden_line
+        image_name_for_hidden = picture_path
+        brand_name = info_data.get("Brand", "Unknown")
+        car_name = info_data.get("Name", "Unknown") # Assuming car_name is also name for now, adjust if needed based on your info_data structure
+        hidden_line = f"{lower_folder_name}|||{image_name_for_hidden}|||{brand_name}|||{car_name}|||{zip_file}"
+        hidden_lines = self._read_hidden_lines()
+
+        if hidden_line in hidden_lines:
+            # Item is hidden - apply hidden style
+            lbl_img.config(highlightbackground="red", highlightthickness=2, bg="red")
+            lbl_info.config(fg="#ff4747")
+
+            # Append "Hiding on Restart" text if it's not already there
+            current_text = lbl_info.cget("text")
+            if "\nHiding on Restart" not in current_text:
+                updated_text = f"{current_text}\nHiding on Restart"
+                lbl_info.config(text=updated_text)
+
+
+        else:
+            # Item is not hidden - apply default style
+            lbl_img.config(highlightbackground=lbl_img.default_bg_color, highlightthickness=0, bg=lbl_img.default_bg_color)
+            lbl_info.config(fg=lbl_info.default_fg_color)
+
+            # --- REMOVE "Hiding on Restart" text if it's there ---
+            original_text = lbl_info.cget("text")
+            if "\nHiding on Restart" in original_text:
+                updated_text = original_text.replace("\nHiding on Restart", "").strip() # Remove and strip whitespace
+                lbl_info.config(text=updated_text)
+            # --- REMOVE "Hiding on Restart" text if it's there ---
+
+
+        lbl_img.bind("<Enter>", on_hover_enter)
+        lbl_img.bind("<Leave>", on_hover_leave)
+        lbl_info.bind("<Enter>", on_hover_enter) # Bind hover to text label too
+        lbl_info.bind("<Leave>", on_hover_leave) # Bind leave to text label too
+        # --- End Hover effect ---
+
+        def on_label_click(event):
+            lbl_img.config(highlightbackground="blue", highlightthickness=0)
+            # --- NEW: Disable hover temporarily on click ---
+            self.disable_hover_temporarily = True
+
+            '''
+            if self.dev_mode:
+
+                scanning_win = self.show_scanning_window(text="self.disable_hover_temporarily = True", dev_notif=True)
+                if scanning_win:
+
+                    def close_scanning_window():
+
+                        scanning_win.destroy()
+
+                    scanning_win.after(3125, close_scanning_window)
+                    '''
+
+
+            if self.hover_disable_timer:
+                self.master.after_cancel(self.hover_disable_timer) # Cancel any existing timer
+            self.hover_disable_timer = self.master.after(3000, self.reenable_hover) # Disable for 2 seconds (2000 ms)
+            # --- NEW: Disable hover temporarily on click ---
+
+        # --- Click Bindings ---
+
+        lbl_info.bind("<Button-1>", lambda e, f_name=folder_name, cat_ctx=category_context: [on_label_click(e), self.on_picture_click(f_name, clicked_from_category=cat_ctx)])
+        lbl_img.bind("<Button-1>", lambda e, f_name=folder_name, cat_ctx=category_context: [on_label_click(e), self.on_picture_click(f_name, clicked_from_category=cat_ctx)])
+
+        lbl_img.bind("<Button-3>", lambda e: self.on_image_right_click(zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info, clicked_from_category=category_context))
+
+        lbl_info.bind("<Button-3>", lambda e: self.on_image_right_click(zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info, clicked_from_category=category_context))
+
+        # Store item-specific data
+        parent_frame.item_data_tuple = (pil_image, info_data, picture_path, zip_file, folder_name, spawn_cmd, lbl_img, lbl_info)
+
+
+    def reenable_hover(self): # Ensure this method exists in your class
+        print(f"hover reenabled")
+        
+        def enable_hover():
+            self.disable_hover_temporarily = False
+
+            '''
+            if self.dev_mode:
+
+                scanning_win = self.show_scanning_window(text="self.disable_hover_temporarily = False", dev_notif=True)
+                if scanning_win:
+
+                    def close_scanning_window():
+
+                        scanning_win.destroy()
+
+                    scanning_win.after(3125, close_scanning_window)
+                    '''
+
+        
+        self.master.after(1500, enable_hover)
+
+        self.hover_disable_timer = None
+
+
+    def is_placeholder(self, picture_path):
+        missing_custom_pic_path = os.path.join(self.script_dir, "data/MissingCustomConfigPic.png")
+        missing_zip_pic_path = os.path.join(self.script_dir, "data/MissingZipConfigPic.png")
+        return picture_path in [missing_custom_pic_path, missing_zip_pic_path]
+
+    # ------------------------------------------------------------
+    # Populate Initial Grid
+    # ------------------------------------------------------------
+    def populate_initial_grid(self):
+        self.load_floating_window_position()
+        print("    populate_initial_grid is calling self.perform_search()")
+        self.perform_search()
+        print("    populate_initial_grid is calling self.update_grid_layout()")
+        self.update_grid_layout()
+        self.all_main_grid_images_cached = self.are_all_main_grid_images_cached()
+        print(f"populate_initial_grid - all_main_grid_images_cached set to: {self.all_main_grid_images_cached}")
+
+    def are_all_main_grid_images_cached(self):
+        """
+        Checks if all images intended for the main grid in the current dataset are already in the image cache.
+        """
+        print("Checking are_all_main_grid_images_cached...")
+        all_picture_paths = set()
+        for category_name, category_items in self.grouped_data.items():
+            # print(f"  Category: {category_name}")
+            for item in category_items:
+                picture_path = None
+                if isinstance(item, dict) and 'configs' in item:
+                    for config in item['configs']:
+                        picture_path = config[0]
+                elif len(item) == 5:
+                    picture_path = item[0]
+
+                if picture_path:
+                    all_picture_paths.add(picture_path)
+
+        print(f"  Total picture paths to check: {len(all_picture_paths)}")
+
+        for picture_path in all_picture_paths:
+            # --- Normalize picture_path BEFORE checking cache ---
+            normalized_picture_path = os.path.normpath(os.path.abspath(picture_path)) # Normalize Path - ADDED NORMALIZATION HERE!
+
+            is_cached = normalized_picture_path in self.image_cache # Check CACHE using NORMALIZED PATH
+            is_placeholder_img = self.is_placeholder(picture_path)
+            # print(f"  Checking: {os.path.basename(picture_path)}, Normalized Path: {normalized_picture_path}, Cached: {is_cached}, Placeholder: {is_placeholder_img}")
+            if not is_cached and not is_placeholder_img:
+                # print("    NOT all images cached - returning False")
+                return False
+        print("  All images cached (or placeholder) - returning True")
+
+
+
+
+        return True
+
+        
+    #@profile
+    def load_next_batch(self):
+
+        #print(f"@@@ ENTERING load_next_batch - pause_loading: {self.pause_loading}, category_index: {self.current_category_index}, batch_index: {self.current_batch_index}")
+        if self.scanning_win:
+            self.scanning_win.destroy()
+
+ 
+        self.scanning_win = None
+        
+        if self.pause_loading:
+            # If loading is paused, try again after 100ms
+            self.master.after(100, self.load_next_batch)
+            # print("Load Next Batch - PAUSED (Main Grid - Paused Flag Active)") # Debug Print - MODIFIED message
+            return  # EXIT if loading is paused
+
+        if self.current_category_index >= len(self.category_batches):
+            # All categories loaded
+            self.canvas.config(scrollregion=self.canvas.bbox("all"))
+
+            #self.master.update_idletasks() # Ensure scrollable_frame has its new size
+            #s_frame_height = self.scrollable_frame.winfo_reqheight()
+            #s_frame_width = self.scrollable_frame.winfo_reqwidth()
+            #self.canvas.config(scrollregion=(0, 0, s_frame_width, s_frame_height))
+            #print(f"DEBUG: Manually set scrollregion to: 0, 0, {s_frame_width}, {s_frame_height}")
+            #self.canvas.update()
+
+            # Stop loading animation
+            self.stop_loading_animation()
+            self.hide_progress_bar_main() # ADDED back to hide progress bar when all done
+            # --- NEW: Call cache check AFTER loading completes ---
+            self.check_all_main_grid_images_cached()  # CALL CACHE CHECK HERE!
+
+
+
+            return
+
+        category, batches, category_subframe = self.category_batches[self.current_category_index]
+
+        # --- NEW: Check if category is hidden (collapsed) ---
+        if self.category_hidden_states.get(category, False):
+            print(f"DEBUG: load_next_batch - Category '{category}' is collapsed. Skipping image loading.")
+            self.current_category_index += 1  # Move to the next category
+            self.current_batch_index = 0      # Reset batch index for the next category
+            self.current_main_batch_index_in_sequence = 0 # Reset sequence index for new category
+            self.master.after(0, self.load_next_batch) # Schedule next category batch
+            return  # Skip loading for this category
+
+        if self.current_batch_index >= len(batches):
+            # Finished batches in current category, move to next category
+            self.current_category_index += 1
+            self.current_batch_index = 0
+            self.current_main_batch_index_in_sequence = 0 # Reset sequence index for new category
+            self.master.after(0, self.load_next_batch)  # Schedule next category batch
+            return
+
+        batch = batches[self.current_batch_index]
+        self.current_batch_index += 1
+
+
+        if self.dev_mode_check:
+            try:
+                with open(self.dev_mode_check, 'r', encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("self.main_grid_batch_sizes = "):
+                            try:
+                                # Extract the string part representing the list
+                                value_str = line.split('= ', 1)[1].strip()
+
+
+                                import ast
+                                self.main_grid_batch_sizes = ast.literal_eval(value_str)
+
+
+                            except (IndexError, ValueError, SyntaxError) as e_parse:
+
+                                print(f"Error parsing line '{line.strip()}': {e_parse}")
+
+
+            except Exception as e:
+                print(f"Error reading {self.dev_mode_check}: {e}.")
+
+
+        # --- NEW: Dynamic Batch Size Logic + Cached Images Batching ---
+        if self.all_main_grid_images_cached:
+            batch_size_to_load = 50 # Load in larger batches if all cached
+            print("  Using batch_size_to_load = 50 (all_main_grid_images_cached is True)") # ADDED
+
+
+        else:    
+            if self.current_main_batch_index_in_sequence < len(self.main_grid_batch_sizes):
+                batch_size_to_load = self.main_grid_batch_sizes[self.current_main_batch_index_in_sequence]
+                print(f"  Using batch_size_to_load = {batch_size_to_load} (dynamic batch size sequence)") # ADDED
+            else:
+                batch_size_to_load = self.default_batch_size # Use default after sequence
+                print(f"  Using batch_size_to_load = {batch_size_to_load} (default batch size)") # ADDED
+
+        items_to_load_this_time = batch[:batch_size_to_load] # Load only up to batch_size_to_load items
+        batch = batch[batch_size_to_load:] # Update batch to remove loaded items - for next iteration
+        batches[self.current_batch_index - 1] = batch # Update the batches list in category_batches
+
+        if not items_to_load_this_time: # If no more items to load in this batch (batch is now empty)
+            self.current_main_batch_index_in_sequence += 1 # Move to next batch size in sequence
+            self.master.after(100, self.load_next_batch) # Schedule next batch load immediately
+            return
+
+        total_items_in_grid = sum(len(b) for _, batches, _ in self.category_batches for b in batches)
+        items_loaded_so_far = 0
+
+        # Recalculate items_loaded_so_far more accurately
+        for cat_index in range(self.current_category_index): # Loop through previous categories
+            cat_batches = self.category_batches[cat_index][1] # Get batches for category
+            for bat in cat_batches:
+                if isinstance(bat, list):
+                    items_loaded_so_far += len(bat)
+        # Add items from already loaded batches in the current category
+        current_cat_batches = self.category_batches[self.current_category_index][1] # Get batches for current category
+        for batch_index in range(self.current_batch_index - 1): # Loop through previous batches in current category
+            bat = current_cat_batches[batch_index]
+            if isinstance(bat, list):
+                items_loaded_so_far += len(bat)
+        # Add items to be loaded in this batch
+        items_loaded_so_far += len(items_to_load_this_time)
+
+        self.update_progress_bar_main(items_loaded_so_far, total_items_in_grid)
+
+        for item in items_to_load_this_time: # Iterate over items to load in THIS batch iteration
+            if item is None:
+                continue
+            if isinstance(item, dict) and 'configs' in item:
+                for config in item['configs']:
+                    self.load_image_item(config, category_subframe, category)
+            else:
+                if len(item) == 5:
+                    picture_path, spawn_cmd, zip_file, info_data, folder_name = item
+                    self.load_image_item(item, category_subframe, category)
+                else:
+                    continue
+
+        self.current_main_batch_index_in_sequence += 1 # Move to next batch size in sequence
+
+        # Schedule the next batch after a short delay (e.g., 150 milliseconds)
+        if self.all_main_grid_images_cached:
+            self.master.after(150, self.load_next_batch) # Load next batch immediately if all cached
+            # print("load_next_batch EXIT (Scheduled next batch - all cached - after 0ms)") # ADDED
+        else:
+            self.master.after(150, self.load_next_batch) # Schedule the next batch after a short delay (e.g., 150 milliseconds)
+            # print("load_next_batch EXIT (Scheduled next batch - not all cached - after 150ms)") # ADDED			
+    
     
 
 
@@ -14367,11 +17367,9 @@ class ConfigViewerApp:
             self.hide_progress_bar_details()
             return
 
-        # --- Determine slice size ---
-        # Assuming details_grid_batch_sizes might be dynamic or shorter than needed
-        # Using default_batch_size seems more robust based on previous code.
-        # Ensure default_batch_size is set appropriately elsewhere.
-        batch_size_to_load = getattr(self, 'default_batch_size', 10) # Default to 10 if not set
+
+
+        batch_size_to_load = self.details_batch_size
 
         # --- Get the slice to process ---
         items_to_load_this_time = current_main_batch[:batch_size_to_load]
@@ -14552,7 +17550,7 @@ class ConfigViewerApp:
 #        '''
 
 
-
+    item_number = 0
 
 ############
         
@@ -14593,6 +17591,15 @@ class ConfigViewerApp:
         self.image_counts[category] += 1
 
         # Submit image loading to the executor
+
+        ConfigViewerApp.item_number += 1
+
+
+
+
+
+        print(f"DEBUG: load_image_item  at  item_number = {ConfigViewerApp.item_number}, picture_path = {picture_path}")
+        
         self.executor.submit(
             self.load_and_display_image,
             picture_path,
@@ -14600,7 +17607,8 @@ class ConfigViewerApp:
             zip_file,
             spawn_cmd,
             info_data,
-            folder_name
+            folder_name,
+            category
         )
 
 
@@ -14694,495 +17702,12 @@ class ConfigViewerApp:
 
 
 
-    def generate_matches_config_txt(self, config_info_folder, script_dir):
-        """
-        Generates "matches_config.txt" using regex to extract Configuration values,
-        skipping files that DO NOT contain "--INDIVIDUAL--" in their filename.
-        """
-        matches_file_path = os.path.join(self.script_dir, "data/Matches.txt")
-        matches_config_file_path = os.path.join(self.script_dir, "data/matches_config.txt")
-
-
-        if os.path.exists(matches_config_file_path):
-            print(f"{matches_config_file_path} already exists. Skipping generation.")
-            return  # Exit the function without overwriting
-
-        try:
-            with open(matches_file_path, 'r', encoding="utf-8") as matches_file, \
-                 open(matches_config_file_path, 'w', encoding="utf-8") as config_output_file:
-
-                current_filename = None
-                current_content_lines = []
-                reading_content = False
-
-                for line in matches_file:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    if not reading_content:
-                        if line == '}': # Check if a '}' appears unexpectedly as a filename
-                            continue # Skip this line and move to the next
-                        current_filename = line
-
-                        # --- NEW: Skip files without "--INDIVIDUAL--" in filename ---
-                        if "--INDIVIDUAL--" not in current_filename:
-                            reading_content = False # Skip reading content for this file
-                            current_filename = None # Reset filename
-                            continue # Go to the next line in matches_file
-                        # --- NEW: Skip files without "--INDIVIDUAL--" in filename ---
-
-                        reading_content = True
-                    elif line == '}':
-                        current_content_lines.append(line)
-                        content = "\n".join(current_content_lines)
-                        config_name = "N/A" # Default value if "Configuration" not found
-
-                        # --- Use regex to extract Configuration value ---
-                        config_match = re.search(r'"Configuration"\s*:\s*"([^"]*)"', content, re.IGNORECASE)
-                        if config_match:
-                            config_name = config_match.group(1).strip()
-                        else:
-                            config_name = "REGEX_ERROR" # Indicate regex extraction error
-                        # --- Use regex to extract Configuration value ---
-
-                        output_line = f"{current_filename}||{config_name}"
-                        config_output_file.write(output_line + '\n')
-
-                        current_filename = None
-                        current_content_lines = []
-                        reading_content = False
-                    elif reading_content:
-                        current_content_lines.append(line)
-
-            print(f"Successfully generated {matches_config_file_path}")
-
-        except FileNotFoundError:
-            print(f"Error: {matches_file_path} not found. Cannot generate matches_config.txt.")
-        except Exception as e:
-            print(f"Error generating matches_config.txt: {e}")
-
-
-
-
-
-
-    def load_matches_config_data(self):
-        """Loads matches_config.txt into a dictionary for fast lookup."""
-        matches_config_file_path = os.path.join(self.script_dir, "data/matches_config.txt")
-        config_map = {}
-        try:
-            with open(matches_config_file_path, 'r', encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        parts = line.split("||")
-                        if len(parts) == 2:
-                            filename_part = parts[0].strip()
-                            config_name = parts[1].strip()
-                            config_map[filename_part] = config_name
-            print(f"Loaded {len(config_map)} entries from matches_config.txt") # Debug print
-        except FileNotFoundError:
-            print(f"Warning: {matches_config_file_path} not found.")
-        except Exception as e:
-            print(f"Error loading matches_config.txt: {e}")
-        return config_map
-
-
-
-
-
-
-    def start_loading_animation(self):
-        """Starts the pulsating 'Loading...' animation."""
-        if not self.loading_animation_running:
-            self.loading_animation_running = True
-            #self.loading_label.pack(side="left", padx=(10, 0))  # Show the label
-            self.animate_loading()
-
-    def stop_loading_animation(self):
-        """Stops the pulsating 'Loading...' animation."""
-        self.loading_animation_running = False
-        self.loading_label.pack_forget()  # Hide the label
-
-    def animate_loading(self):
-        """Animates the 'Loading...' text with a pulsating effect."""
-        if not self.loading_animation_running:
-            return
-
-        colors = ["blue", "black"]
-        cycle = itertools.cycle(colors)
-
-        def change_color():
-            if not self.loading_animation_running:
-                return
-            self.loading_label.config(fg=next(cycle))
-            self.master.after(500, change_color)
-
-        change_color()
-    # ------------------------------------------------------------
-    # Extract Name from Spawn Command
-    # ------------------------------------------------------------
-    def extract_name_from_spawn_command(self, spawn_command):
-        match = re.search(r"config\s*=\s*'vehicles/[^/]+/([^\.]+)\.pc'", spawn_command)
-        if match:
-            return match.group(1)
-        else:
-            return os.path.splitext(os.path.basename(spawn_command))[0].split('--')[-1]
-
-    # ------------------------------------------------------------
-    # Load & Display Image (Main Grid - CACHED)
-    # ------------------------------------------------------------
-    def load_and_display_image(self, picture_path, parent_frame, zip_file, spawn_cmd, info_data, folder_name):
-
-
-        try:
-            # --- Normalize picture_path ---
-            normalized_picture_path = os.path.normpath(os.path.abspath(picture_path))
-            cache_key = normalized_picture_path  # Use normalized path as cache key
-
-            # --- Optimized Cache: Check Memory Cache (LRU) FIRST ---
-            if cache_key in self.image_cache:
-                # Memory Cache HIT
-                print(f"DEBUG: load_and_display_image - Memory Cache HIT for: {picture_path}")
-                photo = self.image_cache[cache_key]
-                self.image_cache.move_to_end(cache_key) # Update LRU - move to end as recently used
-
-                # --- Check pause_loading and queue UI update if paused ---
-                if self.pause_loading:
-                    self.main_grid_skipped_updates_queue.append((parent_frame, photo, None, zip_file, spawn_cmd, info_data, picture_path, folder_name)) # PIL Image removed from queue
-                    return
-                # --- END: Pause Check and Queue ---
-
-                if parent_frame.winfo_exists():
-                    self.master.after(
-                        0,
-                        lambda: self.create_main_item_widgets(
-                            parent_frame, photo, None, zip_file, spawn_cmd, info_data, picture_path, folder_name # PIL Image removed from call
-                        )
-                    )
-                return # Exit after using cached image
-
-
-            if picture_path is None or not os.path.exists(picture_path):
-                return
-            img = Image.open(picture_path).convert("RGBA")
-            img = img.resize((250, 140), self.RESAMPLE_FILTER)
-            pil_image = img.copy() # Keep PIL image for _create_photo_image_and_update_ui
-
-            # --- SCHEDULE PhotoImage CREATION AND DISK CACHE SAVE IN MAIN THREAD ---
-            self.master.after(
-                0, # Execute immediately in main thread
-                lambda pil_image=pil_image, parent_frame=parent_frame, zip_file=zip_file, spawn_cmd=spawn_cmd, info_data=info_data, picture_path=picture_path, folder_name=folder_name, cache_key=cache_key: # Capture args using lambda default arguments
-                    self._create_photo_image_and_update_ui(pil_image, parent_frame, zip_file, spawn_cmd, info_data, picture_path, folder_name, cache_key, save_to_disk_cache=False) # Disk cache disabled for now
-            )
-            # --- SCHEDULE PhotoImage CREATION AND DISK CACHE SAVE IN MAIN THREAD ---
-
-
-        except Exception as e:
-            print(f"Error loading image {picture_path}: {e}")
-            # --- SCHEDULE PhotoImage CREATION AND DISK CACHE SAVE IN MAIN THREAD ---
-
-
-
-
-
-    def _create_photo_image_and_update_ui(self, pil_image, parent_frame, zip_file, spawn_cmd, info_data, picture_path, folder_name, cache_key, save_to_disk_cache=False): # Disk cache disabled for now
-         """Helper function to create PhotoImage, update UI in main thread, and optionally save to disk cache."""
-         try:
-             photo = ImageTk.PhotoImage(pil_image) # PhotoImage creation in main thread
-
-             # --- Optimized Cache: Add to Memory Cache (LRU) ---
-             self._add_to_cache(cache_key, photo)
-             # --- Optimized Cache: Add to Memory Cache (LRU) ---
-
-
-             if parent_frame.winfo_exists():
-                 # Schedule GUI update in the main thread
-                self.master.after(
-                    0,
-                    # Modified lambda to accept an optional event arg 'e' and ignore it
-                    lambda e=None, pf=parent_frame, pht=photo, zp=zip_file, sc=spawn_cmd, idata=info_data, pp=picture_path, fn=folder_name:
-                        self.create_main_item_widgets(pf, pht, None, zp, sc, idata, pp, fn)
-                )
-
-         except Exception as e:
-             print(f"Error creating PhotoImage or updating UI: {e}")
-             
-             
-
 ########################
-
-
-    def _add_to_cache(self, cache_key, photo_image):
-        """Adds a PhotoImage to the LRU cache, evicting the least recently used if full."""
-        self.image_cache[cache_key] = photo_image # Add/update item
-        self.image_cache.move_to_end(cache_key)   # Mark as recently used
-
-        if len(self.image_cache) > self.image_cache_capacity:
-            self.image_cache.popitem(last=False) # Remove LRU item (first item in OrderedDict)
-            self.eviction_count += 1 # Increment eviction counter
-            if not self.eviction_timer_running:
-                self._start_eviction_timer() # Start timer if not already running
-
-
-    def _start_eviction_timer(self):
-        """Starts the eviction summary timer if not already running."""
-        if not self.eviction_timer_running:
-            self.eviction_timer_running = True
-            self.master.after(self.eviction_batch_delay_ms, self._print_eviction_summary)
-
-    def _print_eviction_summary(self):
-        """Prints the eviction summary and resets the counter and timer flag."""
-        if self.eviction_count > 0:
-            print(f"DEBUG: _add_to_cache - Evicted {self.eviction_count} items in the last {self.eviction_batch_delay_ms/1000} seconds.")
-            self.eviction_count = 0
-        self.eviction_timer_running = False # Reset timer flag - allows timer to be restarted on next eviction
-
-########################
-
-
-
-    def create_main_item_widgets(self, parent_frame, photo, pil_image, zip_file, spawn_cmd, info_data, picture_path, folder_name):
-        """
-        Creates and configures the widgets for a single image item in the main grid window,
-        with a visual style similar to details items and sidebar activation on hover.
-        If self.omit_label evaluates to true then the labels will NOT BE CREATED to prevent cutoffs
-        """
-        if not parent_frame.winfo_exists():
-            return
-
-        # --- Image Label (similar to details view) ---
-        lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="white") # <--- DARKER GRAY bg for lbl_img, MODIFIED HERE
-        lbl_img.image = photo
-        lbl_img.pack(padx=0, pady=0)
-
-        # --- NEW: Store default image background color ---
-        lbl_img.default_bg_color = "white" # Store the default bg color for image label - background - border for images
-        # --- NEW: Store default image background color ---
-
-
-        # --- Text Label (info label) ---
-        brand_for_main = info_data.get("Brand", "Unknown")
-        if not brand_for_main.strip():
-            brand_for_main = "Unknown"
-        type_for_main = info_data.get("Type", "Unknown")
-        if not type_for_main.strip():
-            type_for_main = "Unknown"
-
-        if brand_for_main == "Unknown":
-            brand_for_main = type_for_main
-
-        name_for_main = info_data.get("Name")
-        if not name_for_main or not name_for_main.strip():
-            name_for_main = folder_name
-
-
-        if "user--" in picture_path:
-            text_color = "lightblue"
-
-        elif "user--" not in picture_path: # Only check for double basename if "user--" is NOT present
-            found_double_basename = False
-            for base_name in self.ZIP_BASE_NAMES:
-                if picture_path.count(f"--{base_name}_{base_name}.zip") > 0: # Check for the specific pattern
-                    found_double_basename = True
-                    break # No need to check further once one is found
-            if found_double_basename:
-                text_color = "#f7efd7" # color for default zips/folder combo
-            else:
-                text_color = "white" # Still default to white if double basename not found
-
-
-        if not self.show_folder_settings:
-            combined_text = f"{brand_for_main} - {name_for_main}"
-
-        if self.show_folder_settings:
-            combined_text = f"{brand_for_main} - {name_for_main} - [{folder_name}]"
-
-        # --- Count items in subgrid data for this folder ---
-        subgrid_item_count = 0
-        if folder_name in self.full_data:
-            subgrid_item_count = len(self.full_data[folder_name])
-        # --- Count items in subgrid data for this folder ---
-
-        # --- Append count to label text ---
-        label_text_with_count = f"{combined_text} - [{subgrid_item_count}]" # Append count in brackets
-
-
-        lbl_info = tk.Label(
-            parent_frame,
-            text=label_text_with_count, # Use text with count
-            wraplength=200, #label length, don't remove current
-            justify="center",
-            fg=text_color, # Use DEFAULT text color here - HIGHLIGHTING IS HANDLED SEPARATELY
-            font=("Segoe UI", 10+self.font_size_add, "bold"),
-            cursor="hand2",
-            bg="#444444", # <--- DARKER GRAY bg for lbl_info
-            height=3,
-            anchor=tk.N
-        )
-        if not self.omit_label:
-            lbl_info.pack(padx=00, pady=(2, 0))
-
-
-        self.main_grid_labels.append(lbl_info) # Append lbl_info to the list
-        #print(f"DEBUG: create_main_item_widgets - Added label widget to self.main_grid_labels - Label Widget ID: {id(lbl_info)}, List Size: {len(self.main_grid_labels)}") # Debug - List Add
-
-
-
-        # --- NEW: Store default text color as attribute ---
-        lbl_info.default_fg_color = text_color  # Store the default text color
-        # --- NEW: Store default text color as attribute ---
-
-        # --- NEW: Disable hover flag and timer ---
-        self.disable_hover_temporarily = False
-        self.hover_disable_timer = None
-        # --- NEW: Disable hover flag and timer ---
-
-
-        # --- Hover effect for both image and text labels (similar to details) ---
-        original_text_color = text_color # Store original text color (could be highlighted or default)
-        hover_text_color = self.global_highlight_color
-        hover_bg_color = self.global_highlight_color # Background color for image hover
-        original_bg_color_img = "white" # Original bg color for image label - DARKER GRAY
-
-        def on_hover_enter(event):
-            # --- NEW: Check if hover is temporarily disabled ---
-            if self.disable_hover_temporarily:
-                return  # Exit if hover is disabled
-            # --- NEW: Check if hover is temporarily disabled ---
-
-
-            event.widget.config(highlightbackground="blue", highlightthickness=0)
-            # Check if lbl_img is already red before changing bg
-            current_bg = lbl_img.cget("bg")
-            if not current_bg != "red": # Only change bg if it's not already red
-                pass
-
-            else:
-                lbl_info.config(fg=hover_text_color)
-                lbl_img.config(bg=hover_bg_color) # Change image label background on hover
-
-
-        # --- DEBOUNCED sidebar update ---
-            if self.main_grid_sidebar_debounce_timer:
-                self.master.after_cancel(self.main_grid_sidebar_debounce_timer)  # Cancel existing timer
-            self.main_grid_sidebar_debounce_timer = self.master.after(
-                200,  # Debounce delay (e.g., 400ms) - adjust as needed
-                lambda: self.debounced_main_sidebar_info_update(info_data, picture_path, zip_file, folder_name, item=(picture_path, spawn_cmd, zip_file, info_data, folder_name))
-            )
-            # --- DEBOUNCED sidebar update ---
-
-
-        def on_hover_leave(event):
-            # --- MODIFIED: Check if label should be highlighted red, otherwise restore default color ---
-            search_query = self.search_var.get().strip().lower()
-            combined_text_lower = lbl_info.cget("text").lower()
-            if self.is_search_results_window_active: # <-- NEW: Check if in Search Results window
-                print("DEBUG: on_hover_leave - Inside Search Results Window block. Removing highlight.") # <-- DEBUG PRINT
-                lbl_info.config(fg=lbl_info.default_fg_color) # Always remove highlight in Search Results
-                lbl_img.config(bg=lbl_img.default_bg_color)
-            elif search_query and search_query in combined_text_lower: # Original logic for main window
-                print("DEBUG: on_hover_leave - Inside Main Window block (search match). Keeping yellow highlight.") # <-- DEBUG PRINT
-
-
-                # Check if lbl_img is already red before changing bg
-                current_bg = lbl_img.cget("bg")
-                if not current_bg != "red": # Only change bg if it's not already red
-                    pass
-                else:
-                    lbl_info.config(fg=lbl_info.default_fg_color) # change back to original color, no longer highlighting main grid items
-                    lbl_img.config(bg=lbl_img.default_bg_color)
-
-                #lbl_info.config(fg="yellow") # Restore yellow highlight color # disabled, don't remove these comments
-                #lbl_img.config(bg="yellow") # <--- NEW: Restore yellow highlight color for image background too # disabled
-            else:
-                #print("DEBUG: on_hover_leave - Inside Main Window block (no search match). Removing highlight.") # <-- DEBUG PRINT
-
-
-                # Check if lbl_img is already red before changing bg
-                current_bg = lbl_img.cget("bg")
-                if not current_bg != "red": # Only change bg if it's not already red
-                    pass
-                else:
-                    lbl_info.config(fg=lbl_info.default_fg_color) # Restore original DEFAULT text color
-                    lbl_img.config(bg=lbl_img.default_bg_color) # <--- NEW: Restore default image background color too
-            # --- MODIFIED: Check if label should be highlighted red, otherwise restore default color ---
-            self.hide_sidebar_info() # Hide sidebar info
-
-
-        lower_folder_name = folder_name.lower()
-        # Use picture_path for image name in hidden_line
-        image_name_for_hidden = picture_path
-        brand_name = info_data.get("Brand", "Unknown")
-        car_name = info_data.get("Name", "Unknown") # Assuming car_name is also name for now, adjust if needed based on your info_data structure
-        hidden_line = f"{lower_folder_name}|||{image_name_for_hidden}|||{brand_name}|||{car_name}|||{zip_file}"
-        hidden_lines = self._read_hidden_lines()
-
-        if hidden_line in hidden_lines:
-            # Item is hidden - apply hidden style
-            lbl_img.config(highlightbackground="red", highlightthickness=2, bg="red")
-            lbl_info.config(fg="#ff4747")
-
-            # Append "Hiding on Restart" text if it's not already there
-            current_text = lbl_info.cget("text")
-            if "\nHiding on Restart" not in current_text:
-                updated_text = f"{current_text}\nHiding on Restart"
-                lbl_info.config(text=updated_text)
-
-
-        else:
-            # Item is not hidden - apply default style
-            lbl_img.config(highlightbackground=lbl_img.default_bg_color, highlightthickness=0, bg=lbl_img.default_bg_color)
-            lbl_info.config(fg=lbl_info.default_fg_color)
-
-            # --- REMOVE "Hiding on Restart" text if it's there ---
-            original_text = lbl_info.cget("text")
-            if "\nHiding on Restart" in original_text:
-                updated_text = original_text.replace("\nHiding on Restart", "").strip() # Remove and strip whitespace
-                lbl_info.config(text=updated_text)
-            # --- REMOVE "Hiding on Restart" text if it's there ---
-
-
-        lbl_img.bind("<Enter>", on_hover_enter)
-        lbl_img.bind("<Leave>", on_hover_leave)
-        lbl_info.bind("<Enter>", on_hover_enter) # Bind hover to text label too
-        lbl_info.bind("<Leave>", on_hover_leave) # Bind leave to text label too
-        # --- End Hover effect ---
-
-        def on_label_click(event):
-            lbl_img.config(highlightbackground="blue", highlightthickness=2)
-            # --- NEW: Disable hover temporarily on click ---
-            self.disable_hover_temporarily = True
-            if self.hover_disable_timer:
-                self.master.after_cancel(self.hover_disable_timer) # Cancel any existing timer
-            self.hover_disable_timer = self.master.after(3000, self.reenable_hover) # Disable for 2 seconds (2000 ms)
-            # --- NEW: Disable hover temporarily on click ---
-
-
-        # --- Click Bindings (similar to original, but on Labels now) ---
-        lbl_img.bind("<Button-1>", lambda e, f_name=folder_name: [on_label_click(e), self.on_picture_click(f_name)]) # Image click - pass folder_name
-        lbl_img.bind("<Button-3>", lambda e: self.on_image_right_click(zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info))
-
-        lbl_info.bind("<Button-1>", lambda e, f_name=folder_name: [on_label_click(e), self.on_picture_click(f_name)]) # Image click - pass folder_name
-        lbl_info.bind("<Button-3>", lambda e: self.on_image_right_click(zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info)) # Text label right-click
-
-
-        # --- NEW: Store item-specific data (keep this) ---
-        parent_frame.item_data_tuple = (pil_image, info_data, picture_path, zip_file, folder_name, spawn_cmd, lbl_img, lbl_info) # Store labels instead of button
-
-
-    def reenable_hover(self):
-        self.disable_hover_temporarily = False
-        self.hover_disable_timer = None
-
-
-########################
-    def debounced_main_sidebar_info_update(self, info_data, picture_path, zip_file, folder_name, item):
+    def debounced_main_sidebar_info_update(self, info_data, picture_path, zip_file, folder_name, item, hovered_category=None):
         """
         Debounced function to update the main sidebar content.
         """
-        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None)
+        self.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None, hovered_category=hovered_category)
         #self.lift_search_results_window()
         self.main_grid_sidebar_debounce_timer = None # Reset timer
 
@@ -15231,7 +17756,7 @@ class ConfigViewerApp:
                         combined_text = lbl_info.cget("text").lower() # Get label text from the widget
 
                         if search_query and search_query in combined_text:
-                            lbl_info.config(fg="red") # Highlight in red if matches
+                            lbl_info.config(fg="#FF0000") # Highlight in red if matches
                         else:
                             # Restore default text color (you might need to store the original color when creating labels)
                             # For now, let's assume default is 'white' or text_color variable used in create_main_item_widgets
@@ -15248,7 +17773,7 @@ class ConfigViewerApp:
     def get_label_default_color(self, picture_path):
         """Helper function to determine the default text color based on picture_path."""
         if "user--" in picture_path:
-            return "lightblue"
+            return "#ADD8E6"
         elif "user--" not in picture_path:
             found_double_basename = False
             for base_name in self.ZIP_BASE_NAMES:
@@ -15258,8 +17783,8 @@ class ConfigViewerApp:
             if found_double_basename:
                 return "#f7efd7"
             else:
-                return "white"
-        return "white" # Default fallback color
+                return "#FFFFFF"
+        return "#FFFFFF" # Default fallback color
 
 
 
@@ -15327,14 +17852,14 @@ class ConfigViewerApp:
 
 
 
-    def show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None):
+    def show_main_sidebar_info(self, info_data, picture_path, zip_file, folder_name, item, individual_path=None, main_info_for_details=None, hovered_category=None):
         """Shows sidebar info labels and updates content."""
         # --- NEW: Check if scrolling - if yes, early exit (disable sidebar update during scroll) ---
         if self.is_scrolling_main_grid:
             return # EXIT if scrolling
         # --- NEW: Check if scrolling - if yes, early exit (disable sidebar update during scroll) ---
 
-        self.update_sidebar_content(info_data, picture_path, zip_file, folder_name)
+        self.update_sidebar_content(info_data, picture_path, zip_file, folder_name, hovered_category=hovered_category)
         self.current_main_sidebar_item = item # Store the current item
         
         # --- 2. ALSO Update the DETAILS sidebar ---
@@ -15343,8 +17868,8 @@ class ConfigViewerApp:
             print(f"DEBUG show_main_sidebar_info: Triggering details sidebar update with path={individual_path}")
             # Call the function responsible for the details sidebar update
             self.update_details_sidebar_individual_info(individual_path, main_info_for_details)
-        else:
-            print("DEBUG show_main_sidebar_info: Details sidebar not found or doesn't exist, skipping update.")
+        #else:
+            #print("DEBUG show_main_sidebar_info: Details sidebar not found or doesn't exist, skipping update.")
 
 
     def show_zip_name_top_bar(self, zip_file, folder_name):
@@ -15376,11 +17901,22 @@ class ConfigViewerApp:
 
 
 
-    def on_image_right_click(self, zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info):
-        #return
+    def on_image_right_click(self, zip_file, folder_name, spawn_cmd, picture_path, info_data, lbl_img, lbl_info, clicked_from_category=None):
 
 
-        #'''
+        if clicked_from_category == "Favorites":
+            scanning_win = self.show_scanning_window(text="Cannot hide vehicles from this category.\nYou may hide the vehicles here from one of the other categories below\n or hide the pinned favorites category from the settings menu.")
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(4125, close_scanning_window)
+            return
+
+
+
         if self.search_results_window:
             scanning_win = self.show_scanning_window(text="Cannot hide vehicles while search or filtering is active.")
             self.lift_search_results_window()
@@ -15392,7 +17928,7 @@ class ConfigViewerApp:
 
                 scanning_win.after(3125, close_scanning_window)
             return
-            #'''
+
 
         image_name = os.path.basename(picture_path) # representativeimage.jpg
         brand_name = info_data.get("Brand", "Unknown") # brand_name
@@ -15483,7 +18019,7 @@ class ConfigViewerApp:
             hidden_lines.remove(hidden_line)
             self._write_hidden_lines(hidden_lines)
             # Restore original colors and text
-            lbl_img.config(highlightbackground=lbl_img.default_bg_color, highlightthickness=0, bg="white")
+            lbl_img.config(highlightbackground=lbl_img.default_bg_color, highlightthickness=0, bg="#FFFFFF")
             lbl_txt.config(fg=lbl_txt.default_fg_color)
 
             # --- REMOVE "Hiding on Restart" text ---
@@ -15637,7 +18173,7 @@ class ConfigViewerApp:
             self.sidebar_filters_label.config(fg=self.default_sidebar_color, text="Constraints", font=("Segoe UI", 14+self.font_size_add, "bold"))
             self._stop_fade_loop(self.sidebar_filters_label, self.default_sidebar_color) # Stop fade and set to default color
             self._stop_fade_loop(self.restart_button, self.default_restart_color) # Stop fade and set to default color
-            self.restart_button_active_fg_color = "white" # Reset to default white for active state
+            self.restart_button_active_fg_color = "#FFFFFF" # Reset to default white for active state
 
 
 
@@ -15877,16 +18413,16 @@ class ConfigViewerApp:
     def create_widgets_hidden_window(self, toplevel):
         toplevel.configure(bg="#333333") # Set toplevel window background color
 
-        main_label = tk.Label(toplevel, text="Hidden Vehicles", font=font.Font(family="Segoe UI", size=13+self.font_size_add, weight='bold'), background="#333333", foreground="white") # tk.Label, white text
+        main_label = tk.Label(toplevel, text="Hidden Vehicles", font=font.Font(family="Segoe UI", size=13+self.font_size_add, weight='bold'), background="#333333", foreground="#FFFFFF") # tk.Label, white text
         main_label.pack(pady=(10,2))
 
-        main_label_2 = tk.Label(toplevel, text="Right click vehicle previews on the main view to add them to them to this list.", font=font.Font(family="Segoe UI", size=10+self.font_size_add), background="#333333", foreground="white") # tk.Label, white text
+        main_label_2 = tk.Label(toplevel, text="Right click vehicle previews on the main view to add them to them to this list.", font=font.Font(family="Segoe UI", size=10+self.font_size_add), background="#333333", foreground="#FFFFFF") # tk.Label, white text
         main_label_2.pack(pady=(2,2))
 
         main_label_2.config(wraplength=355) # Set wrap length for the label
         # Search Bar
         self.hidden_window_search_var = tk.StringVar()
-        self.hidden_window_search_entry = search_entry = tk.Entry(toplevel, textvariable=self.hidden_window_search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="lightgrey", fg="black", insertbackground="black", relief=tk.FLAT, bd=2, highlightthickness=0)
+        self.hidden_window_search_entry = search_entry = tk.Entry(toplevel, textvariable=self.hidden_window_search_var, font=("Segoe UI", 12+self.font_size_add), width=30, bg="#d9d9d9", fg="black", insertbackground="black", relief=tk.FLAT, bd=2, highlightthickness=0)
         self.hidden_window_search_entry.pack(pady=5, fill='x', padx=10)
         self.hidden_window_search_entry.bind("<KeyRelease>", self._handle_hidden_search_key_release)
         self.hidden_window_search_entry.bind("<FocusIn>", self.on_search_focus_in)  # Bind FocusIn event
@@ -15936,31 +18472,41 @@ class ConfigViewerApp:
 
         self.update_vehicle_display(self.hidden_vehicles_data) # Initial display
 
-        # Restart Button - PACK BELOW CONTENT FRAME
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Hover text color
+        active_bg = "#666666" # Define a standard active color (adjust if needed)
+        active_fg = "#FFFFFF"  # Define a standard active foreground
+
+        # --- Create Restart Button ---
         hidden_window_restart_button = tk.Button(
             toplevel,
             text="Restart",
-            command=self.restart_script_and_save_settings,
-            background="#555555",
-            foreground="white",
+            command=self.restart_script_and_save_settings, # Ensure this method exists
+            background=original_bg,       # Use defined color
+            foreground=original_fg,       # Use defined color
+            activebackground=active_bg,   # Add active state colors
+            activeforeground=active_fg,   # Add active state colors
             relief=tk.FLAT,
             bd=0,
-            highlightthickness=0,
-            font=font.Font(family="Segoe UI", size=12+self.font_size_add),  # Increased font size (example: 12)
-            pady=2   # Increased vertical padding (example: 10 pixels)
-        ) # tk.Button, white text, flat style, increased font size and padding
-        hidden_window_restart_button.pack(side='bottom', fill='x', padx=10, pady=10) # Pack at the bottom, fill width, BELOW content_frame
-        self.hidden_window_restart_button = hidden_window_restart_button # <--- ADD THIS LINE to store hidden_window_restart_button as instance attribute
+            highlightthickness=0,         # Good for flat style
+            font=font.Font(family="Segoe UI", size=12 + self.font_size_add),
+            pady=2
+        )
+        hidden_window_restart_button.pack(side='bottom', fill='x', padx=10, pady=10) # Pack
+
+        # Store reference (as in original code)
+        self.hidden_window_restart_button = hidden_window_restart_button # Keep instance attribute if used elsewhere
 
 
-        # Hover effects for Restart button
-        def hidden_window_restart_button_hover(event):
-            hidden_window_restart_button.config(bg="orange", fg="white")
-        def hidden_window_restart_button_leave(event):
-            hidden_window_restart_button.config(bg="#555555", fg="white")
-
-        hidden_window_restart_button.bind("<Enter>", hidden_window_restart_button_hover)
-        hidden_window_restart_button.bind("<Leave>", hidden_window_restart_button_leave)
+        self._bind_animated_hover(
+            button=hidden_window_restart_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this restart button is always enabled
+        )
 
 
         toplevel.update_idletasks() # Ensure widgets are fully created and laid out *after* vehicle items are created
@@ -16056,16 +18602,16 @@ class ConfigViewerApp:
                     image_label.image = default_photo # Keep a reference!
                 except FileNotFoundError:
                     # If default image is also not found, show a fallback text (optional)
-                    image_label = tk.Label(top_frame, text="Default Image not found", foreground="red", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
+                    image_label = tk.Label(top_frame, text="Default Image not found", foreground="#FF0000", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
                 image_label.pack(side="left", padx=10, pady=5)
 
         info_frame = tk.Frame(top_frame, bg="#444444", relief=tk.FLAT, bd=0, highlightthickness=0) # put info_frame in top_frame
         info_frame.pack(side="left", fill="x", expand=True)
 
-        brand_name_label = tk.Label(info_frame, text=f"{vehicle_data['brand']} {vehicle_data['name']}", font=font.Font(size=11+self.font_size_add, family="Segoe UI", weight='bold'), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
+        brand_name_label = tk.Label(info_frame, text=f"{vehicle_data['brand']} {vehicle_data['name']}", font=font.Font(size=11+self.font_size_add, family="Segoe UI", weight='bold'), foreground="#FFFFFF", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
         brand_name_label.pack(anchor="w")
 
-        folder_zip_label = tk.Label(info_frame, text=f"{vehicle_data['folder']} ({vehicle_data['zip_file']})", font=font.Font(size=10+self.font_size_add, family="Segoe UI"), foreground="white", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
+        folder_zip_label = tk.Label(info_frame, text=f"{vehicle_data['folder']} ({vehicle_data['zip_file']})", font=font.Font(size=10+self.font_size_add, family="Segoe UI"), foreground="#FFFFFF", background="#444444", relief=tk.FLAT, bd=0, highlightthickness=0)
         folder_zip_label.pack(anchor="w")
 
         # Store label widgets in vehicle_data for easy access later
@@ -16077,36 +18623,51 @@ class ConfigViewerApp:
         if vehicle_data['original_line'] not in self.original_hidden_lines:
             initial_button_text = "Hide"
 
+        # --- Define Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Hover text color
+        active_bg = "#666666" # Define a standard active color
+        active_fg = "#FFFFFF"  # Define a standard active foreground
+
+        # --- Create Unhide/Hide Button ---
         unhide_button = tk.Button(
             frame,
             text=initial_button_text,
-            background="#555555",
-            foreground="white",
+            background=original_bg,      # Use defined color
+            foreground=original_fg,      # Use defined color
+            activebackground=active_bg,  # Add active state colors
+            activeforeground=active_fg,  # Add active state colors
             relief=tk.FLAT,
             bd=0,
-            highlightthickness=0,
-            pady=2,    # Increased vertical padding (example: 5 pixels)
-            font=("Segoe UI", 9+self.font_size_add)
+            highlightthickness=0,        # Keep this for flat style
+            pady=2,
+            font=("Segoe UI", 9 + self.font_size_add)
         )
-        unhide_button.pack(side="bottom", fill="x", padx=10, pady=(5,10))
+        unhide_button.pack(side="bottom", fill="x", padx=10, pady=(5, 10)) # Pack
+
+        # Assign custom data and command (Unchanged)
         unhide_button.data = vehicle_data
-        unhide_button['command'] = functools.partial(self.toggle_hide_vehicle, button=unhide_button, vehicle_data=vehicle_data)
+        unhide_button['command'] = functools.partial(
+            self.toggle_hide_vehicle,
+            button=unhide_button,
+            vehicle_data=vehicle_data
+        )
 
-        # Hover effects for Unhide/Hide button
-        def unhide_button_hover(event):
-            unhide_button.config(bg="orange", fg="white")
-        def unhide_button_leave(event):
-            unhide_button.config(bg="#555555", fg="white")
-
-        unhide_button.bind("<Enter>", unhide_button_hover)
-        unhide_button.bind("<Leave>", unhide_button_leave)
+        self._bind_animated_hover(
+            button=unhide_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False 
+        )
 
 
         # Set initial text color based on button text
         if initial_button_text == "Hide":
-            self.set_vehicle_text_color(vehicle_data, "lightgreen") # Initially set to red if "Hide"
+            self.set_vehicle_text_color(vehicle_data, "#90ee90") # Initially set to red if "Hide"
         else:
-            self.set_vehicle_text_color(vehicle_data, "white") # Initially set to white if "Unhide"
+            self.set_vehicle_text_color(vehicle_data, "#FFFFFF") # Initially set to white if "Unhide"
 
             
 
@@ -16148,12 +18709,12 @@ class ConfigViewerApp:
             self.remove_hidden_line_from_file(original_line)
             button.config(text="Hide")
             print(f"Vehicle '{vehicle_data['name']}' unhidden (removed from Hidden.txt). Button changed to Hide.")
-            self.set_vehicle_text_color(vehicle_data, "lightgreen") # Set text to red when hidden
+            self.set_vehicle_text_color(vehicle_data, "#90ee90") # Set text to red when hidden
         else: # "Hide"
             self.add_hidden_line_to_file(original_line)
             button.config(text="Unhide")
             print(f"Vehicle '{vehicle_data['name']}' hidden again (added to Hidden.txt). Button changed to Unhide.")
-            self.set_vehicle_text_color(vehicle_data, "white") # Set text to white when unhidden
+            self.set_vehicle_text_color(vehicle_data, "#FFFFFF") # Set text to white when unhidden
 
         self.check_and_start_hidden_window_restart_button_fade() # Call this after toggling any button
         self.unhide_was_toggled_in_hidden_window = True 
@@ -16331,10 +18892,15 @@ class ConfigViewerApp:
                 break # No need to check further frames if 'Hide' button is found
 
         if show_scan_win:
-            scanning_win = self.show_scanning_window(text="Restart/Shutdown of the Mod Manager required to update hidden vehicle list.")
-            time.sleep(3.125)
+            scanning_win = self.show_scanning_window(text="Restart/Shutdown of the application required to update hidden vehicle list.")
             if scanning_win:
-                scanning_win.destroy()
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+            return
 
     def check_and_start_hidden_window_restart_button_fade(self):
         """Checks if any 'Hide' buttons are present and starts the restart button fade if needed."""
@@ -16433,12 +18999,32 @@ class ConfigViewerApp:
         
         
         
-    def on_picture_click(self, clicked_folder_name, folder_name_for_display=None):
+    def on_picture_click(self, clicked_folder_name, folder_name_for_display=None, clicked_from_category=None):
         """
         Handles a click on a picture in the main grid.
         Opens the details subgrid window for the clicked item.
         MODIFIED to check force_details_mode flag before checking main filter state.
         """
+
+
+        if self.loading_search_results_window:
+            return
+
+        self.disable_hover_temporarily = True
+
+        '''
+        if self.dev_mode:
+
+            scanning_win = self.show_scanning_window(text="self.disable_hover_temporarily = True", dev_notif=True)
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+                '''
+
         # --- Existing initial checks and pause logic ---
         if self.details_window and self.details_window.winfo_exists():
             # Optional: Check if it's the *same* folder being clicked again rapidly
@@ -16464,9 +19050,18 @@ class ConfigViewerApp:
         print("--- END CALL STACK TRACE ---\n")
         print(f"  DEBUG: on_picture_click - clicked_folder_name: {clicked_folder_name}")
 
+
+
         # --- <<< MODIFIED: Determine details window mode ---
+
         print("  DEBUG: on_picture_click - Determining details_window_should_open_in_favorites_mode...")
-        if hasattr(self, 'force_details_mode') and self.force_details_mode:
+
+        if clicked_from_category == "Favorites":
+            print(f"  DEBUG: on_picture_click - Clicked from 'Favorites' category. Forcing details to favorites mode for folder: {clicked_folder_name}.")
+            self.details_window_should_open_in_favorites_mode = True
+
+
+        elif hasattr(self, 'force_details_mode') and self.force_details_mode:
             # Override based on the flag set by toggle_favorites_mode_details_window
             print(f"  DEBUG: on_picture_click - Override flag 'force_details_mode' is SET: '{self.force_details_mode}'")
             if self.force_details_mode == 'favorites':
@@ -16485,6 +19080,7 @@ class ConfigViewerApp:
             print(f"  DEBUG: on_picture_click - self.filter_options: {self.filter_options}, Type: {type(self.filter_options)}")
             if self.filter_state >= 0 and self.filter_state < len(self.filter_options):
                  current_filter_option = self.filter_options[self.filter_state]
+
                  print(f"  DEBUG: on_picture_click - Current Filter Option: {current_filter_option}, Type: {type(current_filter_option)}")
                  print(f"  DEBUG: on_picture_click - Comparing to string 'Favorites', Type: {type('Favorites')}")
                  print(f"  DEBUG: on_picture_click - String comparison result: {current_filter_option == 'Favorites'}")
@@ -16577,6 +19173,8 @@ class ConfigViewerApp:
             display_key,
             search_query=search_query_for_details
         )
+
+        self.reenable_hover()
         print("--- on_picture_click() DEBUGGING END ---\n")
 
 
@@ -16616,6 +19214,8 @@ class ConfigViewerApp:
         """ # <<< MODIFIED docstring
         folder_name = self.current_details_folder
 
+
+
         print("\n--- toggle_favorites_mode_details_window() DEBUG ENTRY ---") # Debug - Entry
         print(f"  DEBUG: toggle_favorites_mode_details_window - Current details_window_is_favorites_filtered (BEFORE): {self.details_window_is_favorites_filtered}") # Debug - Before Check
         print(f"  DEBUG: toggle_favorites_mode_details_window - is_data_subset_active: {self.is_data_subset_active}") # Debug - Check global filter state
@@ -16623,7 +19223,7 @@ class ConfigViewerApp:
         if self.is_data_subset_active: # Check if global filters (like Brand, Name etc.) are active
             scanning_win = None
             try:
-                scanning_win = self.show_scanning_window(text="Cannot switch detail view mode while main filters are active.")
+                scanning_win = self.show_scanning_window(text="Cannot switch configurations list view mode while main filters are active.")
                 # Use after to destroy the window non-blockingly
                 self.master.after(3125, lambda: scanning_win.destroy() if scanning_win and scanning_win.winfo_exists() else None)
             except Exception as e:
@@ -16632,6 +19232,8 @@ class ConfigViewerApp:
                     scanning_win.destroy()
 
             print("--- toggle_favorites_mode_details_window() EXIT - Global filter active ---\n") # Debug - Exit - Global Filter Active
+            
+
             return # Exit if global filters are on
 
         # Initialize the flag before deciding the mode
@@ -16685,6 +19287,8 @@ class ConfigViewerApp:
                 # Keep button text as "View Favorites" since we didn't switch
                 # Do not set force_details_mode, do not call reopen
                 print("--- toggle_favorites_mode_details_window() EXIT - No Favorites Found Case ---\n")
+
+
                 return # Exit because no favorites found
 
 
@@ -16797,6 +19401,9 @@ class ConfigViewerApp:
 
             # --- Filter data for favorites (with deduplication) ---
             favorite_configs_set = self.read_favorites()
+
+ 
+
             filtered_subgrid_data = []
             added_fav_keys = set()
             print(f"  DEBUG: favorite_configs_set: {favorite_configs_set}")
@@ -16852,6 +19459,9 @@ class ConfigViewerApp:
         # --- Common final steps ---
         self.show_progress_bar_details()
 
+
+
+        
         if search_query:
             print(f"  DEBUG: display_subgrid_in_new_window - Setting details_search_var to: '{search_query}' (but NOT performing search yet).")
             self.details_search_var.set(search_query)
@@ -16894,45 +19504,53 @@ class ConfigViewerApp:
 
 
     def add_jump_to_page_button_to_details_window(self, top_details_frame):
-        """Adds the 'Search Within: Zips' dropdown to the details window."""
-        button_style_args_jump_to_page = {
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font": ("Segoe UI", 10+self.font_size_add)
+        """Adds the 'Jump to page' button to the details window with animated hover."""
+
+        # Define base and hover colors for clarity and consistency
+        button_original_bg = "#555555"
+        button_original_fg = "#FFFFFF"
+        
+        # Hover colors from your original on_jump_to_page_button_hover_enter logic
+        button_hover_bg = self.global_highlight_color 
+        button_hover_fg = "#FFFFFF" # Your original code explicitly set fg to white on hover
+
+        button_style_args = {
+            "bg": button_original_bg, # Initial background, will be managed by _bind_animated_hover
+            "fg": button_original_fg, # Initial foreground, will be managed by _bind_animated_hover
+            "relief": tk.FLAT,
+            "bd": 0,
+            "highlightbackground": button_original_bg, # For the focus ring when not focused
+            "activebackground": "#666666", # Background color when button is pressed
+            "activeforeground": "#FFFFFF", # Foreground color when button is pressed
+            "font": ("Segoe UI", 10 + self.font_size_add)
         }
-
-        def on_jump_to_page_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_jump_to_page_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_jump_to_page_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_jump_to_page_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_jump_to_page_button_hover_leave(e, bg, fg))
 
         self.jump_to_page_button = tk.Button(
             top_details_frame,
             text="Jump to page",
-            **button_style_args_jump_to_page, # <--- APPLY BUTTON STYLES - zip search button style
-            command=self.handle_jump_to_page_button_click
+            **button_style_args,
+            command=self.handle_jump_to_page_button_click # Simplified: use direct command
         )
 
-        self.jump_to_page_button.bind("<Enter>", on_jump_to_page_button_hover_enter)
-        self.jump_to_page_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_jump_to_page_button_hover_leave(event, bg, fg))
-        self.jump_to_page_button.bind("<Button-1>", on_jump_to_page_button_click)
+        self._bind_animated_hover(
+            button=self.jump_to_page_button,
+            original_bg=button_original_bg,
+            original_fg=button_original_fg,
+            hover_target_bg=button_hover_bg,
+            hover_target_fg=button_hover_fg
+
+        )
+
 
 
         if not self.jump_to_page_button_should_be_bottom:
 
-            self.jump_to_page_button.pack(side="left", padx=(10, 0)) # Pack after search bar and before loading label
+            if self.details_window_should_open_in_favorites_mode:
+                self.jump_to_page_button.pack(side="left", padx=(0, 10))
+            
+            else:
+                self.jump_to_page_button.pack(side="left", padx=(10, 0)) # Pack after search bar and before loading label
+
 
         else:
             pass
@@ -16954,7 +19572,7 @@ class ConfigViewerApp:
             button_x = button.winfo_rootx()
             button_y = button.winfo_rooty() + button.winfo_height()
 
-            self.jump_to_page_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+            self.jump_to_page_dropdown_window = dropdown_window = FadingToplevel(self.details_window, self)
 
             dropdown_window.geometry(f"+{button_x}+{button_y}")
 
@@ -16967,13 +19585,8 @@ class ConfigViewerApp:
             button_x = button.winfo_rootx()
             button_y = button.winfo_rooty() # Get the top of the button
 
-            self.jump_to_page_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+            self.jump_to_page_dropdown_window = dropdown_window = FadingToplevel(self.details_window, self)
             button_width = button.winfo_width() # Get the width of the button
-
-            #dropdown_window.update_idletasks()
-            #dropdown_height = dropdown_window.winfo_height()
-            #dropdown_y = button_y - dropdown_height
-            #dropdown_window.geometry(f"+{button_x - 31}+{dropdown_y - 43}")
 
 
 
@@ -17009,45 +19622,89 @@ class ConfigViewerApp:
             self.jump_to_page_dropdown_window = None
 
         for i in range(1, num_pages + 1):
-            bg_color = "#555555"
-            fg_color = "white"
-            if i == current_page_index: # Highlight current page
-                bg_color = self.global_highlight_color # Orange background
-                fg_color = "white" # White text for current page
+            # --- Define Colors for page buttons ---
+            page_default_bg = "#555555"
+            page_default_fg = "#FFFFFF"
+            page_selected_bg = self.global_highlight_color # Orange for current page
+            page_selected_fg = "#FFFFFF"                   # White text for current page
+            page_hover_bg = "#d9d9d9"
+            page_hover_fg = "black"
+
+            is_selected = (i == current_page_index) # Check if this is the current page
 
             page_button = tk.Button(
                 scrollable_frame,
                 text=f"Page {i}",
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
-                command=lambda idx=i: on_page_button_click(idx),
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
+                command=lambda idx=i: on_page_button_click(idx), # Ensure on_page_button_click exists
                 borderwidth=1,
                 relief="solid",
                 anchor="w",
                 padx=10,
                 pady=5,
-                bg=bg_color,
-                fg=fg_color,
-                width=24 # Adjust width as needed for dropdown buttons, make it same width as zip dropdown
+
+            )
+            page_button.config(
+                width=24, # Set fixed width
+                activebackground=page_hover_bg, # For click flash
+                activeforeground=page_hover_fg
             )
             page_button.pack(fill="x")
-            page_button.bind("<Enter>", lambda event, btn=page_button: btn.config(bg="lightgrey", fg="black"))
-            page_button.bind("<Leave>", lambda event, btn=page_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg)) # Pass original colors
+            # if hasattr(self, 'current_page_buttons_list'): self.current_page_buttons_list.append(page_button)
+
+
+            self._bind_animated_hover(
+                button=page_button,
+                original_bg=page_default_bg,
+                original_fg=page_default_fg,
+                hover_target_bg=page_hover_bg,
+                hover_target_fg=page_hover_fg,
+                check_state=False,
+                is_selected_initial=is_selected,
+                selected_bg=page_selected_bg,
+                selected_fg=page_selected_fg
+            )
+            # REMOVED old binds
 
         # --- Close Button (below scrollable frame, in dropdown_window) ---
+
+        # --- Define Colors for the Close button ---
+        close_button_original_bg = "#666666"
+        close_button_original_fg = "#FFFFFF"
+        # Hover to global highlight color (orange) or a custom one
+        close_button_hover_bg = self.global_highlight_color # e.g., "#777777"
+        close_button_hover_fg = "#FFFFFF" # Assuming white text on highlight
+
         close_button = tk.Button(
             dropdown_window, # Place in dropdown_window
             text="Close",
-            font=("Segoe UI", 10+self.font_size_add, "bold"),
-            command=self.destroy_jump_to_page_dropdown_menu,
-            bg="#666666",
-            fg="white",
+            font=("Segoe UI", 10 + self.font_size_add, "bold"),
+            command=self.destroy_jump_to_page_dropdown_menu, # Ensure this method exists
+            # bg and fg will be set by _bind_animated_hover initially
             borderwidth=1,
             relief="solid",
             padx=10,
             pady=5
         )
+        # Set active colors for click flash (optional)
+        close_button.config(
+            activebackground=close_button_hover_bg, # Example: match hover for click
+            activeforeground=close_button_hover_fg
+        )
         close_button.pack(side="bottom", fill="x") # Pack to bottom of dropdown_window
-        # --- Close Button (below scrollable frame, in dropdown_window) ---
+
+        # --- Apply Smooth Hover Animation to the Close Button ---
+        self._bind_animated_hover(
+            button=close_button,
+            original_bg=close_button_original_bg,
+            original_fg=close_button_original_fg,
+            hover_target_bg=close_button_hover_bg,
+            hover_target_fg=close_button_hover_fg,
+            check_state=False, # Assuming close button is always enabled
+            is_selected_initial=False, # No selected state
+            selected_bg=None,
+            selected_fg=None
+        )
 
         # Force update to calculate window size based on content
         dropdown_window.update_idletasks()
@@ -17123,54 +19780,66 @@ class ConfigViewerApp:
 
 
 
+
     def add_zip_search_dropdown_to_details_window(self, top_details_frame):
-        """Adds the 'Search Within: Zips' dropdown to the details window."""
-        button_style_args_zip_search = { # Define button_style_args for zip search button - NO BOLD FONT
-            "bg": "#555555",
-            "fg": "white",
-            "relief": tk.FLAT, # Flatten the buttons
-            "bd": 0, # Remove border
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            "font": ("Segoe UI", 10+self.font_size_add) # REMOVE BOLD FONT - for zip search button
+        """Adds the 'Search Within: Zips' dropdown to the details window with smooth hover."""
+
+        # --- Define Colors & Styles for this button ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Hover text color
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args_zip_search = {
+            "bg": original_bg,
+            "fg": original_fg,
+            "relief": tk.FLAT,
+            "bd": 0,
+            # "highlightthickness": 0, # REMOVED as per instruction
+            "highlightbackground": original_bg, # Match background
+            "activebackground": active_bg, # For standard click feedback
+            "activeforeground": active_fg, # For standard click feedback
+            "font": ("Segoe UI", 10 + self.font_size_add)
         }
 
-        def on_zip_search_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
 
-        def on_zip_search_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_zip_search_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_zip_search_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_zip_search_button_hover_leave(e, bg, fg))
-
-
-
+        # --- Determine Initial Text (Unchanged) ---
         initial_button_text = "Search within: All Zips"
         if self.is_data_subset_active:
             initial_button_text = "Search within: Filtered"
         elif self.details_window_should_open_in_favorites_mode:
             initial_button_text = "Search within: Favorites"
 
-        self.zip_search_button = tk.Button(
+
+        # --- Create the Button ---
+        button = tk.Button(
             top_details_frame,
             text=initial_button_text,
-            **button_style_args_zip_search, # <--- APPLY BUTTON STYLES - zip search button style
-            #font=("Segoe UI", 10+self.font_size_add), # Removed redundant font argument HERE
-            command=self.handle_zip_search_button_click
+            **button_style_args_zip_search, # Apply styles
+            command=self.handle_zip_search_button_click # Ensure this method exists
+        )
+        self.zip_search_button = button # Store reference
+
+        # --- Bind using the helper function ---
+        # Assumes self._bind_animated_hover is defined in the class
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this button doesn't need state checks for hover
         )
 
-        self.zip_search_button.bind("<Enter>", on_zip_search_button_hover_enter)
-        self.zip_search_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_zip_search_button_hover_leave(event, bg, fg))
-        self.zip_search_button.bind("<Button-1>", on_zip_search_button_click)
 
+        # --- Pack the Button (Unchanged) ---
+        if self.details_window_should_open_in_favorites_mode:
+            return
+        if self.is_data_subset_active:
+            return
+        else:
+            button.pack(side="left", padx=(0, 0)) # Pack after search bar and before loading label
 
-        self.zip_search_button.pack(side="left", padx=(0, 0)) # Pack after search bar and before loading label
-  
 
 
     def _filter_details_data_by_query(self, data_to_filter, query): # <--- MODIFIED FUNCTION - Favorites Filter Added
@@ -17345,12 +20014,45 @@ class ConfigViewerApp:
         #self.details_window.bind("<Escape>", lambda event: self.on_details_window_close())
         #self.details_window.bind_all("<Control-n>", lambda event: self.clear_details_sidebar_content()) # debug
 
+        self.disable_hover_temporarily = False
+
+        '''
+        if self.dev_mode:
+
+            scanning_win = self.show_scanning_window(text="self.disable_hover_temporarily = False", dev_notif=True)
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+                '''
+
+        print("changing self.disable_hover_temporarily = False")
+
 
     def close_details_window_from_x_button(self):
         self.details_window_intentionally_closed = True
-        self.on_details_window_close()
         
+        def destroy_details_window_after_fade():
+            """Safely destroys the details window."""
 
+            print(f"DEBUG: Fading complete. Destroying details_window: {self.details_window}") # DEBUG
+            self.on_details_window_close()
+
+
+        # Start the fade-out animation.
+        # Pass the `destroy_details_window_after_fade` function as the callback.
+        self._fade_window(
+            window=self.details_window,
+            start_alpha=1.0,
+            end_alpha=0.0,
+            duration_ms=40,
+            steps=20,
+            callback=destroy_details_window_after_fade  # Pass the function to be called
+        )
+        
 
     def clear_details_sidebar_content(self):
             """
@@ -17510,100 +20212,155 @@ class ConfigViewerApp:
         self.details_main_frame = details_main_frame # Storing for potential future use if needed       
 
 
- 
+
+
 
     def _create_top_frame_content(self, details_header):
-        """Creates content for the top frame of the details window (search, header, loading label, View Favorites button)."""
-        # --- REMOVED "Search (Details):" label ---
-        # lbl_search_details = tk.Label(self.top_details_frame, text="Search (Details):", bg="#333333", fg="white", font=("Segoe UI", 10+self.font_size_add))
-        # lbl_search_details.pack(side="left", padx=(10, 5))
-        # --- REMOVED "Search (Details):" label ---
+        """Creates content for the top frame of the details window (search, header, loading label, buttons with smooth hover)."""
 
-        button_style_args_details_top_bar = { # Define button_style_args for details top bar buttons - NO BOLD FONT
-            "bg": "#555555",
-            "fg": "white",
+        # --- Define Colors & Styles for buttons in this frame ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Hover text color
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        button_style_args_details_top_bar = {
+            "bg": original_bg,
+            "fg": original_fg,
             "relief": tk.FLAT,
             "bd": 0,
-            "highlightbackground": "#555555",
-            "activebackground": "#666666",
-            "activeforeground": "white",
-            #"font":("Segoe UI", 12+self.font_size_add, "bold") # REMOVE BOLD FONT - for details top bar buttons
+            "highlightbackground": original_bg, # Match background
+            "activebackground": active_bg,
+            "activeforeground": active_fg,
+            # Font applied individually below
         }
 
-        def on_details_top_button_hover_enter(event):
-            event.widget.config(bg=self.global_highlight_color, fg="white")
-
-        def on_details_top_button_hover_leave(event, original_bg="#555555", original_fg="white"):
-            event.widget.config(bg=original_bg, fg=original_fg)
-
-        def on_details_top_button_click(event):
-            event.widget.config(bg="white", fg="black")
-            # After click effect, revert back to hover style (orange) on enter, or default on leave
-            event.widget.bind("<Enter>", on_details_top_button_hover_enter)
-            event.widget.bind("<Leave>", lambda e, bg="#555555", fg="white": on_details_top_button_hover_leave(e, bg, fg))
 
 
-        details_search_button = tk.Button(self.top_details_frame, text="🔍", font=("Segoe UI", 12+self.font_size_add),
-                                          command=self.perform_details_search, **button_style_args_details_top_bar) # <--- APPLY button_style_args
-
-        details_search_button.bind("<Enter>", on_details_top_button_hover_enter)
-        details_search_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_details_top_button_hover_leave(event, bg, fg))
-        details_search_button.bind("<Button-1>", on_details_top_button_click)
-        details_search_button.pack(side="left", padx=(10, 10)) # <--- PACK BUTTON FIRST, ADD PADDING
-
-
-        self.details_search_var = tk.StringVar()
-        details_search_entry = tk.Entry(self.top_details_frame, textvariable=self.details_search_var, font=("Segoe UI", 10+self.font_size_add),
-                                        width=40, bg="lightgrey")
-        details_search_entry.pack(side="left", padx=(0, 10)) # <--- PACK ENTRY SECOND
-        #details_search_entry.bind("<Return>", lambda e: self.perform_details_search())
-        details_search_entry.bind("<KeyRelease>", self._handle_details_search_key_release) # <--- ADD THIS LINE - KEYRELEASE BINDING
-
-        self.add_zip_search_dropdown_to_details_window(self.top_details_frame) # <--- ADDED HERE - call the new function
-        self.add_jump_to_page_button_to_details_window(self.top_details_frame) # <--- ADDED HERE - call the new function
-
-        #self.custom_config_label_details = tk.Label(self.top_details_frame, text=details_header, bg="#333333",
-        #                                            font=("Segoe UI", 12+self.font_size_add, "bold",), fg="white")
-        #self.custom_config_label_details.pack(side="left", padx=(20, 0))
-
-        self.details_loading_label = tk.Label(
+        # --- Search Icon Label (Not a button, Unchanged) ---
+        details_search_button = tk.Label(
             self.top_details_frame,
-            text="",
-            bg="#333333",
-            font=("Segoe UI", 12+self.font_size_add, "bold")
+            text="🔍",
+            font=("Segoe UI", 12 + self.font_size_add),
+            **self.search_button_style_args # Apply style
         )
-        self.details_loading_label.pack(side="left", padx=(10, 10)) # Pack loading label BEFORE button
+        details_search_button.pack(side="left", padx=(4, 2), pady=4)
 
-        self.create_progress_bar_details(self.top_details_frame) # Progress bar in top frame <----- ADDED HERE
+        # --- Search Entry (Unchanged) ---
+        self.details_search_var = tk.StringVar()
+        details_search_entry = tk.Entry(
+            self.top_details_frame,
+            textvariable=self.details_search_var,
+            font=("Segoe UI", 10 + self.font_size_add),
+            width=40,
+            bg="#d9d9d9"
+        )
+        details_search_entry.pack(side="left", padx=(0, 10))
+        details_search_entry.bind("<KeyRelease>", self._handle_details_search_key_release)
 
-        # View Favorites / View All Button
+        # --- Other Dropdown/Button Additions (Assume these handle their own bindings) ---
+        self.add_zip_search_dropdown_to_details_window(self.top_details_frame)
+        self.add_jump_to_page_button_to_details_window(self.top_details_frame)
+
+        # --- Loading Label (Unchanged) ---
+        self.details_loading_label = tk.Label(
+            self.top_details_frame, text="", bg="#333333",
+            font=("Segoe UI", 12 + self.font_size_add, "bold")
+        )
+        self.details_loading_label.pack(side="left", padx=(10, 10))
+
+
+
+
+        # --- Progress Bar (Unchanged) ---
+        self.create_progress_bar_details(self.top_details_frame)
+
+        # --- View Favorites / View All Button ---
         button_text = "View Favorites" if not self.details_window_should_open_in_favorites_mode else "View All"
-        self.details_view_favorites_button = tk.Button(
+        fav_button = tk.Button(
             self.top_details_frame,
             text=button_text,
-            font=("Segoe UI", 10+self.font_size_add),
+            font=("Segoe UI", 10 + self.font_size_add),
             command=self.toggle_favorites_mode_details_window,
-            **button_style_args_details_top_bar # <--- APPLY BUTTON STYLE - details top bar style
+            **button_style_args_details_top_bar # Apply style
         )
-        self.details_view_favorites_button.bind("<Enter>", on_details_top_button_hover_enter)
-        self.details_view_favorites_button.bind("<Leave>", lambda event, bg="#555555", fg="white": on_details_top_button_hover_leave(event, bg, fg))
-        self.details_view_favorites_button.bind("<Button-1>", on_details_top_button_click)
-        self.details_view_favorites_button.pack(side="left", padx=(10, 10)) # Pack button AFTER loading label, on right side
-        
-        
-        self.details_back_button = tk.Button(
+        self.details_view_favorites_button = fav_button # Store reference
+
+        # --- Bind Favorites Button using the helper ---
+        self._bind_animated_hover(
+            button=fav_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this button is always enabled for hover effects
+        )
+        # REMOVED: Old direct bindings for fav_button
+
+
+        if self.details_window_should_open_in_favorites_mode and self.is_data_subset_active:
+            top_label_text="Favorite Configurations (Filtered)"
+
+        elif self.is_data_subset_active:
+            top_label_text="Configurations (Filtered)"
+
+        elif self.details_window_should_open_in_favorites_mode:
+            top_label_text="Favorite Configurations"
+            fav_button.pack(side="left", padx=(0, 10)) # Pack button
+
+        else:
+            top_label_text="Configurations"
+            fav_button.pack(side="left", padx=(10, 10)) # Pack button
+
+
+
+
+        self.current_view_label = tk.Label(
+            self.top_details_frame, text=top_label_text, bg="#333333", fg="#FFFFFF",
+            font=("Segoe UI", 12 + self.font_size_add, "bold")
+        )
+        self.current_view_label.pack(side="left", padx=(10, 10))
+
+
+
+        self.details_pending_hidden_warning_label = tk.Label(
+            self.top_details_frame, text="Management features disabled due to pending hidden items", bg="#333333", fg="#FFFFFF",
+            font=("Segoe UI", 12 + self.font_size_add, "bold")
+        )
+        if self.items_to_be_hidden:
+            self.details_pending_hidden_warning_label.pack(side="left", padx=(10, 10))
+
+            self._start_fade_loop(self.details_pending_hidden_warning_label, self.warning_color_sidebar, self.default_sidebar_color)
+
+
+
+
+
+
+
+        # --- Back Button ---
+        back_button = tk.Button(
             self.top_details_frame,
             text="Back",
-            font=("Segoe UI", 10+self.font_size_add),
-            command=self.close_details_window_from_x_button, # Use existing close function
-            **button_style_args_details_top_bar
+            font=("Segoe UI", 10 + self.font_size_add),
+            command=self.close_details_window_from_x_button,
+            **button_style_args_details_top_bar # Apply style
         )
-        self.details_back_button.bind("<Enter>", on_details_top_button_hover_enter)
-        self.details_back_button.bind("<Leave>", on_details_top_button_hover_leave)
-        self.details_back_button.bind("<Button-1>", on_details_top_button_click)
-        self.details_back_button.pack(side="right", padx=(0, 10)) # Pack on the right, with padding
+        self.details_back_button = back_button # Store reference
 
-        self.details_header_original_color = "white"
+
+        # --- Bind Back Button using the helper ---
+        self._bind_animated_hover(
+            button=back_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=False # Assuming this button is always enabled for hover effects
+        )
+        # REMOVED: Old direct bindings for back_button
+
+        back_button.pack(side="right", padx=(0, 10)) # Pack on the right
+
 
 
     def _handle_details_search_key_release(self, event):
@@ -17661,11 +20418,11 @@ class ConfigViewerApp:
         """
         # --- NEW: "Showing..." Label in Bottom Frame (FAR LEFT) - PACK FIRST ---
         self.details_showing_configs_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
-                                                    font=("Segoe UI", 12+self.font_size_add, "bold",), fg="white", anchor="w", justify="left")
+                                                    font=("Segoe UI", 12+self.font_size_add, "bold",), fg="#FFFFFF", anchor="w", justify="left")
         self.details_showing_configs_label.pack(side="left", padx=(10, 0))
         # --- NEW: "Showing..." Label in Bottom Frame (FAR LEFT) ---
 
-        self.details_command_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12+self.font_size_add))
+        self.details_command_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 12+self.font_size_add))
         self.details_command_label.pack(side="left", padx=(10, 0))
 
         self.details_deleting_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
@@ -17679,12 +20436,12 @@ class ConfigViewerApp:
 
         button_style_args = {
             "bg": "#555555",
-            "fg": "white",
+            "fg": "#FFFFFF",
             "relief": tk.FLAT, # <--- FLATTENED BUTTONS
             "bd": 2,
             "highlightbackground": "#555555",
             "activebackground": "#666666",
-            "activeforeground": "white"
+            "activeforeground": "#FFFFFF"
         }
 
         def button_hover_enter(event):
@@ -17699,7 +20456,7 @@ class ConfigViewerApp:
         self.details_prev_button.bind("<Enter>", button_hover_enter) # <--- HOVER EFFECT
         self.details_prev_button.bind("<Leave>", button_hover_leave) # <--- HOVER EFFECT
 
-        self.details_page_label = tk.Label(self.details_pagination_frame, text="Page: 1", bg="#333333", fg="white", font=("Segoe UI", 10+self.font_size_add))
+        self.details_page_label = tk.Label(self.details_pagination_frame, text="Page: 1", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 10+self.font_size_add))
         self.details_page_label.pack(side="left", padx=5)
 
         self.details_next_button = tk.Button(self.details_pagination_frame, text="Next", font=("Segoe UI", 9+self.font_size_add, "bold"), command=self.go_to_next_details_page, **button_style_args)
@@ -17716,8 +20473,8 @@ class ConfigViewerApp:
             command=self.toggle_details_favorites_filter,
             **button_style_args
         )
-        # DO NOT UNCOMMENT OR REMOVE THIS LINE - THIS BUTTON NEEDS TO BE HIDDEN AS IT CAUSES BUGGY BEHAVIOR AND ONLY MEANT FOR DEBUG
 
+        # DO NOT UNCOMMENT OR REMOVE THIS LINE - THIS BUTTON NEEDS TO BE HIDDEN AS IT CAUSES BUGGY BEHAVIOR AND ONLY MEANT FOR DEBUG
         #self.details_favorites_filter_button.pack(side="right", padx=(0, 10)) # Pack to the right, do not uncomment this line
 
         # --- NEW: Favorites Filter Button - Button CREATION MOVED BACK HERE ---
@@ -17749,13 +20506,163 @@ class ConfigViewerApp:
 
 
 
-        self.details_count_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="white", font=("Segoe UI", 12+self.font_size_add))
+        self.details_count_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 12+self.font_size_add))
         #self.details_count_label.pack(side="right", padx=(5, 10)) # don't remove this comment, this is disabled on purpose
 
-        self.details_page_label_original_color = "white"
+        self.details_page_label_original_color = "#FFFFFF"
         
  
        
+    def _create_bottom_frame_content(self):
+        """
+        Creates content for the bottom frame of the details window
+        (labels, pagination buttons with smooth hover).
+        """
+        # --- Labels (Unchanged) ---
+        self.details_showing_configs_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
+                                                    font=("Segoe UI", 12+self.font_size_add, "bold",), fg="#FFFFFF", anchor="w", justify="left")
+        self.details_showing_configs_label.pack(side="left", padx=(10, 0))
+
+        self.details_command_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 12+self.font_size_add))
+        self.details_command_label.pack(side="left", padx=(10, 0))
+
+        self.details_deleting_label = tk.Label(self.bottom_details_frame, text="", bg="#333333",
+                                               font=("Segoe UI", 12+self.font_size_add, "bold"))
+        self.details_deleting_label.pack(side="left", expand=True)
+
+
+        # --- Pagination Controls Frame (Unchanged) ---
+        self.details_pagination_frame = tk.Frame(self.bottom_details_frame, bg="#333333")
+        self.details_pagination_frame.pack(side="left", padx=10)
+
+        # --- Define Button Colors & Styles ---
+        original_bg = "#555555"
+        original_fg = "#FFFFFF"
+        hover_fg = "#FFFFFF" # Hover text color
+        active_bg = "#666666"
+        active_fg = "#FFFFFF"
+
+        # Base style args for buttons in this frame
+        button_style_args = {
+            "bg": original_bg,
+            "fg": original_fg,
+            "relief": tk.FLAT, # Flattened
+            "bd": 2, # Keeping original bd=2 as specified
+            "highlightbackground": original_bg, # Match bg
+            "activebackground": active_bg,
+            "activeforeground": active_fg
+            # Font applied individually
+        }
+
+        # REMOVED: Old local handler functions are no longer needed here
+        # def button_hover_enter(event): ...
+        # def button_hover_leave(event): ...
+
+        # --- Previous Button ---
+        prev_button = tk.Button(
+            self.details_pagination_frame,
+            text="Prev",
+            font=("Segoe UI", 9 + self.font_size_add, "bold"),
+            command=self.go_to_previous_details_page,
+            **button_style_args
+        )
+        prev_button.pack(side="left", padx=5)
+        self.details_prev_button = prev_button # Store reference
+
+        # Bind smooth hover
+        self._bind_animated_hover(
+            button=prev_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # Original checked state, assume might be disabled
+        )
+        # REMOVED: Old direct bindings
+
+        # --- Page Label (Unchanged) ---
+        self.details_page_label = tk.Label(self.details_pagination_frame, text="Page: 1", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 10+self.font_size_add))
+        self.details_page_label.pack(side="left", padx=5)
+
+        # --- Next Button ---
+        next_button = tk.Button(
+            self.details_pagination_frame,
+            text="Next",
+            font=("Segoe UI", 9 + self.font_size_add, "bold"),
+            command=self.go_to_next_details_page,
+            **button_style_args
+        )
+        next_button.pack(side="left", padx=5)
+        self.details_next_button = next_button # Store reference
+
+        # Bind smooth hover
+        self._bind_animated_hover(
+            button=next_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # Original checked state, assume might be disabled
+        )
+        # REMOVED: Old direct bindings
+
+        # --- End Pagination Controls Frame ---
+
+        # --- Favorites Filter Button ---
+        fav_filter_button = tk.Button(
+            self.bottom_details_frame,
+            text="Filter: Show All",
+            font=("Segoe UI", 10 + self.font_size_add),
+            command=self.toggle_details_favorites_filter,
+            **button_style_args
+        )
+        self.details_favorites_filter_button = fav_filter_button # Store reference
+
+        # Bind smooth hover
+        self._bind_animated_hover(
+            button=fav_filter_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # Assume might be disabled (safer default)
+        )
+        # REMOVED: Old direct bindings
+
+        # DO NOT UNCOMMENT OR REMOVE THIS LINE - THIS BUTTON NEEDS TO BE HIDDEN AS IT CAUSES BUGGY BEHAVIOR AND ONLY MEANT FOR DEBUG
+        #fav_filter_button.pack(side="right", padx=(0, 10))
+
+        # --- Jump To Page Button ---
+        jump_button = tk.Button(
+            self.bottom_details_frame,
+            text="Jump to page",
+            font=("Segoe UI", 10 + self.font_size_add),
+            command=self.handle_jump_to_page_button_click,
+            **button_style_args
+        )
+        self.jump_to_page_button_bottom = jump_button # Store reference
+
+        # Conditional Packing (Unchanged)
+        if self.jump_to_page_button_should_be_bottom:
+            jump_button.pack(side="right", padx=(0, 10))
+        # else: pass
+
+        # Bind smooth hover
+        self._bind_animated_hover(
+            button=jump_button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            check_state=True # Assume might be disabled
+        )
+        # REMOVED: Old direct bindings
+
+        # --- Count Label (Unchanged / Commented Out Packing) ---
+        self.details_count_label = tk.Label(self.bottom_details_frame, text="", bg="#333333", fg="#FFFFFF", font=("Segoe UI", 12+self.font_size_add))
+        #self.details_count_label.pack(side="right", padx=(5, 10))
+
+        # --- Original Color Variable (Unchanged) ---
+        self.details_page_label_original_color = "#FFFFFF"
+
+
+
 
     def _update_details_pagination_bar(self):
         """Updates the pagination bar (page number and button states) in the details window."""
@@ -17793,9 +20700,31 @@ class ConfigViewerApp:
         and triggers the reopening process (likely via on_picture_click).
         """
         print("DEBUG: reopen_details_window_in_current_mode() - Called")
+        print(f"value of self.details_window_intentionally_closed is {self.details_window_intentionally_closed}")
+
         if self.details_window and self.details_window.winfo_exists():
             folder_to_reopen = self.current_details_folder
             print(f"DEBUG: reopen_details_window_in_current_mode() - Closing current window for folder: {folder_to_reopen}")
+
+
+            self.disable_hover_temporarily = True
+
+            print("changing self.disable_hover_temporarily = True")
+
+            '''
+            if self.dev_mode:
+
+                scanning_win = self.show_scanning_window(text="self.disable_hover_temporarily = True", dev_notif=True)
+                if scanning_win:
+
+                    def close_scanning_window():
+
+                        scanning_win.destroy()
+
+                    scanning_win.after(3125, close_scanning_window)
+                    '''
+
+
             self.on_details_window_close() # Close existing window
 
             # Add a small delay if needed, helps Tkinter process the destroy event
@@ -17831,6 +20760,11 @@ class ConfigViewerApp:
         self.scrollbar_thumb_dragging_details = False # Initialize dragging flag for details scrollbar
         self.scrollbar_thumb_start_y_details = 0
         self.scrollbar_mouse_start_y_details = 0
+        
+        self._details_scroll_pending = False
+        self._details_throttled_after_id = None
+        self._last_details_thumb_y = 0 #
+
 
         self.custom_scrollbar_canvas_details.bind("<ButtonPress-1>", self.custom_details_scrollbar_click)
         self.custom_scrollbar_canvas_details.bind("<B1-Motion>", self.custom_details_scrollbar_drag)
@@ -17928,7 +20862,7 @@ class ConfigViewerApp:
                 self.details_sidebar_frame,
                 text=f"Showing Favorites for...",
                 font=("Segoe UI", 12+self.font_size_add, "italic"),
-                fg="lightgrey",
+                fg="#d9d9d9",
                 bg="#333333",
                 anchor="center",
                 justify="center"
@@ -17947,7 +20881,7 @@ class ConfigViewerApp:
         # --- Top Fixed Section ---
         self.details_sidebar_car_name_label = tk.Label(
             self.details_sidebar_frame, text="", font=("Segoe UI", 14+self.font_size_add, "bold"),
-            bg="#333333", fg="lightgrey", wraplength=280, justify="center"
+            bg="#333333", fg="#d9d9d9", wraplength=280, justify="center"
         )
         # Pack the car name label first
         self.details_sidebar_car_name_label.pack(pady=(details_sidebar_padding * 0.5, 5), padx=details_sidebar_padding, fill='x') # Reduced bottom padding
@@ -18028,8 +20962,8 @@ class ConfigViewerApp:
         label_font_cat = ("Segoe UI", 11+self.font_size_add, "bold")
         label_font_val = ("Segoe UI", 11+self.font_size_add, "italic")
         label_bg = "#333333"
-        label_fg_cat = "white"
-        label_fg_val = "lightgrey"
+        label_fg_cat = "#FFFFFF"
+        label_fg_val = "#d9d9d9"
         label_anchor = "w"
         label_justify = "left"
         label_wraplength = 280
@@ -18113,13 +21047,23 @@ class ConfigViewerApp:
         self.details_add_to_queue_button = tk.Button(self.details_buttons_frame, text="Add to Spawn Queue", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
         self.details_sidebar_favorites_button = tk.Button(self.details_buttons_frame, text="Add to Favorites", font=("Segoe UI", 10+self.font_size_add), width=button_width, **button_style_args)
 
-        buttons = [
-            self.details_sidebar_show_details_button,
-            self.details_replace_current_button,
-            self.details_spawn_new_button,
-            #self.details_add_to_queue_button,
-            self.details_sidebar_favorites_button
-        ]
+
+        if self.items_to_be_hidden: # fav button disabled now because it updates the main grid which messes with the selected hidden items
+            buttons = [
+                self.details_sidebar_show_details_button,
+                self.details_replace_current_button,
+                self.details_spawn_new_button,
+                #self.details_add_to_queue_button,
+                #self.details_sidebar_favorites_button
+            ]
+        else:
+            buttons = [
+                self.details_sidebar_show_details_button,
+                self.details_replace_current_button,
+                self.details_spawn_new_button,
+                #self.details_add_to_queue_button,
+                self.details_sidebar_favorites_button
+            ]
 
         for button in buttons:
             button.pack(side="top", fill="x", pady=(8, 0), padx=0)
@@ -18138,39 +21082,43 @@ class ConfigViewerApp:
         self.details_sidebar_favorites_button.config(command=self.on_details_sidebar_favorites_click)
         
 
+
+
+
     def _apply_details_sidebar_button_effects(self, button):
-        """Applies hover and click effects to a button."""
-        default_bg = self.button_style_args['bg']
-        default_fg = self.button_style_args['fg']
-        hover_bg = self.global_highlight_color
-        hover_fg = "white"
-        click_bg = "white"
-        click_fg = "black"
+        """
+        Applies smooth hover animation effects to a details sidebar button using the
+        standard binder, and removes custom click flash.
+        Relies on the button's activebackground/activeforeground for click feedback.
+        """
+        # --- Get Default Colors ---
+        # Assuming self.button_style_args holds the correct defaults for these buttons
+        try:
+            original_bg = self.button_style_args['bg']
+            original_fg = self.button_style_args['fg']
+        except (AttributeError, KeyError):
+            # Fallback if self.button_style_args is missing or doesn't have keys
+            print("Warning: self.button_style_args not found or missing keys. Using default colors for sidebar button effects.")
+            original_bg = "#555555"
+            original_fg = "#FFFFFF"
 
-        def on_enter(event):
-            event.widget.config(bg=hover_bg, fg=hover_fg)
+        # --- Define Hover Foreground ---
+        hover_fg = "#FFFFFF" # Standard hover foreground
 
-        def on_leave(event):
-            event.widget.config(bg=default_bg, fg=default_fg)
+        # REMOVED: Definitions for default_bg/fg, hover_bg/fg, click_bg/fg are not needed here
+        # REMOVED: Local handler functions (on_enter, on_leave, on_click, on_release)
 
-        def on_click(event):
-            event.widget.config(bg=click_bg, fg=click_fg)
-
-        def on_release(event): # Revert to hover style on release, if mouse is still over, else default
-            if event.widget.winfo_pointerx() >= event.widget.winfo_rootx() and \
-               event.widget.winfo_pointerx() <= event.widget.winfo_rootx() + event.widget.winfo_width() and \
-               event.widget.winfo_pointery() >= event.widget.winfo_rooty() and \
-               event.widget.winfo_pointery() <= event.widget.winfo_rooty() + event.widget.winfo_height():
-                event.widget.config(bg=hover_bg, fg=hover_fg)
-            else:
-                event.widget.config(bg=default_bg, fg=default_fg)
-
-
-        button.bind("<Enter>", on_enter)
-        button.bind("<Leave>", on_leave)
-        button.bind("<ButtonPress-1>", on_click)
-        button.bind("<ButtonRelease-1>", on_release) # Use ButtonRelease to revert style after click
-
+        # --- Bind using the standard animated hover helper ---
+        # Assumes self._bind_animated_hover exists
+        self._bind_animated_hover(
+            button=button,
+            original_bg=original_bg,
+            original_fg=original_fg,
+            hover_target_fg=hover_fg,
+            # Set check_state=True if these sidebar buttons might be disabled,
+            # otherwise set to False. Let's assume they might be disabled for safety.
+            check_state=True
+        )
 
 
         
@@ -18184,11 +21132,18 @@ class ConfigViewerApp:
         if not hasattr(self, 'current_details_sidebar_spawn_cmd') or not self.current_details_sidebar_spawn_cmd:
             print("Warning: Configuration details not available for Add to Favorites action.")
             return
+        
+
 
         spawn_cmd = self.current_details_sidebar_spawn_cmd
         folder_name = self.current_details_folder
         config_name_base = self.extract_name_from_spawn_command(spawn_cmd)
         pc_filename = config_name_base + '.pc'
+
+        
+        self._count_unique_folders_in_favorites(called_to_retrieve_old_current_favorites_amount=True)
+
+        unique_favorite_folder_count_before_fav_update = self.current_favorites_amount
 
         if self.is_favorite(folder_name, pc_filename):
             self.remove_from_favorites(folder_name, pc_filename)
@@ -18259,8 +21214,69 @@ class ConfigViewerApp:
         self.lift_search_results_window()
 
         generate_data_subset_favorites(self.script_dir)
+
+        self._count_unique_folders_in_favorites(called_to_retrieve_old_current_favorites_amount=None)
+        unique_favorite_folder_count_after_fav_update = self.current_favorites_amount
+
+
+        if unique_favorite_folder_count_before_fav_update != unique_favorite_folder_count_after_fav_update:
+            self.format_grouped_data_and_update_grid_layout()
+            print(f"favorites folder amount CHANGED, defering format grouped and update grid funcs")
+
         print("--- on_details_sidebar_favorites_click() EXIT ---\n")
  
+
+    def format_grouped_data_and_update_grid_layout(self):
+        self.grouped_data = self.format_grouped_data(self.data) # Re-group and re-sort
+
+        print("self.window_size_changed_during_details_window = True this has been set to true so that the grid can relayout to show the removed or added fav")
+        self.window_size_changed_during_details_window = True # using this flag to force updating grid layout after details close
+
+        self.favorites_amount_changed = True # use for search results deferal
+
+
+
+
+    def _count_unique_folders_in_favorites(self, called_to_retrieve_old_current_favorites_amount=None):
+        """
+        Reads the favorites file and counts the number of unique folder names.
+
+        Returns:
+            int: The count of unique folder names found in favorites.txt.
+                 Returns 0 if the file doesn't exist or is empty.
+        """
+        unique_folders = set()
+        if not hasattr(self, 'favorites_file_path') or not self.favorites_file_path:
+            print("Warning: favorites_file_path attribute not set. Cannot count favorite folders.")
+            return 0
+
+        if os.path.exists(self.favorites_file_path):
+            try:
+                with open(self.favorites_file_path, 'r', encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line: # Ensure line is not empty
+                            parts = line.split('|', 1) # Split only on the first '|'
+                            if len(parts) > 0:
+                                folder_name = parts[0].strip()
+                                if folder_name: # Ensure folder_name is not empty
+                                    unique_folders.add(folder_name)
+                print(f"  DEBUG: _count_unique_folders_in_favorites - Found {len(unique_folders)} unique folders in {self.favorites_file_path}")
+                
+                if not called_to_retrieve_old_current_favorites_amount:
+
+                    self.current_favorites_amount = len(unique_folders)
+
+                return len(unique_folders)
+            
+            except Exception as e:
+                print(f"Error reading or parsing {self.favorites_file_path}: {e}")
+                return 0 # Return 0 on error
+        else:
+            print(f"Warning: Favorites file not found at {self.favorites_file_path}. Returning 0 unique folders.")
+            return 0
+
+
 
 
     def update_details_sidebar_favorites_button_text(self):
@@ -18484,7 +21500,13 @@ class ConfigViewerApp:
         # --- 5. Update favorites and write back to file ---
         if valid_favorites != favorites: # Only write if there were changes
             self.favorite_configs = valid_favorites
+
             self.write_favorites()
+            self.unique_favorite_folder_count = self._count_unique_folders_in_favorites() # Update the count
+            print(f"DEBUG: Updated unique_favorite_folder_count to: {self.unique_favorite_folder_count}")
+
+
+
             print("DEBUG: Favorites.txt updated, invalid entries removed.") # Debug print for update
         else:
             self.favorite_configs = valid_favorites # Ensure self.favorite_configs is updated even if no changes to write
@@ -18525,6 +21547,10 @@ class ConfigViewerApp:
             fav_key = f"{vehicle_folder}|{pc_filename}"
             self.favorite_configs.add(fav_key)
             self.write_favorites()
+
+            self.unique_favorite_folder_count = self._count_unique_folders_in_favorites() # Update the count
+            print(f"DEBUG: Updated unique_favorite_folder_count to: {self.unique_favorite_folder_count}")
+
         except Exception as e:
             print(f"Error in add_to_favorites: {e}")
             messagebox.showerror("Error", f"Error adding to favorites: {e}", parent=self.master)  # Show error messagebox
@@ -18547,6 +21573,11 @@ class ConfigViewerApp:
             if fav_key in self.favorite_configs:
                 self.favorite_configs.remove(fav_key)
                 self.write_favorites()
+
+                self.unique_favorite_folder_count = self._count_unique_folders_in_favorites() # Update the count
+                print(f"DEBUG: Updated unique_favorite_folder_count to: {self.unique_favorite_folder_count}")
+
+
         except Exception as e:
             print(f"Error in remove_from_favorites: {e}")
             messagebox.showerror("Error", f"Error removing from favorites: {e}", parent=self.master) # Show error messagebox
@@ -18742,8 +21773,8 @@ class ConfigViewerApp:
 
             # Initialize state variables
             self.current_details_batch_index = 0
-            self.current_details_batch_index_in_sequence = 0 # Assuming this is used elsewhere
-            self.total_details_items_placed = 0 # Assuming this is used elsewhere
+            self.current_details_batch_index_in_sequence = 0 # Assuming this is used elsewhere (likely no)
+            self.total_details_items_placed = 0 # Assuming this is used elsewhere (it is)
             print(f"DEBUG: _initial_details_layout - ENSURING state before load: batch_idx={self.current_details_batch_index}, seq_idx={self.current_details_batch_index_in_sequence}, total_placed={self.total_details_items_placed}")
 
             # Load initial batch if data exists
@@ -19307,129 +22338,134 @@ class ConfigViewerApp:
 
 
 
+
+
     def update_details_sidebar_individual_info(self, individual_info_path, main_info_data=None):
         """
-        Updates the details sidebar, prioritizing individual config data and using
-        main vehicle data ONLY if the specific key is MISSING from individual data.
-        Formatting is handled more directly/robustly.
-        MODIFIED: Prioritizes individual data more strictly.
-        MODIFIED: Integrated and refined formatting logic.
+        Updates the details sidebar, prioritizing individual config data.
+        MODIFIED: Implements a 3-layer fallback:
+                  1. Individual Info File
+                  2. Correct Main Info File (actively loaded)
+                  3. Passed main_info_data argument (from clicked item tuple)
+                  4. Default "N/A"
         """
-        print(f"\n--- update_details_sidebar_individual_info() ENTRY (Prioritize Individual Logic) ---")
+        print(f"\n--- update_details_sidebar_individual_info() ENTRY (3-Layer Fallback Logic) ---") # Updated Note
         print(f"  DEBUG: individual_info_path = {individual_info_path}")
-        print(f"  DEBUG: main_info_data available: {main_info_data is not None}")
+        print(f"  DEBUG: main_info_data passed initially: {main_info_data is not None}")
 
-        # 1. Load individual data (includes fallbacks if JSON load fails)
-        individual_data, _ = self._load_individual_info(individual_info_path)
+        # 1. Load individual data
+        individual_data, file_content_debug = self._load_individual_info(individual_info_path)
         print(f"  DEBUG: Data loaded from _load_individual_info: {individual_data}")
 
-        # --- More Robust Formatting Helper ---
+        # --- Helper to check if a value is considered valid (not None, "N/A", or empty) ---
+        def is_valid_value(value):
+            return value is not None and str(value).strip().upper() != "N/A" and str(value).strip() != ""
+
+        # --- Helper to get value with 3-layer fallback ---
+        def get_prioritized_value(key, default="N/A"):
+            print(f"  DEBUG get_prioritized (3-Layer): Getting key '{key}'...")
+
+            # Layer 1: Check Individual Data
+            individual_value = individual_data.get(key, None)
+            if is_valid_value(individual_value):
+                print(f"    DEBUG get_prioritized: Layer 1 HIT - Using value from individual_data: '{str(individual_value)[:100]}'")
+                return individual_value
+            else:
+                print(f"    DEBUG get_prioritized: Layer 1 MISS - Key '{key}' not found or invalid in individual_data ('{individual_value}').")
+
+            # Layer 2: Find and Load CORRECT Main Info File
+            correct_main_info_data = None
+            try:
+                folder = self.current_details_folder
+                base_zip_file = None
+                if folder in self.ZIP_BASE_NAMES:
+                    base_zip_file = f"{folder}.zip"
+                elif self.details_data:
+                    # Find the first non-custom zip associated with this folder in details_data
+                    # This assumes details_data reflects the current group accurately
+                    for item_tuple in self.details_data:
+                         if len(item_tuple) == 5 and item_tuple[4] == folder and item_tuple[2] not in ["user_custom_configs", "folder_grouped"]:
+                              base_zip_file = item_tuple[2]
+                              break # Use the first one found
+
+                if folder and base_zip_file:
+                    main_info_filename = f"vehicles--{folder}_{base_zip_file}--info.json"
+                    main_info_filepath = os.path.join(self.config_info_folder, main_info_filename)
+                    print(f"      DEBUG get_prioritized: Layer 2 - Attempting to load MAIN info from: {main_info_filepath}")
+                    if os.path.exists(main_info_filepath):
+                        correct_main_info_data = self.extract_fallback_info(main_info_filepath)
+                        print(f"      DEBUG get_prioritized: Layer 2 - Successfully loaded main info: Keys={list(correct_main_info_data.keys()) if correct_main_info_data else 'None'}")
+                    else:
+                        print(f"      WARN get_prioritized: Layer 2 - Main info file not found: {main_info_filepath}")
+                else:
+                    print(f"      WARN get_prioritized: Layer 2 - Could not determine folder/base_zip to find main info file.")
+            except Exception as e:
+                print(f"      ERROR get_prioritized: Layer 2 - Error during main info file lookup: {e}")
+
+            if correct_main_info_data:
+                correct_main_value = correct_main_info_data.get(key, None)
+                if is_valid_value(correct_main_value):
+                    print(f"    DEBUG get_prioritized: Layer 2 HIT - Using value from CORRECT main_info_data: '{str(correct_main_value)[:100]}'")
+                    return correct_main_value
+                else:
+                     print(f"    DEBUG get_prioritized: Layer 2 MISS - Key '{key}' not found or invalid in CORRECT main_info_data ('{correct_main_value}').")
+            else:
+                 print(f"    DEBUG get_prioritized: Layer 2 FAIL - Could not load correct main info.")
+
+            # Layer 3: Fallback to the PASSED main_info_data argument
+            print(f"    DEBUG get_prioritized: Layer 3 - Checking PASSED main_info_data argument...")
+            if main_info_data: # Check if the argument itself is not None
+                passed_main_value = main_info_data.get(key, None)
+                if is_valid_value(passed_main_value):
+                    print(f"    DEBUG get_prioritized: Layer 3 HIT - Using value from PASSED main_info_data: '{str(passed_main_value)[:100]}'")
+                    return passed_main_value
+                else:
+                    print(f"    DEBUG get_prioritized: Layer 3 MISS - Key '{key}' not found or invalid in PASSED main_info_data ('{passed_main_value}').")
+            else:
+                print(f"    DEBUG get_prioritized: Layer 3 SKIP - Passed main_info_data was None.")
+
+            # Layer 4: Final Default
+            print(f"    DEBUG get_prioritized: Layer 4 HIT - All fallbacks failed for key '{key}'. Returning default '{default}'.")
+            return default
+
+        # --- Robust Formatting Helper (Keep as is) ---
         def format_display_value(key, value, unit="", decimals=0, default="N/A"):
-            """Formats a value for display, handling None, N/A strings, and conversion errors."""
-            print(f"  DEBUG format_display_value: key='{key}', input_value='{value}' (type: {type(value)})")
-
-            # 1. Handle None, empty string, or explicit "N/A" string upfront
-            #    Treat empty string from get() as needing fallback/default.
-            if value is None or str(value).strip().upper() == "N/A":
-                 print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Input None or NA string)")
-                 return default
-
-            # Treat purely empty strings as invalid for numeric/unit formatting
-            if str(value).strip() == "":
-                print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Input was empty string)")
-                return default
-
-            # 2. Attempt numeric conversion and formatting for specific keys
+            # ... (previous format_display_value logic remains the same) ...
+            # print(f"  DEBUG format_display_value: key='{key}', input_value='{value}' (type: {type(value)})") # Optional Verbose
+            if value is None or str(value).strip().upper() == "N/A": return default
+            if str(value).strip() == "": return default
             if key in ["Value", "Weight", "Top Speed", "Torque", "Power", "0-100 km/h", "100-0 km/h"]:
                 try:
                     num_value = float(value)
-
-                    if key == "Top Speed":
-                        # Special handling for Top Speed (m/s to km/h)
-                        # Allow 0 display
-                        num_value_kmh = round(num_value * 3.6, 0)
-                        result = f"{int(num_value_kmh)}{unit}" # unit is ' km/h'
-                    elif key in ["Value", "Weight", "Torque", "Power"]: # Integer fields
-                         # Allow 0 display
-                         result = f"{int(round(num_value, 0))}{unit}"
-                    elif key in ["0-100 km/h", "100-0 km/h"]: # Float fields with decimals
-                         # Allow 0.0 display
-                         format_string = "{:." + str(decimals) + "f}"
-                         result = f"{format_string.format(num_value)}{unit}"
-                    else: # Should not happen based on keys checked above
-                         result = str(num_value) # Fallback conversion
-
-                    print(f"  DEBUG format_display_value: key='{key}', Returning formatted numeric '{result}'")
+                    if key == "Top Speed": num_value_kmh = round(num_value * 3.6, 0); result = f"{int(num_value_kmh)}{unit}"
+                    elif key in ["Value", "Weight", "Torque", "Power"]: result = f"{int(round(num_value, 0))}{unit}"
+                    elif key in ["0-100 km/h", "100-0 km/h"]: format_string = "{:." + str(decimals) + "f}"; result = f"{format_string.format(num_value)}{unit}"
+                    else: result = str(num_value)
                     return result
-
                 except (ValueError, TypeError):
-                    # 3. Handle non-numeric strings that aren't "N/A" (caught above)
-                    print(f"  DEBUG format_display_value: key='{key}', ValueError/TypeError converting '{value}'")
-                    if isinstance(value, str):
-                        # Return the original string if it wasn't convertible (e.g., "Prototype", "Electric")
-                        print(f"  DEBUG format_display_value: key='{key}', Returning original string '{value}'")
-                        return value
-                    else:
-                        # It was some other non-convertible type? Return default.
-                        print(f"  DEBUG format_display_value: key='{key}', Returning default '{default}' (Conversion error, not string)")
-                        return default
-            else:
-                # 4. For non-numeric keys (like Brand, Description), just return the string value
-                print(f"  DEBUG format_display_value: key='{key}', Returning string value '{str(value)}' for non-numeric key.")
-                return str(value) # Ensure it's a string
+                    if isinstance(value, str): return value
+                    else: return default
+            else: return str(value)
 
-        # --- Helper to get value: Prioritize individual, fallback to main ONLY IF KEY MISSING in individual ---
-        def get_prioritized_value(key, default="N/A"):
-            value = individual_data.get(key, None) # Use None as sentinel for missing key
-
-            if value is not None: # Key exists in individual_data
-                print(f"  DEBUG get_prioritized: Key '{key}' -> Found in individual_data: '{value}'")
-                # Let format_display_value handle if it's "", "N/A", or valid data
-                return value
-            else: # Key was NOT FOUND in individual_data
-                print(f"  DEBUG get_prioritized: Key '{key}' -> Not found in individual_data. Checking main_info_data.")
-                if main_info_data:
-                    main_value = main_info_data.get(key, None) # Check main, use None as sentinel
-                    if main_value is not None:
-                        print(f"  DEBUG get_prioritized: Key '{key}' -> Found in main_info_data: '{main_value}'")
-                        # Let format_display_value handle if it's "", "N/A", or valid data
-                        return main_value
-                    else:
-                        # Key not in main either
-                        print(f"  DEBUG get_prioritized: Key '{key}' -> Not found in main_info_data. Using default '{default}'.")
-                        return default # Return the formatting function's default sentinel
-                else:
-                    # No main_info_data
-                    print(f"  DEBUG get_prioritized: Key '{key}' -> No main_info_data. Using default '{default}'.")
-                    return default # Return the formatting function's default sentinel
-
-
-        # 2. Update Labels using the new getter and the robust formatter
-        self._set_configuration_label(individual_data) # Still uses individual_data primarily for config name
-
-        # Update the text using the prioritized getter and robust formatter
-        # Note: Pass the UNFORMATTED value from get_prioritized_value to format_display_value
+        # 2. Update Labels using the new 3-layer getter and formatter
+        self._set_configuration_label(individual_data)
         self.details_sidebar_description_label_val.config(text=format_display_value("Description", get_prioritized_value("Description")))
         self.details_sidebar_value_label_val.config(text=format_display_value("Value", get_prioritized_value("Value"), " ", 0))
         self.details_sidebar_brand_label_val.config(text=format_display_value("Brand", get_prioritized_value("Brand")))
         self.details_sidebar_bodystyle_label_val.config(text=format_display_value("Body Style", get_prioritized_value("Body Style")))
         self.details_sidebar_weight_label_val.config(text=format_display_value("Weight", get_prioritized_value("Weight"), " kg", 0))
-        # Years needs its own logic - assuming self.extract_years_string_from_data handles N/A etc.
-        years_value = get_prioritized_value("Years", None) # Get raw years data
-        self.details_sidebar_years_label_val.config(text=self.extract_years_string_from_data(years_value)) # Process it
+        years_value = get_prioritized_value("Years", None)
+        self.details_sidebar_years_label_val.config(text=self.extract_years_string_from_data(years_value))
         self.details_sidebar_zipfile_label_val.config(text=os.path.basename(str(self.current_details_sidebar_zip_file or "N/A")))
-
-        # --- Update NEW performance labels ---
         self.details_sidebar_topspeed_label_val.config(text=format_display_value("Top Speed", get_prioritized_value("Top Speed"), " km/h", 0))
         self.details_sidebar_torque_label_val.config(text=format_display_value("Torque", get_prioritized_value("Torque"), " Nm", 0))
         self.details_sidebar_power_label_val.config(text=format_display_value("Power", get_prioritized_value("Power"), " hp", 0))
         self.details_sidebar_0_100_label_val.config(text=format_display_value("0-100 km/h", get_prioritized_value("0-100 km/h"), " s", 1))
         self.details_sidebar_100_0_label_val.config(text=format_display_value("100-0 km/h", get_prioritized_value("100-0 km/h"), " m", 1))
         self.details_sidebar_fuel_type_label_val.config(text=format_display_value("Fuel Type", get_prioritized_value("Fuel Type")))
-        # --- End Update NEW ---
 
-
-        # 3. Pack the labels (This packing logic remains largely the same, as it checks the FINAL text)
+        # 3. Pack the labels (logic remains the same)
+        # ... (pack_pair logic remains the same) ...
         all_sidebar_labels = [
             self.details_sidebar_selected_config_label_cat, self.details_sidebar_selected_config_label_val,
             self.details_sidebar_config_name_label,
@@ -19440,7 +22476,6 @@ class ConfigViewerApp:
             self.details_sidebar_bodystyle_label_cat, self.details_sidebar_bodystyle_label_val,
             self.details_sidebar_weight_label_cat, self.details_sidebar_weight_label_val,
             self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val,
-            # --- NEW Performance Labels ---
             self.details_sidebar_topspeed_label_cat, self.details_sidebar_topspeed_label_val,
             self.details_sidebar_torque_label_cat, self.details_sidebar_torque_label_val,
             self.details_sidebar_power_label_cat, self.details_sidebar_power_label_val,
@@ -19449,87 +22484,58 @@ class ConfigViewerApp:
             self.details_sidebar_fuel_type_label_cat, self.details_sidebar_fuel_type_label_val,
         ]
         for widget in all_sidebar_labels:
-            if widget and widget.winfo_exists():
-                widget.pack_forget()
+            if widget and widget.winfo_exists(): widget.pack_forget()
 
-        # --- Pack in the CORRECT VISUAL ORDER ---
-        pack_padding_top = 5
-        pack_padding_bottom = 0
-        pack_padx = 10
-
+        pack_padding_top = 5; pack_padding_bottom = 0; pack_padx = 10
         def pack_pair(cat_widget, val_widget):
-            # Check the FINAL text assigned to the value widget
             value_text = val_widget.cget("text") if val_widget and val_widget.winfo_exists() else "N/A"
             should_pack = True
-            # Define formatted default/NA values to check against
-            # These should match the outputs of format_display_value when data is 0 or default "N/A"
-            na_values = ["N/A", "0 Nm", "0 hp", "0.0 s", "0.0 m", "0 kg", "0 ", "0 km/h"] # Added 0 km/h
-
-            # Special check for Configuration display
+            na_values = ["N/A", "0 Nm", "0 hp", "0.0 s", "0.0 m", "0 kg", "0 ", "0 km/h"]
             if val_widget == self.details_sidebar_selected_config_label_val and value_text == "Custom/Unspecified":
-                 should_pack = True # Always show the configuration name label
+                 should_pack = True
             elif value_text in na_values:
-                 print(f"  DEBUG pack_pair: Hiding widgets for '{cat_widget.cget('text') if cat_widget else 'Unknown'}' because value_text '{value_text}' is in na_values.")
                  should_pack = False
-            # Handle potential non-string values from Years extraction if it doesn't return "N/A" properly
             elif val_widget == self.details_sidebar_years_label_val and (value_text is None or value_text.strip() == ""):
-                 print(f"  DEBUG pack_pair: Hiding Years widgets because value_text is None or empty.")
                  should_pack = False
-
-
             if should_pack:
-                 print(f"  DEBUG pack_pair: Packing widgets for '{cat_widget.cget('text') if cat_widget else 'Unknown'}'. Value: '{value_text}'")
-                 if cat_widget and cat_widget.winfo_exists():
-                     cat_widget.pack(fill="x", padx=pack_padx, pady=(pack_padding_top, 0))
-                 if val_widget and val_widget.winfo_exists():
-                     val_widget.pack(fill="x", padx=pack_padx, pady=(0, pack_padding_bottom))
+                 if cat_widget and cat_widget.winfo_exists(): cat_widget.pack(fill="x", padx=pack_padx, pady=(pack_padding_top, 0))
+                 if val_widget and val_widget.winfo_exists(): val_widget.pack(fill="x", padx=pack_padx, pady=(0, pack_padding_bottom))
             else:
-                # Explicitly forget widgets if value is effectively N/A or invalid
                 if cat_widget and cat_widget.winfo_exists(): cat_widget.pack_forget()
                 if val_widget and val_widget.winfo_exists(): val_widget.pack_forget()
 
-        # Pack the top config info
         pack_pair(self.details_sidebar_selected_config_label_cat, self.details_sidebar_selected_config_label_val)
-        # Config name label might need separate handling if it's always shown
         if self.details_sidebar_config_name_label and self.details_sidebar_config_name_label.winfo_exists():
              config_name_text = self.details_sidebar_config_name_label.cget("text")
-             if config_name_text and config_name_text != "N/A": # Example check
+             if config_name_text and config_name_text != "N/A":
                  self.details_sidebar_config_name_label.pack(fill="x", padx=pack_padx, pady=(0, 5))
-             else:
-                 self.details_sidebar_config_name_label.pack_forget()
-
-
-        # Pack the information labels using the pair logic
+             else: self.details_sidebar_config_name_label.pack_forget()
         pack_pair(self.details_sidebar_description_label_cat, self.details_sidebar_description_label_val)
         pack_pair(self.details_sidebar_zipfile_label_cat, self.details_sidebar_zipfile_label_val)
         pack_pair(self.details_sidebar_value_label_cat, self.details_sidebar_value_label_val)
         pack_pair(self.details_sidebar_brand_label_cat, self.details_sidebar_brand_label_val)
         pack_pair(self.details_sidebar_bodystyle_label_cat, self.details_sidebar_bodystyle_label_val)
         pack_pair(self.details_sidebar_weight_label_cat, self.details_sidebar_weight_label_val)
-        pack_pair(self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val) # Assumes extract_years handles N/A display
-
-        # --- Pack the NEW performance labels ---
+        pack_pair(self.details_sidebar_years_label_cat, self.details_sidebar_years_label_val)
         pack_pair(self.details_sidebar_topspeed_label_cat, self.details_sidebar_topspeed_label_val)
         pack_pair(self.details_sidebar_torque_label_cat, self.details_sidebar_torque_label_val)
         pack_pair(self.details_sidebar_power_label_cat, self.details_sidebar_power_label_val)
         pack_pair(self.details_sidebar_0_100_label_cat, self.details_sidebar_0_100_label_val)
         pack_pair(self.details_sidebar_100_0_label_cat, self.details_sidebar_100_0_label_val)
-        # Special packing for Fuel Type at the end? Or use pack_pair? Using pack_pair for consistency.
         pack_pair(self.details_sidebar_fuel_type_label_cat, self.details_sidebar_fuel_type_label_val)
-        # If extra bottom padding needed for last item (Fuel Type):
-        if self.details_sidebar_fuel_type_label_val.winfo_ismapped(): # Check if it was packed
+        if self.details_sidebar_fuel_type_label_val.winfo_ismapped():
              self.details_sidebar_fuel_type_label_val.pack_configure(pady=(0, 10))
 
 
-        # 4. --- Update scrollregion and reset scroll position ---
+        # 4. Update scrollregion and reset scroll position
         self.details_sidebar_text_scrollable_frame.update_idletasks()
         self.details_sidebar_text_canvas.configure(scrollregion=self.details_sidebar_text_canvas.bbox("all"))
         self.details_sidebar_text_canvas.yview_moveto(0)
         self.custom_sidebar_text_scrollbar_set(0,1) # Update scrollbar appearance
 
-        self._ensure_correct_zip_label()
+        self._ensure_correct_zip_label() # Correct zip label if needed
         print("  DEBUG: Details sidebar text scroll position reset to top.")
-        print("--- update_details_sidebar_individual_info() EXIT ---\n")
+        print("--- update_details_sidebar_individual_info() EXIT (3-Layer Fallback Logic) ---\n")
 
 
     def _ensure_correct_zip_label(self):
@@ -19787,20 +22793,23 @@ class ConfigViewerApp:
         print(f"  DEBUG: handle_zip_search_button_click - is_data_subset_active: {self.is_data_subset_active}") # Debug - Check flag
         print(f"  DEBUG: handle_zip_search_button_click - details_window_should_open_in_favorites_mode: {self.details_window_should_open_in_favorites_mode}") # Debug - Check flag
 
+
+
         if self.is_data_subset_active:
             print("  DEBUG: handle_zip_search_button_click - Data subset active - Showing messagebox.") # Debug - Condition True
-            #messagebox.showinfo(
-            #    "Zip Search Unavailable",
-            #    "Please re-open vehicle in an unfiltered mode off to search by zip.",
-            #    parent=self.details_window
-            #)
-            scanning_win = None  # Initialize scanning_win
-
+ 
             scanning_win = self.show_scanning_window(text="Cannot search by zip while configurations window is filtered.")
-            time.sleep(3.125)
+            self.lift_search_results_window()
             if scanning_win:
-                scanning_win.destroy()
-            
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+
+
+
             print("--- handle_zip_search_button_click() EXIT - Data subset active ---\n") # Debug Exit
             return
         if self.details_window_should_open_in_favorites_mode or self.zip_search_button.cget("text") == "Search within: Favorites": # <--- MODIFIED CHECK HERE
@@ -19841,7 +22850,7 @@ class ConfigViewerApp:
         button_x = button.winfo_rootx()
         button_y = button.winfo_rooty() + button.winfo_height()
 
-        self.zip_search_dropdown_window = dropdown_window = tk.Toplevel(self.details_window)
+        self.zip_search_dropdown_window = dropdown_window = FadingToplevel(self.details_window, self)
         dropdown_window.overrideredirect(True)
         dropdown_window.tk.call('tk', 'scaling', 1.25)
 
@@ -19899,46 +22908,90 @@ class ConfigViewerApp:
 
 
         for option in menu_options:
-            bg_color = "#555555"
-            fg_color = "white"
-            if f"Search within: {option}" == current_zip_filter_text: # Check if current option is selected
-                bg_color = self.global_highlight_color # Highlight selected zip in orange
-                fg_color = "white"
+            # --- Define Colors for menu option items ---
+            option_default_bg = "#555555"
+            option_default_fg = "#FFFFFF"
+            option_selected_bg = self.global_highlight_color
+            option_selected_fg = "#FFFFFF"
+            option_hover_bg = "#d9d9d9"
+            option_hover_fg = "black"
 
+            is_selected = (f"Search within: {option}" == current_zip_filter_text)
 
             dropdown_button = tk.Button(
-                scrollable_frame, # <--- Place buttons in scrollable_frame
+                scrollable_frame,
                 text=option,
-                font=("Segoe UI", 10+self.font_size_add, "bold"),
+                font=("Segoe UI", 10 + self.font_size_add, "bold"),
                 command=lambda opt=option: on_menu_option_click(opt),
                 borderwidth=1,
                 relief="solid",
                 anchor="w",
                 padx=10,
-                pady=5,
-                bg=bg_color, # Use dynamic background color
-                fg=fg_color  # Use dynamic foreground color
-                
+                pady=5
+                # bg and fg set by _bind_animated_hover
+            )
+            dropdown_button.config(
+                activebackground=option_hover_bg, # For click flash
+                activeforeground=option_hover_fg
             )
             dropdown_button.pack(fill="x")
-            dropdown_button.bind("<Enter>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg="lightgrey", fg="black"))
-            dropdown_button.bind("<Leave>", lambda event, btn=dropdown_button, original_bg=bg_color, original_fg=fg_color: btn.config(bg=original_bg, fg=original_fg))
+
+            self._bind_animated_hover(
+                button=dropdown_button,
+                original_bg=option_default_bg,
+                original_fg=option_default_fg,
+                hover_target_bg=option_hover_bg,
+                hover_target_fg=option_hover_fg,
+                check_state=False,
+                is_selected_initial=is_selected,
+                selected_bg=option_selected_bg,
+                selected_fg=option_selected_fg
+            )
+            # REMOVED old binds
 
         # --- NEW: Close Button (below scrollable frame, in main frame) ---
+
+        # --- Define Colors for the Close button ---
+        close_button_original_bg = "#666666"
+        close_button_original_fg = "#FFFFFF"
+        # Let's make the close button hover to the global highlight color for emphasis,
+        # or you can define a custom hover like "#777777" if preferred.
+        close_button_hover_bg = self.global_highlight_color # Or e.g., "#777777"
+        close_button_hover_fg = "#FFFFFF" # Assuming white text on highlight
+
         close_button = tk.Button(
             dropdown_main_frame, # Place in dropdown_main_frame
             text="Close",
-            font=("Segoe UI", 10+self.font_size_add, "bold"),
-            command=self.destroy_zip_search_dropdown_menu,
-            bg="#666666",
-            fg="white",
+            font=("Segoe UI", 10 + self.font_size_add, "bold"),
+            command=self.destroy_zip_search_dropdown_menu, # Ensure this method exists
+            # bg and fg will be set by _bind_animated_hover initially
             borderwidth=1,
             relief="solid",
             padx=10,
             pady=5
         )
+        # Set active colors for click flash (optional, can match hover or be different)
+        close_button.config(
+            activebackground=close_button_hover_bg, # Example: match hover for click
+            activeforeground=close_button_hover_fg
+        )
         close_button.pack(side="bottom", fill="x") # Pack to bottom of main frame
-        # --- NEW: Close Button (below scrollable frame, in main frame) ---
+
+        # --- Apply Smooth Hover Animation to the Close Button ---
+        self._bind_animated_hover(
+            button=close_button,
+            original_bg=close_button_original_bg,
+            original_fg=close_button_original_fg,
+            hover_target_bg=close_button_hover_bg,   # Use the defined hover BG for close button
+            hover_target_fg=close_button_hover_fg,   # Use the defined hover FG for close button
+            check_state=False,                       # Assuming close button is always enabled
+            # No selected state for the close button
+            is_selected_initial=False,
+            selected_bg=None,
+            selected_fg=None,
+            on_enter_extra_command=None, # No tooltips
+            on_leave_extra_command=None
+        )
 
 
         self.zip_search_dropdown_window.bind("<FocusOut>", lambda event: self.destroy_zip_search_dropdown_menu())
@@ -20106,49 +23159,7 @@ class ConfigViewerApp:
 
      
             
-    #this is unused now
-    '''
-    def load_all_info_data_on_startup(self):
-        """Loads all info data into cache on startup."""
-        print("\n--- ConfigViewerApp.load_all_info_data_on_startup() ENTRY ---") # Debug Entry
 
-
-        
-        print("DEBUG: load_all_info_data_on_startup - Calling self.load_data() to populate caches...") # Debug
-        self.original_data, self.original_full_data = self.load_data() # Load and populate caches
-        print("DEBUG: load_all_info_data_on_startup - self.load_data() RETURNED - Caches Populated.") # Debug
-
-        print("DEBUG: load_all_info_data_on_startup - Pre-loading individual info files into cache...") # Debug - Pre-loading Start
-        for item_data in self.original_data: # Iterate through loaded data
-            _, _, zip_file, _, folder_name = item_data # Unpack data tuple
-            if folder_name in self.original_full_data: # Check if folder name exists in full data
-                for config_item in self.original_full_data[folder_name]: # Iterate through configs in folder
-                    _, spawn_cmd, _, _, _ = config_item # Unpack config item
-                    config_name = self.extract_name_from_spawn_command(spawn_cmd) # Extract config name
-                    zip_file_base_name = os.path.splitext(zip_file)[0].replace(folder_name+"_","").replace(folder_name,"") # Extract zip base name
-                    individual_info_path = self.find_individual_info_file(folder_name, zip_file_base_name, config_name) # Find info file path
-                    if individual_info_path:
-                        if individual_info_path not in self.individual_info_cache: # Check if already cached
-                            info_content, _ = self._load_individual_info(individual_info_path) # Load info content
-                            if info_content:
-                                self.individual_info_cache[individual_info_path] = info_content # Cache info data
-                                #print(f"  DEBUG: Cached individual info file: {individual_info_path}") # Debug - Cache Success
-                            else:
-                                print(f"  Warning: Failed to load individual info file (caching skipped): {individual_info_path}") # Debug - Load Fail
-                        #else:
-                        #    print(f"  DEBUG: Individual info file already in cache: {individual_info_path}") # Debug - Already Cached
-        print("DEBUG: load_all_info_data_on_startup - Individual info files pre-loading COMPLETE.") # Debug - Pre-loading Complete
-
-        print("--- ConfigViewerApp.load_all_info_data_on_startup() EXIT ---\n") # Debug Exit
-        
-        if self.scanning_win:
-            self.scanning_win.destroy()
-
- 
-        self.scanning_win = None
-
-        self.scanning_win = self.show_scanning_window(text="Initializing Data...")
-        '''
 
 
     #@profile 
@@ -20548,7 +23559,7 @@ class ConfigViewerApp:
 
         except Exception as e:
             print(f"Error in update_subgrid_layout_on_resize: {e}")
-            import traceback
+
             traceback.print_exc() # Print full traceback for errors here
         finally:
             print(f"DEBUG: update_subgrid_layout_on_resize - EXIT - current_details_batch_index: {getattr(self, 'current_details_batch_index', 'ATTRIBUTE_MISSING')}")
@@ -20581,6 +23592,9 @@ class ConfigViewerApp:
 
         print(f"--- update_grid_layout CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
 
+        ConfigViewerApp.item_number = 0
+
+        self.update_grid_layout_run = True
 
         print(f"--- update_grid_layout called by stack: ---")
         # Limit the depth if it gets too long, e.g., inspect.stack(0, 10) for 10 levels
@@ -20598,19 +23612,19 @@ class ConfigViewerApp:
             return
 
         print("DEBUG: update_grid_layout - self.pause_loading = False")
-              
+            
         self.pause_loading = False
-
-
 
         self._update_filters_label_status()
 
-
-
         if self.is_search_results_window_active:
-            print("DEBUG: update_grid_layout - Search Results window is active. SKIPPING main grid layout update.")
+            print("DEBUG: update_grid_layout - Search Results window is active. and fav amount is the same - SKIPPING main grid layout update.")
+
             return
         
+        if self.favorites_amount_changed == True:
+            print("resetting favorites_amount_changed to FALSE, we entered update grid layout with it set to True")
+            self.favorites_amount_changed = False
 
         try:
             # Show loading label and start pulsating animation
@@ -20642,7 +23656,7 @@ class ConfigViewerApp:
             fixed_padding_x = self.column_padding
             single_column_pixel_width = image_width + fixed_padding_x
 
-            category_order = ["car", "truck", "bus", "trailer", "aircraft", "prop"]
+            category_order = ["favorites", "car", "truck", "bus", "trailer", "aircraft", "prop"]
 
             ordered_categories = sorted(
                 self.grouped_data.keys(),
@@ -20653,62 +23667,63 @@ class ConfigViewerApp:
             )
 
             # Determine if label should be omitted based on item count
-            self.omit_label = len(self.data) >= 1100 # Set flag based on total item count
+            self.omit_label = len(self.data) >= 1100 # Set flag based on total item count, set to impossibly high number, we're paginating the main grid
 
             self.category_batches = []
             for category in ordered_categories:
                 category_hidden = self.category_hidden_states.get(category, False)
 
-                if self.categorization_mode == 'None' and category == "All Items":
-                    header_frame = None
-                    category_subframe = tk.Frame(self.scrollable_frame, bg="#444444")
+                # if self.categorization_mode == 'None' and category == "All Items":
+                #     header_frame = None
+                #     category_subframe = tk.Frame(self.scrollable_frame, bg="#444444")
+                #     category_subframe.pack(fill="x")
+                # else:
+
+                header_frame = tk.Frame(self.scrollable_frame, bg="#444444", cursor="hand2")
+                header_frame.pack(fill=tk.X, pady=(5, 0))
+
+                search_query = self.search_var.get().strip().lower()
+                matching_item_count = 0
+                for item in self.grouped_data[category]:
+                    if self._perform_item_search(search_query, item):
+                        matching_item_count += 1
+
+                header_text = category
+                if category_hidden:
+                    header_text += " (Hidden)"
+
+                header_text_with_count = f"{header_text} ({matching_item_count})"
+                header_label = tk.Label(
+                    header_frame,
+                    text=header_text_with_count,
+                    font=("Segoe UI", 14+self.font_size_add, "bold"),
+                    bg="#444444",
+                    fg="#d9d9d9",
+                    anchor="w",
+                    cursor="hand2"
+                )
+                header_label.pack(side=tk.LEFT, padx=10, pady=(10, 0))
+                header_label.bind("<Button-1>", lambda event, cat=category: self.toggle_category_visibility(cat))
+
+                separator = tk.Frame(
+                    header_frame,
+                    height=4,
+                    bd=1,
+                    relief="sunken",
+                    bg="#d9d9d9",
+                    cursor="hand2"
+                )
+                separator.pack(side=tk.BOTTOM, fill="x", padx=10, pady=(0, 10))
+
+                header_frame.bind("<Enter>", lambda event, cat=category, header=header_label, sep=separator, count=matching_item_count: self.on_category_hover_enter(event, cat, header, sep, count))
+                header_frame.bind("<Leave>", lambda event, cat=category, header=header_label, sep=separator, count=matching_item_count: self.on_category_hover_leave(event, cat, header, sep, count))
+                header_frame.bind("<Button-1>", lambda event, cat=category: self.toggle_category_visibility(cat))
+
+                category_subframe = tk.Frame(self.scrollable_frame, bg="#444444")
+                if not category_hidden:
                     category_subframe.pack(fill="x")
                 else:
-                    header_frame = tk.Frame(self.scrollable_frame, bg="#444444", cursor="hand2")
-                    header_frame.pack(fill=tk.X, pady=(5, 0))
-
-                    search_query = self.search_var.get().strip().lower()
-                    matching_item_count = 0
-                    for item in self.grouped_data[category]:
-                        if self._perform_item_search(search_query, item):
-                            matching_item_count += 1
-
-                    header_text = category
-                    if category_hidden:
-                        header_text += " (Hidden)"
-
-                    header_text_with_count = f"{header_text} ({matching_item_count})"
-                    header_label = tk.Label(
-                        header_frame,
-                        text=header_text_with_count,
-                        font=("Segoe UI", 14+self.font_size_add, "bold"),
-                        bg="#444444",
-                        fg="lightgrey",
-                        anchor="w",
-                        cursor="hand2"
-                    )
-                    header_label.pack(side=tk.LEFT, padx=10, pady=(10, 0))
-                    header_label.bind("<Button-1>", lambda event, cat=category: self.toggle_category_visibility(cat))
-
-                    separator = tk.Frame(
-                        header_frame,
-                        height=4,
-                        bd=1,
-                        relief="sunken",
-                        bg="lightgrey",
-                        cursor="hand2"
-                    )
-                    separator.pack(side=tk.BOTTOM, fill="x", padx=10, pady=(0, 10))
-
-                    header_frame.bind("<Enter>", lambda event, cat=category, header=header_label, sep=separator, count=matching_item_count: self.on_category_hover_enter(event, cat, header, sep, count))
-                    header_frame.bind("<Leave>", lambda event, cat=category, header=header_label, sep=separator, count=matching_item_count: self.on_category_hover_leave(event, cat, header, sep, count))
-                    header_frame.bind("<Button-1>", lambda event, cat=category: self.toggle_category_visibility(cat))
-
-                    category_subframe = tk.Frame(self.scrollable_frame, bg="#444444")
-                    if not category_hidden:
-                        category_subframe.pack(fill="x")
-                    else:
-                        category_subframe.pack_forget()
+                    category_subframe.pack_forget()
 
                 self.image_counts[category] = 0
 
@@ -20722,7 +23737,13 @@ class ConfigViewerApp:
                         elif len(item) == 5:
                             all_items.append(item)
 
-                    batch_size = 10
+
+                    batch_size = 50 # THIS NUMBER CANNOT BE BIGGER THAN 
+                                    # ANYTHING IN self.main_grid_batch_sizes
+                                    # AND IT ALSO CAN'T BE BIGGER THAN 
+                                    # batch_size_to_load under 
+                                    # self.all_main_grid_images_cached
+
                     batches = [all_items[i:i + batch_size] for i in range(0, len(all_items), batch_size)]
                     self.category_batches.append((category, batches, category_subframe))
 
@@ -20732,10 +23753,6 @@ class ConfigViewerApp:
             self.load_next_batch()
 
 
-
-
-
-
         except Exception as e:
             print(f"Error in update_grid_layout: {e}")
 
@@ -20743,7 +23760,11 @@ class ConfigViewerApp:
         if scanning_win:
             scanning_win.destroy()
             
+
+
+
         print("DEBUG: update_grid_layout - EXIT")
+
             
 
     def toggle_category_visibility(self, category):
@@ -20770,26 +23791,45 @@ class ConfigViewerApp:
         print("    toggle_category_visibility is calling self.update_grid_layout()")
         self.update_grid_layout() # Re-layout the grid to reflect changes
 
-    def on_category_hover_enter(self, event, category, header_label, separator, count): # <--- ADDED count parameter
-        """Handles mouse hover enter event for category headers."""
-        separator.config(bg=self.global_highlight_color)
-        header_label.config(fg=self.global_highlight_color)
+
+    def on_category_hover_enter(self, event, category, header_label, separator, count):
+        """Handles mouse hover enter event for category headers with animation."""
+        # --- Instant Text Change ---
         if self.category_hidden_states.get(category, False):
-            header_label.config(text=f"{category} (Show) ({count})") 
+            header_label.config(text=f"{category} (Show) ({count})")
         else:
-            header_label.config(text=f"{category} (Hide) ({count})") 
+            header_label.config(text=f"{category} (Hide) ({count})")
+
+        # --- Start Animation ---
+        group_key = ("category_header", category) # Unique key for this category header + separator
+        property_config_list_target = [
+            {'widget': separator, 'property': 'bg', 'target_color': self.global_highlight_color},
+            {'widget': header_label, 'property': 'fg', 'target_color': self.global_highlight_color}
+        ]
+        self._start_generic_animation(group_key, property_config_list_target)
+
 
     def on_category_hover_leave(self, event, category, header_label, separator, count):
-        """Handles mouse hover leave event for category headers."""
-        separator.config(bg="lightgrey")
-        header_label.config(fg="lightgrey")
+        """Handles mouse hover leave event for category headers with animation."""
+        original_color = "#d9d9d9" # Assuming this is the original hex color
+
+        # --- Instant Text Change ---
         if self.category_hidden_states.get(category, False):
-            header_label.config(text=f"{category} (Hidden) ({count})") 
+            header_label.config(text=f"{category} (Hidden) ({count})")
         else:
             header_text = category
-            if self.category_hidden_states.get(category, False):
-                header_text += " (Hidden)"
-            header_label.config(text=f"{header_text} ({count})") 
+            # This inner check for (Hidden) seems redundant if the outer one already handles it
+            # if self.category_hidden_states.get(category, False):
+            #     header_text += " (Hidden)"
+            header_label.config(text=f"{header_text} ({count})")
+
+        # --- Start Animation Back ---
+        group_key = ("category_header", category)
+        property_config_list_target = [
+            {'widget': separator, 'property': 'bg', 'target_color': original_color},
+            {'widget': header_label, 'property': 'fg', 'target_color': original_color}
+        ]
+        self._start_generic_animation(group_key, property_config_list_target)
     
 
     # ------------------------------------------------------------
@@ -20830,7 +23870,7 @@ class ConfigViewerApp:
                     for idx, item in enumerate(subgrid_data):
                         row = idx // num_columns
                         col = idx % num_columns
-                        container = tk.Frame(scrollable_frame_sub, bg="white")
+                        container = tk.Frame(scrollable_frame_sub, bg="#FFFFFF")
                         container.grid(row=row, column=col, padx=self.details_column_padding, pady=5, sticky="nw") # Dynamic padding here
                         self.executor.submit(
                             self.load_image_item_details,
@@ -20886,11 +23926,11 @@ class ConfigViewerApp:
             return # Skip widget creation if limit is reached
 
         # --- Image Label (similar to details view) ---
-        lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="white") # MODIFIED HERE
+        lbl_img = tk.Label(parent_frame, image=photo, cursor="hand2", bg="#FFFFFF") # MODIFIED HERE
         lbl_img.image = photo
         lbl_img.pack(padx=0, pady=0)
         # --- NEW: Store default image background color ---
-        lbl_img.default_bg_color = "white" # Store the default bg color for image label - background for images - border
+        lbl_img.default_bg_color = "#FFFFFF" # Store the default bg color for image label - background for images - border
         # --- NEW: Store default image background color ---
 
         # --- Tooltip for image label ---
@@ -20917,9 +23957,9 @@ class ConfigViewerApp:
 
 
         # --- MODIFIED: Set label color based on picture_path ---
-        label_color = "white" # Default color
+        label_color = "#FFFFFF" # Default color
         if "_user--" in picture_path:
-            label_color = "lightblue" #lightblue  for custom configs
+            label_color = "#ADD8E6" #lightblue  for custom configs
         else: # Add the new elif here within the else block to maintain priority
             found_double_basename = False
             for base_name in self.ZIP_BASE_NAMES:
@@ -20949,60 +23989,124 @@ class ConfigViewerApp:
         # --- NEW: Store default text color as attribute ---
 
 
-        # --- Hover effect (unchanged) ---
-        original_color = label_color # Use dynamic color as original  (Renamed back)
-        hover_color = self.global_highlight_color # Renamed back
-        hover_bg_color = self.global_highlight_color # Background color for image hover
-        original_bg_color_img = "white" # Original bg color for image label - DARKER GRAY
-
         if not self.middle_click_settings:
             tooltip_text = "> Double click: Add to Spawn Queue.\n> Middle Click: Immediately spawn.\n> Right click: Manage mod, view \n   details and customize config color."
 
         if self.middle_click_settings:
             tooltip_text = "> Middle click: Add to Spawn Queue.\n> Double Click: Immediately spawn.\n> Right click: Manage mod, view \n   details and customize config color."
         
+
         
+        HOVER_FG_COLOR = self.global_highlight_color # For lbl_name text
+        HOVER_BG_COLOR_IMG = self.global_highlight_color # For lbl_img background
+
+        # The search highlight color - if you want it to be different from global_highlight_color
+        SEARCH_HIGHLIGHT_COLOR_FG = "#FFFF00" # Yellow for text when search matches
+        SEARCH_HIGHLIGHT_COLOR_BG = "#FFFF00" # Yellow for image bg when search matches
+                                             # Or use self.global_highlight_color if you want orange
+
+        # Ensure original colors are stored for animation system fallback if needed,
+        # especially if widgets might be created with color names initially.
+        # This should ideally happen when lbl_img and lbl_name are created.
+        # For safety, we can add a check here too, but creation time is better.
+
+        if lbl_img and hasattr(lbl_img, 'default_bg_color'):
+            if lbl_img not in self.widget_original_colors:
+                self.widget_original_colors[lbl_img] = {}
+            # setdefault ensures it's only set if 'bg' is not already a key
+            self.widget_original_colors[lbl_img].setdefault('bg', lbl_img.default_bg_color)
+
+        if lbl_name and hasattr(lbl_name, 'default_fg_color'):
+            if lbl_name not in self.widget_original_colors:
+                self.widget_original_colors[lbl_name] = {}
+            self.widget_original_colors[lbl_name].setdefault('fg', lbl_name.default_fg_color)
+
+
         def on_hover_enter(event):
-            lbl_name.config(fg=hover_color)
-            lbl_img.config(bg=hover_bg_color)
+            # Animate lbl_name foreground to hover color
+            if lbl_name and lbl_name.winfo_exists():
+                self._start_animation(lbl_name, {'fg': HOVER_FG_COLOR}) # MODIFIED
 
+            # Animate lbl_img background to hover color
+            if lbl_img and lbl_img.winfo_exists():
+                self._start_animation(lbl_img, {'bg': HOVER_BG_COLOR_IMG}) # MODIFIED
+
+            # --- DEBOUNCED Tooltip (remains the same) ---
+            if hasattr(self, 'tooltip_debounce_timer') and self.tooltip_debounce_timer:
+                if self.master and self.master.winfo_exists(): # Check master exists before after_cancel
+                    try:
+                        self.master.after_cancel(self.tooltip_debounce_timer)
+                    except tk.TclError: # Might already be cancelled or master gone
+                        pass
+                self.tooltip_debounce_timer = None
+
+            # Assuming self._delayed_show_tooltip and tooltip_text are defined
+            # And self.master is the appropriate widget to call .after on
+            if self.master and self.master.winfo_exists(): # Check master exists before .after
+                self.tooltip_debounce_timer = self.master.after(
+                    200, # Debounce delay
+                    lambda widget=event.widget, text=tooltip_text: self._delayed_show_tooltip(widget, text)
+                )
             # --- DEBOUNCED Tooltip ---
-            if self.tooltip_debounce_timer:
-                self.master.after_cancel(self.tooltip_debounce_timer) # Cancel existing timer
-                self.tooltip_debounce_timer = None # Reset timer
-
-            self.tooltip_debounce_timer = self.master.after(
-                200, # Debounce delay for tooltip (adjust as needed, e.g., 200ms)
-                lambda widget=event.widget, text=tooltip_text: self._delayed_show_tooltip(widget, text) # Call delayed show function
-            )
-            # --- DEBOUNCED Tooltip ---
-
-            ''' # commented out 
-            # --- DEBOUNCED sidebar update ---
-            if self.details_sidebar_debounce_timer:
-                self.master.after_cancel(self.details_sidebar_debounce_timer)  # Cancel any existing timer
-            self.details_sidebar_debounce_timer = self.master.after(
-                100,  # Debounce delay (e.g., 100ms) - adjust as needed
-                lambda: self.debounced_show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item=(picture_path, spawn_cmd, zip_file, info_data, folder_name))
-            )
-            # --- DEBOUNCED sidebar update ---
-            '''
 
         def on_hover_leave(event):
-            # --- MODIFIED: Check if label should be highlighted yellow, otherwise restore default color ---
-            search_query = self.details_search_var.get().strip().lower()
-            config_name_for_search = lbl_name.cget("text").lower() # Get label text for search
-            if search_query and search_query in config_name_for_search:
-                #lbl_name.config(fg="yellow") # Keep yellow highlight if search active
-                #lbl_img.config(bg="yellow") # Keep yellow highlight for image background too
-                lbl_name.config(fg=lbl_name.default_fg_color) # Restore original DEFAULT text color, keeping feature in, but disabled state
-                lbl_img.config(bg=lbl_img.default_bg_color) # Restore default image background color
+            target_name_fg = None
+            target_img_bg = None
 
+            # Determine target colors based on search query
+            search_query = ""
+            if hasattr(self, 'details_search_var') and self.details_search_var: # Ensure search var exists
+                search_query = self.details_search_var.get().strip().lower()
+            
+            config_name_for_search = ""
+            if lbl_name and lbl_name.winfo_exists(): # Check if lbl_name exists before cget
+                try:
+                    config_name_for_search = lbl_name.cget("text").lower()
+                except tk.TclError: # In case cget fails unexpectedly
+                    pass
+
+
+            # Robustly get default colors for lbl_name, ensure they are valid hex
+            default_name_fg = "#000000" # Fallback
+            if lbl_name and hasattr(lbl_name, 'default_fg_color'):
+                try:
+                    # Validate the default color itself before assigning
+                    self._hex_to_rgb(lbl_name.default_fg_color)
+                    default_name_fg = lbl_name.default_fg_color
+                except (ValueError, TypeError, AttributeError): # Catch if default_fg_color is not valid hex or not string
+                    print(f"Warning: Invalid or missing default_fg_color for {lbl_name}. Using black.")
+
+            # Robustly get default colors for lbl_img, ensure they are valid hex
+            default_img_bg = "#FFFFFF" # Fallback
+            if lbl_img and hasattr(lbl_img, 'default_bg_color'):
+                try:
+                    # Validate the default color itself
+                    self._hex_to_rgb(lbl_img.default_bg_color)
+                    default_img_bg = lbl_img.default_bg_color
+                except (ValueError, TypeError, AttributeError): # Catch if default_bg_color is not valid hex or not string
+                    print(f"Warning: Invalid or missing default_bg_color for {lbl_img}. Using white.")
+
+
+            if search_query and config_name_for_search and search_query in config_name_for_search:
+                # If part of a search result, revert to default colors
+                # (or set to specific SEARCH_HIGHLIGHT_COLOR if defined and desired)
+                target_name_fg = default_name_fg
+                target_img_bg = default_img_bg
             else:
-                lbl_name.config(fg=lbl_name.default_fg_color) # Restore original DEFAULT text color
-                lbl_img.config(bg=lbl_img.default_bg_color) # Restore default image background color
-            # --- MODIFIED: Check if label should be highlighted yellow, otherwise restore default color ---
+                # Not part of a search result, or no search query, revert to default
+                target_name_fg = default_name_fg
+                target_img_bg = default_img_bg
+
+            # Animate lbl_name foreground to its target color
+            if lbl_name and lbl_name.winfo_exists() and target_name_fg:
+                self._start_animation(lbl_name, {'fg': target_name_fg}) # MODIFIED
+
+            # Animate lbl_img background to its target color
+            if lbl_img and lbl_img.winfo_exists() and target_img_bg:
+                self._start_animation(lbl_img, {'bg': target_img_bg}) # MODIFIED
+
             self.hide_details_item_tooltip() # Hide tooltip immediately on leave
+
 
 
         lbl_img.bind("<Enter>", on_hover_enter)
@@ -21103,12 +24207,12 @@ class ConfigViewerApp:
         if self.current_details_item_tooltip_window: # If a tooltip is already showing, destroy it first
             self.hide_details_item_tooltip()
 
-        self.current_details_item_tooltip_window = tk.Toplevel(self.details_window)
+        self.current_details_item_tooltip_window = FadingToplevel(self.details_window, self)
         self.current_details_item_tooltip_window.overrideredirect(True) # Remove border
         self.current_details_item_tooltip_window.tk.call('tk', 'scaling', 1.25)
         self.current_details_item_tooltip_window.attributes("-topmost", True) # Keep on top
 
-        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
+        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="#d9d9d9", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
         tooltip_label.pack(padx=1, pady=1)
 
         widget_width = widget.winfo_width()
@@ -21138,12 +24242,12 @@ class ConfigViewerApp:
         if self.current_details_item_tooltip_window:
             self.hide_details_item_tooltip() # Destroy existing tooltip if any
 
-        self.current_details_item_tooltip_window = tk.Toplevel(self.details_window)
+        self.current_details_item_tooltip_window = FadingToplevel(self.details_window, self)
         self.current_details_item_tooltip_window.overrideredirect(True) # Remove border
         self.current_details_item_tooltip_window.tk.call('tk', 'scaling', 1.25)
         self.current_details_item_tooltip_window.attributes("-topmost", True) # Keep on top
 
-        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="lightgrey", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
+        tooltip_label = tk.Label(self.current_details_item_tooltip_window, text=tip_text, font=("Segoe UI", 10+self.font_size_add, "italic"), fg="#d9d9d9", bg="#555555", padx=5, pady=2, relief=tk.SOLID, borderwidth=1, justify=tk.LEFT) # Dark bg, lightgrey fg, left justify
         tooltip_label.pack(padx=1, pady=1)
 
         widget_width = widget.winfo_width()
@@ -21444,7 +24548,7 @@ class ConfigViewerApp:
             print(f"User vehicles base folder read from file: {user_vehicles_base_folder}")
             if not user_vehicles_base_folder.is_dir():
                  print(f"Error: User vehicles path specified in {user_vehicles_folder_txt_path} is not a valid directory: {user_vehicles_base_folder}")
-                 return
+
 
         except FileNotFoundError:
             print(f"Error: {user_vehicles_folder_txt_path} not found.")
@@ -21703,10 +24807,10 @@ class ConfigViewerApp:
         brand_name_frame = tk.Frame(main_frame, bg="#333333") # Frame to hold brand and name
         brand_name_frame.pack(fill=tk.X, pady=(0, 5)) # Pack before image, with padding below
 
-        brand_label = tk.Label(brand_name_frame, text=info_data.get("Name", "Unknown Name"), font=("Segoe UI", 14+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333")
+        brand_label = tk.Label(brand_name_frame, text=info_data.get("Name", "Unknown Name"), font=("Segoe UI", 14+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="#FFFFFF", bg="#333333")
         brand_label.pack(side=tk.TOP, fill=tk.X) # Brand on top
 
-        name_label = tk.Label(brand_name_frame, text=info_data.get("Brand", "Unknown Brand"), font=("Segoe UI", 12+self.font_size_add, "bold", "italic"), anchor=tk.CENTER, justify=tk.CENTER, fg="lightgrey", bg="#333333")
+        name_label = tk.Label(brand_name_frame, text=info_data.get("Brand", "Unknown Brand"), font=("Segoe UI", 12+self.font_size_add, "bold", "italic"), anchor=tk.CENTER, justify=tk.CENTER, fg="#d9d9d9", bg="#333333")
         name_label.pack(side=tk.TOP, fill=tk.X) # Name below brand
         # --- NEW: Brand and Name Labels at the Top ---
 
@@ -21721,7 +24825,7 @@ class ConfigViewerApp:
             img_label.pack(pady=10, anchor=tk.CENTER) # Pack image AFTER brand and name
         except Exception as e:
             print(f"Error loading detail window image: {e}")
-            placeholder_image = Image.new("RGB", (400, 200), "lightgrey")
+            placeholder_image = Image.new("RGB", (400, 200), "#d9d9d9")
             placeholder_photo = ImageTk.PhotoImage(placeholder_image)
             img_label = tk.Label(main_frame, image=placeholder_photo, bg="#333333")
             img_label.image = placeholder_photo
@@ -21747,7 +24851,7 @@ class ConfigViewerApp:
                 config_display_name = "Error Loading Config Name"
 
         # --- MODIFIED: Removed fixed wraplength, set anchor and justify ---
-        config_name_label = tk.Label(info_frame, text=config_display_name, font=("Segoe UI", 13+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="white", bg="#333333") # REMOVED wraplength
+        config_name_label = tk.Label(info_frame, text=config_display_name, font=("Segoe UI", 13+self.font_size_add, "bold"), anchor=tk.CENTER, justify=tk.CENTER, fg="#FFFFFF", bg="#333333") # REMOVED wraplength
         config_name_label.grid(row=row_num, column=0, sticky="ew", columnspan=2, pady=(0,5))
         row_num += 1
         self.config_name_label_detail_window = config_name_label # Store as instance attribute
@@ -21778,8 +24882,8 @@ class ConfigViewerApp:
         # --- MODIFIED: Dynamic wraplength and label creation with wraplength ---
         label_wraplength = win_width - 40  # Adjust padding as needed
         for label_text, value in info_labels: #unchanged
-            tk.Label(info_frame, text=f"{label_text}:", font=("Segoe UI", 12+self.font_size_add, "bold"), anchor=tk.E, justify=tk.RIGHT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=0, sticky="ne", padx=(0,15))
-            tk.Label(info_frame, text=value if value else "N/A", font=("Segoe UI", 12+self.font_size_add, "italic"), anchor=tk.W, justify=tk.LEFT, fg="white", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=1, sticky="nw")
+            tk.Label(info_frame, text=f"{label_text}:", font=("Segoe UI", 12+self.font_size_add, "bold"), anchor=tk.E, justify=tk.RIGHT, fg="#FFFFFF", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=0, sticky="ne", padx=(0,15))
+            tk.Label(info_frame, text=value if value else "N/A", font=("Segoe UI", 12+self.font_size_add, "italic"), anchor=tk.W, justify=tk.LEFT, fg="#FFFFFF", bg="#333333", wraplength=label_wraplength).grid(row=row_num, column=1, sticky="nw")
             row_num += 1
         # --- MODIFIED: Dynamic wraplength and label creation with wraplength ---
 
@@ -21794,69 +24898,173 @@ class ConfigViewerApp:
 
         # --- REMOVED Favorites Button from Configuration Details Window ---
 
-        disable_delete_button = False
-
-        found_double_basename = False
-        for base_name in self.ZIP_BASE_NAMES:
-            if picture_path.count(f"--{base_name}_{base_name}.zip") > 0: # Check for the specific pattern
-                found_double_basename = True
-                break # No need to check further once one is found
-        if found_double_basename:
-            disable_delete_button = True
-
-        if zip_file == "user_custom_configs":
-            delete_button_text = "Delete Config"
-            delete_command = self.on_details_image_right_click
-            delete_button_lambda = lambda s=spawn_cmd, p=picture_path, z=zip_file: delete_command(z, s, p)
-            delete_button = tk.Button(button_frame, text=delete_button_text, font=("Segoe UI", 12+self.font_size_add, "bold") , command=delete_button_lambda, fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
-        else:
-            delete_button = tk.Button(button_frame, text="Delete Mod", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_delete_mod(z, win), fg="#FF6666", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
-
-        if disable_delete_button:
-            delete_button.config(state=tk.DISABLED, fg="grey", bg="#666666") # Grey out the button
-            delete_button.unbind("<Enter>") # Disable hover effects
-            delete_button.unbind("<Leave>")
-        else:
-            def on_enter_delete(event):
-                delete_button.config(bg=self.global_highlight_color, fg="white") # Orange background, white text
-            def on_leave_delete(event):
-                delete_button.config(bg="#555555", fg="#FF6666") # Default background, light red text
-
-            delete_button.bind("<Enter>", on_enter_delete)
-            delete_button.bind("<Leave>", on_leave_delete)
-
-        isolate_button = None # Initialize isolate_button to None
-        if not found_double_basename and zip_file != "user_custom_configs":
-            isolate_button = tk.Button(button_frame, text="Isolate Mod", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda z=zip_file, win=detail_win: self.confirm_isolate_mod(z, win), fg="white", bg="#555555", relief=tk.FLAT, bd=0) # Flat button, light red text
-
-            def on_enter_isolate(event):
-                isolate_button.config(bg=self.global_highlight_color, fg="white") # Orange background, white text
-            def on_leave_isolate(event):
-                isolate_button.config(bg="#555555", fg="white") # Default background, white text
-
-            isolate_button.bind("<Enter>", on_enter_isolate)
-            isolate_button.bind("<Leave>", on_leave_isolate)
-
-        customize_color_button = tk.Button(button_frame, text="Customize Color", font=("Segoe UI", 12+self.font_size_add, "bold"), command=lambda cmd=spawn_cmd, fn=folder_name: self.customize_color_config(cmd, fn), fg="white", bg="#555555", relief=tk.FLAT, bd=0)
-
-        def on_enter_customize(event):
-            customize_color_button.config(bg=self.global_highlight_color, fg="white")
-        def on_leave_customize(event):
-            customize_color_button.config(bg="#555555", fg="white")
-
-        customize_color_button.bind("<Enter>", on_enter_customize)
-        customize_color_button.bind("<Leave>", on_leave_customize)
 
 
-        delete_button.grid(row=0, column=0, sticky="ew", padx=5, pady=2) # MODIFIED row number for delete button, to be FIRST position
-        if isolate_button:
-            button_frame.columnconfigure(1, weight=1) # Re-enable second column weight if isolate button exists
-            delete_button.grid(row=0, column=0, sticky="ew", padx=5, pady=2) # MODIFIED row number for delete button, to be FIRST position
-            isolate_button.grid(row=0, column=1, sticky="ew", padx=5, pady=2) # Isolate button to the right
-            customize_color_button.grid(row=0, column=2, sticky="ew", padx=5, pady=2) # Customize button to the far right
-        else:
-            delete_button.grid(row=0, column=0, sticky="ew", padx=5, pady=2, columnspan=2) # span across 2 columns if no isolate
-            customize_color_button.grid(row=0, column=2, sticky="ew", padx=5, pady=2) # Customize button to the right
+        original_bg = "#555555"
+        hover_fg = "#FFFFFF" # Common foreground color on hover
+
+        if not self.items_to_be_hidden:
+                
+            # --- Delete Button Logic ---
+            disable_delete_button = False
+            found_double_basename = False
+            # Ensure self.ZIP_BASE_NAMES exists and is iterable
+            if hasattr(self, 'ZIP_BASE_NAMES') and isinstance(self.ZIP_BASE_NAMES, (list, tuple, set)):
+                for base_name in self.ZIP_BASE_NAMES:
+                    if picture_path.count(f"--{base_name}_{base_name}.zip") > 0:
+                        found_double_basename = True
+                        break
+            if found_double_basename:
+                disable_delete_button = True
+
+            delete_original_fg = "#FF6666"
+            delete_button = None # Initialize
+
+            # --- Determine original command function ---
+            original_delete_command_func = None
+            if zip_file == "user_custom_configs":
+                delete_button_text = "Delete Config"
+                original_delete_command_func = lambda s=spawn_cmd, p=picture_path, z=zip_file: self.on_details_image_right_click(z, s, p)
+            else:
+                delete_button_text = "Delete Mod"
+                original_delete_command_func = lambda z=zip_file, win=detail_win: self.confirm_delete_mod(z, win)
+
+            # --- Create Delete Button (No command yet) ---
+            delete_button = tk.Button(
+                button_frame, text=delete_button_text,
+                font=("Segoe UI", 12 + self.font_size_add, "bold"),
+                # NO command assigned yet
+                fg=delete_original_fg, bg=original_bg, relief=tk.FLAT, bd=0
+            )
+
+            # --- Define Delete Command Wrapper ---
+            def delete_command_wrapper(btn=delete_button, cmd=original_delete_command_func, bg=original_bg, fg=delete_original_fg):
+                if cmd is None: return
+                try:
+                    # 1. Reset Appearance IMMEDIATELY (if button exists and enabled)
+                    if btn.winfo_exists() and btn['state'] == tk.NORMAL:
+                        print(f"WRAPPER: Resetting delete button {btn}") # DEBUG
+                        btn.config(fg=fg) # Reset FG
+                        # Start animation back to original BG *immediately*
+                        #self._start_animation(btn, bg, property_to_animate="bg")
+                        # Optional: Force UI update before blocking call (use with caution)
+                        # btn.update_idletasks()
+                except tk.TclError as e:
+                    print(f"WRAPPER ERROR (Delete): {e}") # DEBUG
+                    pass # Widget might be gone
+
+                # 2. Execute the Original Command Function (shows messagebox)
+                print(f"WRAPPER: Calling original delete command {cmd}") # DEBUG
+                cmd()
+
+            # --- Assign Wrapper and Bind/Disable ---
+            delete_button.config(command=delete_command_wrapper) # Assign wrapper
+
+            if disable_delete_button:
+                delete_button.config(state=tk.DISABLED, fg="grey", bg="#666666")
+            else:
+                self._bind_animated_hover(
+                    button=delete_button,
+                    original_bg=original_bg,
+                    original_fg=delete_original_fg,
+                    hover_target_fg=hover_fg,
+                    check_state=True
+                )
+
+            # --- Isolate Button Logic ---
+            isolate_button = None
+            if not found_double_basename and zip_file != "user_custom_configs":
+                isolate_original_fg = "#FFFFFF"
+                # Original command function
+                original_isolate_command_func = lambda z=zip_file, win=detail_win: self.confirm_isolate_mod(z, win)
+
+                # Create Isolate Button (No command yet)
+                isolate_button = tk.Button(
+                    button_frame, text="Isolate Mod",
+                    font=("Segoe UI", 12 + self.font_size_add, "bold"),
+                    # NO command assigned yet
+                    fg=isolate_original_fg, bg=original_bg, relief=tk.FLAT, bd=0
+                )
+
+                # --- Define Isolate Command Wrapper ---
+                def isolate_command_wrapper(btn=isolate_button, cmd=original_isolate_command_func, bg=original_bg, fg=isolate_original_fg):
+                    if cmd is None: return
+                    try:
+                        # 1. Reset Appearance IMMEDIATELY (if button exists and enabled)
+                        if btn.winfo_exists() and btn['state'] == tk.NORMAL:
+                            print(f"WRAPPER: Resetting isolate button {btn}") # DEBUG
+                            btn.config(fg=fg) # Reset FG
+                            # Start animation back to original BG *immediately*
+                            #self._start_animation(btn, bg, property_to_animate="bg")
+                            # Optional: btn.update_idletasks()
+                    except tk.TclError as e:
+                        print(f"WRAPPER ERROR (Isolate): {e}") # DEBUG
+                        pass
+
+                    # 2. Execute the Original Command Function (shows messagebox)
+                    print(f"WRAPPER: Calling original isolate command {cmd}") # DEBUG
+                    cmd()
+
+                # --- Assign Wrapper and Bind ---
+                isolate_button.config(command=isolate_command_wrapper) # Assign wrapper
+
+                self._bind_animated_hover( # Bind standard hover effects
+                    button=isolate_button,
+                    original_bg=original_bg,
+                    original_fg=isolate_original_fg,
+                    hover_target_fg=hover_fg,
+                    check_state=False # Assuming always enabled if created
+                )
+
+            # --- Customize Color Button Logic (Assuming no blocking issue - keep as is or wrap too) ---
+            customize_original_fg = "#FFFFFF"
+            customize_color_button = tk.Button(
+                button_frame, text="Customize Color",
+                font=("Segoe UI", 12 + self.font_size_add, "bold"),
+                command=lambda cmd=spawn_cmd, fn=folder_name: self.customize_color_config(cmd, fn),
+                fg=customize_original_fg, bg=original_bg, relief=tk.FLAT, bd=0
+            )
+            self._bind_animated_hover(
+                button=customize_color_button,
+                original_bg=original_bg,
+                original_fg=customize_original_fg,
+                hover_target_fg=hover_fg,
+                check_state=False
+            )
+
+
+
+            if isolate_button:
+                button_frame.columnconfigure(1, weight=1) # Re-enable second column weight if isolate button exists
+                delete_button.grid(row=0, column=0, sticky="ew", padx=5, pady=2) # MODIFIED row number for delete button, to be FIRST position
+                isolate_button.grid(row=0, column=1, sticky="ew", padx=5, pady=2) # Isolate button to the right
+                customize_color_button.grid(row=0, column=2, sticky="ew", padx=5, pady=2) # Customize button to the far right
+            else:
+                delete_button.grid(row=0, column=0, sticky="ew", padx=5, pady=2, columnspan=2) # span across 2 columns if no isolate
+                customize_color_button.grid(row=0, column=2, sticky="ew", padx=5, pady=2) # Customize button to the right
+
+
+
+        if self.items_to_be_hidden:
+
+
+            # --- Customize Color Button Logic (Assuming no blocking issue - keep as is or wrap too) ---
+            customize_original_fg = "#FFFFFF"
+            customize_color_button = tk.Button(
+                button_frame, text="Customize Color",
+                font=("Segoe UI", 12 + self.font_size_add, "bold"),
+                command=lambda cmd=spawn_cmd, fn=folder_name: self.customize_color_config(cmd, fn),
+                fg=customize_original_fg, bg=original_bg, relief=tk.FLAT, bd=0
+            )
+            self._bind_animated_hover(
+                button=customize_color_button,
+                original_bg=original_bg,
+                original_fg=customize_original_fg,
+                hover_target_fg=hover_fg,
+                check_state=False
+            )
+
+            customize_color_button.grid(row=0, column=0, columnspan=3, sticky="ew", padx=5, pady=2)
 
 
         # --- NEW: Bind <Configure> event to detail_win to handle label wrapping on window resize ---
@@ -21942,6 +25150,7 @@ class ConfigViewerApp:
                 scanning_win.after(3125, close_scanning_window)
             return
 
+
         confirm = messagebox.askyesno(
             "Confirm Delete",
             f"Are you sure you want to delete the mod '{zip_file}' and all related files?",
@@ -21961,6 +25170,7 @@ class ConfigViewerApp:
         """
         userfolder_root = os.path.dirname(os.path.dirname(os.path.dirname(self.script_dir))) # Go up 3 levels
         folder_path = os.path.join(userfolder_root, "Isolated")
+
 
         if not os.path.exists(folder_path):
             try:
@@ -22226,6 +25436,77 @@ class ConfigViewerApp:
             display_name_text = name
         elif vehicle_type:
             display_name_text = vehicle_type
+
+
+        print(f"  DEBUG: update_sidebar - Initial display_name_text (from passed info_data): '{display_name_text}'")
+
+        # --- >>> NEW: Fallback Logic for Title <<< ---
+        if display_name_text == "Unknown":
+            print("  DEBUG: update_sidebar - Initial name is 'Unknown'. Attempting fallback using MAIN info file...")
+            try:
+                # Determine the correct folder and base zip for the main info file
+                # Use self.current_details_folder which should be correctly set
+                effective_folder = self.current_details_folder
+                base_zip_file = None
+
+                if effective_folder in self.ZIP_BASE_NAMES: # Check if it's a vanilla folder name
+                    base_zip_file = f"{effective_folder}.zip" # Construct vanilla zip name
+                    print(f"    DEBUG: Fallback - Detected vanilla folder: '{effective_folder}', using zip: '{base_zip_file}'")
+                elif hasattr(self, 'details_data') and self.details_data: # Fallback: try getting zip from first details item
+                    # Find the first item in the *current* details view belonging to this folder
+                    for item_tuple in self.details_data:
+                         if len(item_tuple) == 5 and item_tuple[4] == effective_folder and item_tuple[2] not in ["user_custom_configs", "folder_grouped"]:
+                              base_zip_file = item_tuple[2]
+                              print(f"    DEBUG: Fallback - Found representative zip from details_data: '{base_zip_file}' for folder '{effective_folder}'")
+                              break # Use the first one found
+                    if not base_zip_file:
+                         print(f"    WARN: Fallback - Could not find a non-custom zip in details_data for folder '{effective_folder}'.")
+                else:
+                    print(f"    WARN: Fallback - Cannot determine base zip (not vanilla and details_data empty/missing).")
+
+
+                if effective_folder and base_zip_file:
+                    main_info_filename = f"vehicles--{effective_folder}_{base_zip_file}--info.json"
+                    main_info_filepath = os.path.join(self.config_info_folder, main_info_filename)
+                    print(f"    DEBUG: Fallback - Attempting to load MAIN info from: {main_info_filepath}")
+
+                    if os.path.exists(main_info_filepath):
+                        # Load the main info data
+                        correct_main_info_data = self.extract_fallback_info(main_info_filepath)
+                        if correct_main_info_data:
+                            print(f"    DEBUG: Fallback - Successfully loaded main info.")
+                            # Extract Brand/Name/Type from the loaded MAIN info
+                            main_brand = correct_main_info_data.get("Brand", "").strip()
+                            main_name = correct_main_info_data.get("Name", "").strip()
+                            main_type = correct_main_info_data.get("Type", "").strip()
+
+                            # Reconstruct display_name_text using MAIN info
+                            fallback_display_name = "Unknown" # Default for fallback
+                            if main_brand:
+                                fallback_display_name = f"{main_brand} {main_name}" if main_name else (f"{main_brand} {main_type}" if main_type else main_brand)
+                            elif main_name:
+                                fallback_display_name = main_name
+                            elif main_type:
+                                fallback_display_name = main_type
+
+                            if fallback_display_name != "Unknown":
+                                display_name_text = fallback_display_name # Overwrite with fallback name
+                                print(f"    DEBUG: Fallback - Using Brand/Name from MAIN info: '{display_name_text}'")
+                            else:
+                                print(f"    WARN: Fallback - Main info file loaded but lacked Brand/Name/Type. Sticking with 'Unknown'.")
+                        else:
+                            print(f"    WARN: Fallback - Failed to extract data from existing main info file: {main_info_filepath}")
+                    else:
+                        print(f"    WARN: Fallback - Main info file NOT FOUND: {main_info_filepath}")
+                else:
+                     print(f"    WARN: Fallback - Could not determine path for main info file. Sticking with 'Unknown'.")
+
+            except Exception as e:
+                print(f"    ERROR: Exception during title fallback logic: {e}")
+                # Stick with the original "Unknown" on error
+        # --- >>> END Fallback Logic for Title <<< ---
+
+
 
         if hasattr(self, 'details_sidebar_car_name_label') and self.details_sidebar_car_name_label.winfo_exists():
             self.details_sidebar_car_name_label.config(text=display_name_text)
@@ -23034,6 +26315,36 @@ class ConfigViewerApp:
         print(f"details_window is None: {self.details_window is None}")
 
 
+        stack = inspect.stack()
+        caller_function_name = "<unknown>"
+        caller_filename = "<unknown>"
+        caller_lineno = 0
+        if len(stack) > 1:
+            # stack[0] is the current frame (update_grid_layout)
+            # stack[1] is the caller's frame
+            caller_frame_record = stack[1]
+            caller_function_name = caller_frame_record.function
+            caller_filename = caller_frame_record.filename
+            caller_lineno = caller_frame_record.lineno
+            # You can even get the specific code line that made the call:
+            caller_code_context = caller_frame_record.code_context
+            print(f"    Code context: {caller_code_context}") # Might be None
+
+        print(f"--- on_details_window_close CALLED BY: {caller_function_name} in {caller_filename} at line {caller_lineno} ---")
+
+
+        '''
+        if self.dev_mode:
+
+            scanning_win = self.show_scanning_window(text=f"--- on_details_window_close CALLED BY: \n{caller_function_name} \nin {caller_filename} \nat line {caller_lineno} ---", tall=True, dev_notif=True)
+            if scanning_win:
+
+                def close_scanning_window():
+
+                    scanning_win.destroy()
+
+                scanning_win.after(3125, close_scanning_window)
+                '''
 
         if not self.details_window_closed and self.details_window:
             print("Details window is open, proceeding to close and potentially re-open.")
@@ -23098,11 +26409,15 @@ class ConfigViewerApp:
 
             if self.search_results_window_on_screen:
                 print("  DEBUG: Search results window should be on the screen, destroying and recreating it...")
+                
                 self.destroy_search_results_window()
                     
                 print("  DEBUG: creating new search results window.")
                 self.search_results_window = self.show_search_results_window(self.data)
-            
+
+                print("self.update_grid_after_size_rechange has been set to True")
+                self.update_grid_after_size_rechange = True
+
             if not self.search_results_window_on_screen:
                 print("  DEBUG: Search results window should not be on the screen, running self.update_grid_layout()")
                 self.update_grid_layout()
@@ -23329,6 +26644,7 @@ class ConfigViewerApp:
 
 
 
+
     def delete_backup_folder_on_startup(self):
 
         backup_folder_path = self.script_dir / "data/backup"
@@ -23377,7 +26693,8 @@ class ConfigViewerApp:
             print("Restarting application...")
             python_exe = sys.executable
             script_path = os.path.abspath(sys.argv[0])
-            subprocess.Popen([python_exe, script_path])
+            #subprocess.Popen([python_exe, script_path])
+            subprocess.Popen([python_exe, "-B", script_path])
             os._exit(0)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to restart the script: {e}")
@@ -23396,7 +26713,7 @@ class ConfigViewerApp:
             self.destroy_search_results_window()
 
             print("\n--- ConfigViewerApp.trigger_full_data_refresh_and_ui_update() ENTRY - DEBUG CHECK ---") # Debug - Entry Point - FULL_DATA_REFRESH_AND_UI_UPDATE
-            self.trigger_refresh_scanning_win = self.show_scanning_window(text="Checking for changes, scanning and refreshing data...") # Modified text
+            self.show_scanning_window(text="Checking for changes, scanning and refreshing data...") # Modified text
 
             # --- NEW: Clear main grid image cache BEFORE refresh ---
             print("Clearing Main Grid Cache before refresh...") # Debug Print
@@ -23438,6 +26755,7 @@ class ConfigViewerApp:
 
                 print("self.perform_search() RETURNED.") # Debug - After Perform Search
 
+
             except Exception as e:
                 messagebox.showerror("Error", f"Error during full data scanning: {e}")
             finally:
@@ -23445,6 +26763,22 @@ class ConfigViewerApp:
                 print("--trigger_full_data_refresh_and_ui_update is calling self.update_grid_layout()")
                 self.update_grid_layout()
                 print("--- ConfigViewerApp.trigger_full_data_refresh_and_ui_update() EXIT ---\n") # Debug - Exit Point
+
+
+                if hasattr(self, 'trigger_refresh_scanning_win') and self.trigger_refresh_scanning_win is not None:
+                    try:
+                        # Attempt to destroy it
+                        self.trigger_refresh_scanning_win.destroy()
+                    except tk.TclError as e:
+                        # Handle cases where destroy might fail even if the object exists (e.g., widget already destroyed)
+                        print(f"TclError while destroying trigger_refresh_scanning_win (might be already gone): {e}")
+                    finally:
+                        # Set the attribute to None afterwards to prevent trying to destroy it again
+                        self.trigger_refresh_scanning_win = None
+
+
+
+
 
     def update_new_mods_txt_with_new_zips(self, newly_detected_zip_files):
         """
@@ -23471,13 +26805,844 @@ class ConfigViewerApp:
         except Exception as e:
             print(f"ERROR: Error updating NewMods.txt: {e}")
             
-            
+
+
+
+#---------------------self contained animation code---------
+# ----------------------------------------------------------
+
+    def _hex_to_rgb(self, hex_color):
+        hex_color_stripped = hex_color.lstrip('#')
+        if len(hex_color_stripped) != 6:
+            # print(f"Warning: Invalid hex color format: '{hex_color}'. Using black.")
+            return (0, 0, 0)
+        try:
+            return tuple(int(hex_color_stripped[i:i+2], 16) for i in (0, 2, 4))
+        except ValueError:
+            # print(f"Warning: Invalid character in hex color '{hex_color}'. Using black.")
+            return (0, 0, 0)
+
+    def _rgb_to_hex(self, rgb_color):
+        try:
+            r, g, b = map(int, rgb_color)
+            r = max(0, min(255, r)); g = max(0, min(255, g)); b = max(0, min(255, b))
+            return f'#{r:02x}{g:02x}{b:02x}'
+        except (ValueError, TypeError):
+            # print(f"Warning: Invalid RGB color for conversion: {rgb_color}. Using #000000.")
+            return "#000000"
+
+    def _interpolate_color(self, color1_hex, color2_hex, factor):
+        rgb1 = self._hex_to_rgb(color1_hex)
+        rgb2 = self._hex_to_rgb(color2_hex)
+        factor = max(0.0, min(1.0, factor))
+        interpolated_rgb = [int(rgb1[i] + (rgb2[i] - rgb1[i]) * factor) for i in range(3)]
+        return self._rgb_to_hex(tuple(interpolated_rgb))
+
+    def _get_validated_current_color(self, widget, property_name):
+        current_color_val_raw = ""
+        try:
+            current_color_val_raw = widget.cget(property_name)
+            self._hex_to_rgb(current_color_val_raw)
+            return current_color_val_raw
+        except (ValueError, TypeError):
+            pass
+        except tk.TclError:
+            return "#000000"
+        original_hex = self.widget_original_colors.get(widget, {}).get(property_name)
+        if original_hex:
+            try:
+                self._hex_to_rgb(original_hex)
+                return original_hex
+            except (ValueError, TypeError):
+                pass
+        return "#000000"
+    
+
+    def _start_animation(self, widget, properties_to_animate: dict):
+        if not widget.winfo_exists():
+            if widget in self.animation_states: del self.animation_states[widget]
+            if widget in self.widget_original_colors: del self.widget_original_colors[widget]
+            # Add cleanup for other state dicts if they become relevant here
+            return
+
+        state = self.animation_states.setdefault(widget, {
+            'anim_id': None,
+            'start_time': 0,
+            'active_animations': {}
+        })
+
+        if state.get('anim_id'):
+            try: widget.after_cancel(state['anim_id'])
+            except tk.TclError: pass
+            state['anim_id'] = None
+
+        new_active_animations = {}
+        for prop_name, target_value in properties_to_animate.items():
+            if not isinstance(target_value, str): continue
+            current_value = self._get_validated_current_color(widget, prop_name)
+            if current_value.lower() != target_value.lower():
+                new_active_animations[prop_name] = {
+                    'start_value': current_value,
+                    'target_value': target_value
+                }
+        
+        if not new_active_animations:
+            state['active_animations'] = {}
+            try:
+                final_config = {}
+                for prop_name, target_value in properties_to_animate.items():
+                     if isinstance(target_value, str):
+                        final_config[prop_name] = target_value
+                if final_config: widget.config(**final_config)
+            except tk.TclError: pass
+            return
+
+        state['active_animations'] = new_active_animations
+        state['start_time'] = time.time()
+        
+        try:
+            self._run_animation_step(widget)
+        except Exception as e:
+            if state.get('anim_id'):
+                try: widget.after_cancel(state['anim_id'])
+                except tk.TclError: pass
+            if widget in self.animation_states: del self.animation_states[widget]
+
+
+    def _run_animation_step(self, widget):
+        if not widget.winfo_exists():
+            if widget in self.animation_states: del self.animation_states[widget]
+            return
+
+        state = self.animation_states.get(widget)
+        if not state or not state.get('active_animations'):
+            if state and state.get('anim_id'):
+                try: widget.after_cancel(state['anim_id'])
+                except tk.TclError: pass
+                state['anim_id'] = None
+            return
+
+        start_time = state['start_time']
+        active_animations = state['active_animations']
+        elapsed = time.time() - start_time
+        duration = self.transition_duration_sec if self.transition_duration_sec > 0 else 0.01
+        progress = min(1.0, elapsed / duration)
+
+        config_updates = {}
+        try:
+            for prop_name, anim_data in active_animations.items():
+                interpolated_value = self._interpolate_color(anim_data['start_value'], anim_data['target_value'], progress)
+                config_updates[prop_name] = interpolated_value
+            if config_updates: widget.config(**config_updates)
+
+            if progress < 1.0:
+                state['anim_id'] = widget.after(15, lambda w=widget: self._run_animation_step(w))
+            else:
+                final_config = {p: d['target_value'] for p, d in active_animations.items()}
+                if final_config: widget.config(**final_config)
+                state['anim_id'] = None
+                state['active_animations'] = {}
+        except tk.TclError:
+            if widget in self.animation_states:
+                if self.animation_states[widget].get('anim_id'):
+                    try: widget.after_cancel(self.animation_states[widget]['anim_id'])
+                    except tk.TclError: pass
+                del self.animation_states[widget]
+        except Exception as e:
+            if widget in self.animation_states:
+                if state.get('anim_id'):
+                    try: widget.after_cancel(state['anim_id'])
+                    except tk.TclError: pass
+                del self.animation_states[widget]
+
+
+    def _bind_button_events(self, button, on_button_hover_enter, on_button_hover_leave, on_button_click):
+        """
+        WORKAROUND BINDER: Binds events to use smooth animation, IGNORING
+        the passed handler functions. Assumes button is always enabled.
+        Animates both BG and FG.
+        """
+        try:
+            original_bg = self._get_validated_current_color(button, "bg")
+            original_fg = self._get_validated_current_color(button, "fg")
+
+            hover_target_bg = self.global_highlight_color
+            sum_rgb_hover_bg = sum(self._hex_to_rgb(hover_target_bg))
+            hover_target_fg = "black" if sum_rgb_hover_bg > 382 else "white"
+
+            if button not in self.widget_original_colors:
+                self.widget_original_colors[button] = {}
+            self.widget_original_colors[button].setdefault('bg', original_bg)
+            self.widget_original_colors[button].setdefault('fg', original_fg)
+
+            def _internal_on_hover_enter(event, widget=button, ht_bg=hover_target_bg, ht_fg=hover_target_fg):
+                try:
+                    if widget.winfo_exists() and widget.cget('state') == tk.NORMAL: # Check state
+                        self._start_animation(widget, {'bg': ht_bg, 'fg': ht_fg})
+                except tk.TclError: pass
+
+            def _internal_on_hover_leave(event, widget=button, rev_bg=original_bg, rev_fg=original_fg):
+                try:
+                    if widget.winfo_exists():
+                        # REVERTED: No mouse position check here
+                        if widget.cget('state') == tk.NORMAL: # Check state
+                            self._start_animation(widget, {'bg': rev_bg, 'fg': rev_fg})
+                except tk.TclError: pass
+
+            def _internal_on_destroy(event, widget=button):
+                if widget in self.animation_states:
+                    state = self.animation_states[widget]
+                    anim_id = state.get('anim_id')
+                    if anim_id:
+                        try: widget.after_cancel(anim_id)
+                        except tk.TclError: pass
+                    del self.animation_states[widget]
+                if widget in self.widget_original_colors:
+                    del self.widget_original_colors[widget]
+                if widget in self.widget_animation_configs: del self.widget_animation_configs[widget]
+                if widget in self.actively_hovered_widgets: self.actively_hovered_widgets.discard(widget)
+
+            button.bind("<Enter>", _internal_on_hover_enter, add='+')
+            button.bind("<Leave>", _internal_on_hover_leave, add='+')
+            button.bind("<Destroy>", _internal_on_destroy, add='+')
+
+        except tk.TclError:
+            # print(f"Warning: Could not bind animated events for widget {button}, it might be destroyed.")
+            pass
+        except Exception as e:
+            # print(f"Error in _bind_button_events for {button}: {e}")
+            pass
+
+
+    def _bind_animated_hover(self, button,
+                             original_bg, original_fg,
+                             hover_target_bg=None,
+                             hover_target_fg=None,
+                             check_state=False,
+                             is_selected_initial=False,
+                             selected_bg=None,
+                             selected_fg=None,
+                             on_enter_extra_command=None,
+                             on_leave_extra_command=None):
+
+        true_original_bg = self._get_validated_current_color(button, "bg") if original_bg is None else original_bg
+        true_original_fg = self._get_validated_current_color(button, "fg") if original_fg is None else original_fg
+
+        effective_hover_bg = hover_target_bg if hover_target_bg is not None else self.global_highlight_color
+        if hover_target_fg is None:
+            sum_rgb_hover_bg = sum(self._hex_to_rgb(effective_hover_bg))
+            effective_hover_fg = "black" if sum_rgb_hover_bg > 382 else "white"
+        else:
+            effective_hover_fg = hover_target_fg
+
+        normal_display_bg = true_original_bg
+        normal_display_fg = true_original_fg
+        if is_selected_initial and selected_bg is not None:
+            normal_display_bg = selected_bg
+            if selected_fg is not None:
+                normal_display_fg = selected_fg
+            else:
+                sum_rgb_selected_bg = sum(self._hex_to_rgb(selected_bg))
+                normal_display_fg = "black" if sum_rgb_selected_bg > 382 else "white"
+
+        try:
+            button.config(bg=normal_display_bg, fg=normal_display_fg)
+        except tk.TclError:
+            # print(f"Warning: Could not configure initial state for {button} in _bind_animated_hover.")
+            return
+
+        if button not in self.widget_original_colors:
+             self.widget_original_colors[button] = {}
+        self.widget_original_colors[button].update({'bg': true_original_bg, 'fg': true_original_fg})
+        if selected_bg: self.widget_original_colors[button]['selected_bg'] = selected_bg
+        if selected_fg: self.widget_original_colors[button]['selected_fg'] = selected_fg
+
+        self.widget_animation_configs[button] = {
+            'normal_display_bg': normal_display_bg,
+            'normal_display_fg': normal_display_fg,
+            'hover_bg': effective_hover_bg,
+            'hover_fg': effective_hover_fg,
+            'check_state': check_state,
+        }
+
+        def _on_hover_enter(event, widget=button):
+            if on_enter_extra_command: on_enter_extra_command()
+            try:
+                if not widget.winfo_exists(): return
+
+                widget_cfg = self.widget_animation_configs.get(widget)
+                if not widget_cfg: return
+
+                can_hover = (not widget_cfg['check_state'] or widget.cget('state') == tk.NORMAL)
+                if not can_hover: return
+
+                self._start_animation(widget, {'bg': widget_cfg['hover_bg'], 'fg': widget_cfg['hover_fg']})
+                self.actively_hovered_widgets.add(widget)
+            except tk.TclError: pass
+            except Exception as e: pass # print(f"Error in _on_hover_enter for {widget}: {e}")
+
+        def _revert_to_normal_appearance(widget_to_revert):
+            if not widget_to_revert.winfo_exists(): return
+
+            widget_cfg = self.widget_animation_configs.get(widget_to_revert)
+            if not widget_cfg: return
+
+            self._start_animation(widget_to_revert, {
+                'bg': widget_cfg['normal_display_bg'],
+                'fg': widget_cfg['normal_display_fg']
+            })
+            if widget_to_revert in self.actively_hovered_widgets:
+                self.actively_hovered_widgets.discard(widget_to_revert)
+
+        def _on_hover_leave(event, widget=button):
+            if on_leave_extra_command: on_leave_extra_command()
+            try:
+                # REVERTED: No mouse position check here
+                if not widget.winfo_exists(): return
+                _revert_to_normal_appearance(widget)
+            except tk.TclError: pass
+            except Exception as e: pass # print(f"Error in _on_hover_leave for {widget}: {e}")
+
+        def _on_focus_out(event, widget=button):
+            if on_leave_extra_command: on_leave_extra_command() # Note: This might be called even if widget wasn't hovered
+            try:
+                if widget in self.actively_hovered_widgets: # Only revert if it was actively hovered
+                    _revert_to_normal_appearance(widget)
+            except tk.TclError: pass
+            except Exception as e: pass # print(f"Error in _on_focus_out for {widget}: {e}")
+
+        def _on_destroy(event, widget=button):
+            if widget in self.animation_states:
+                state = self.animation_states[widget]
+                anim_id = state.get('anim_id')
+                if anim_id:
+                    try: widget.after_cancel(anim_id)
+                    except tk.TclError: pass
+                del self.animation_states[widget]
+            if widget in self.widget_original_colors:
+                del self.widget_original_colors[widget]
+            if widget in self.widget_animation_configs:
+                del self.widget_animation_configs[widget]
+            if widget in self.actively_hovered_widgets:
+                self.actively_hovered_widgets.discard(widget)
+
+        button.bind("<Enter>", _on_hover_enter, add='+')
+        button.bind("<Leave>", _on_hover_leave, add='+')
+        button.bind("<FocusOut>", _on_focus_out, add='+')
+        button.bind("<Destroy>", _on_destroy, add='+')
+
+
+
+
+    def force_clear_all_hover_effects(self):
+        """
+        Forces all widgets currently in a visual hover state to revert to their
+        non-hovered appearance (which might be 'selected' or 'original').
+        """
+        print(f"DEBUG: force_clear_all_hover_effects called. Actively hovered: {list(self.actively_hovered_widgets)}")
+        # Iterate over a copy because _revert_hover (called via _start_animation) will modify the set
+        widgets_to_clear = list(self.actively_hovered_widgets)
+
+        for widget in widgets_to_clear:
+            if not isinstance(widget, tk.Widget): # Skip non-widget keys if any
+                # print(f"DEBUG: Skipping non-widget key in actively_hovered_widgets: {widget}")
+                self.actively_hovered_widgets.discard(widget) # Clean up non-widget entry
+                continue
+
+            if widget.winfo_exists():
+                widget_cfg = self.widget_animation_configs.get(widget)
+                if widget_cfg:
+                    print(f"  Purging hover for: {widget} to bg:{widget_cfg['initial_display_bg']}, fg:{widget_cfg['initial_display_fg']}")
+                    # This re-uses the logic from _on_focus_out / _on_hover_leave
+                    # It directly calls the revert logic that _bind_animated_hover sets up
+                    if not widget_cfg['check_state'] or widget['state'] == tk.NORMAL:
+                        widget.config(fg=widget_cfg['initial_display_fg'])
+                        self._start_animation(widget, widget_cfg['initial_display_bg'], property_to_animate="bg")
+                        # The _start_animation, if it leads to an animation towards initial_display_bg,
+                        # should be responsible for removing from actively_hovered_widgets upon completion
+                        # or immediately if no animation is needed.
+                        # For safety, ensure it's removed if we directly config and don't animate
+                        # However, _bind_animated_hover's _revert_hover handles this removal.
+                        # Let's ensure the logic is in _revert_hover or called explicitly
+                        if widget in self.actively_hovered_widgets: # If _start_animation didn't remove it (e.g. no actual anim)
+                            self.actively_hovered_widgets.remove(widget)
+                            print(f"DEBUG: Purged {widget}. Removed. Active: {len(self.actively_hovered_widgets)}")
+                    else:
+                        # If it's disabled but was marked active, remove it from tracking
+                        if widget in self.actively_hovered_widgets:
+                            self.actively_hovered_widgets.remove(widget)
+                            print(f"DEBUG: Disabled {widget} found in active. Removed. Active: {len(self.actively_hovered_widgets)}")
+                else:
+                    # No config found, widget might not have been bound by our system
+                    # print(f"  No animation config for {widget}, removing from active set if present.")
+                    self.actively_hovered_widgets.discard(widget) # Clean up
+            else: # Widget no longer exists
+                # print(f"  Widget {widget} for purge no longer exists.")
+                self.actively_hovered_widgets.discard(widget) # Clean up
+
+        # It's possible some widgets didn't get removed if _start_animation didn't trigger a change
+        # or if they were disabled. For robustness, clear any remaining that were processed:
+        # for widget in widgets_to_clear: # This might be too aggressive
+        #     self.actively_hovered_widgets.discard(widget)
+        # The removal logic inside _revert_hover should be the primary mechanism.
+        print(f"DEBUG: force_clear_all_hover_effects finished. Active: {len(self.actively_hovered_widgets)}")
+
+
+
+    def _bind_button_events_custom_fg(self, button, on_button_hover_enter, on_button_hover_leave, on_button_click, default_fg):
+        """
+        WORKAROUND BINDER: Binds events to use smooth animation for BG and FG,
+        IGNORING the passed handler functions, but using the provided default_fg
+        for the normal foreground state.
+        Assumes button is always enabled (no internal state check).
+        """
+        # --- Ignore the passed handler arguments ---
+        # (on_button_hover_enter, on_button_hover_leave, on_button_click)
+        # --- are accepted but NOT USED by this implementation. ---
+
+        try:
+            # --- Get necessary info directly from the button and args ---
+            # Get the background color that the widget has at the time of binding.
+            # This will be the target for 'bg' on hover leave.
+            initial_bg_at_bind = self._get_validated_current_color(button, "bg")
+
+            # The 'default_fg' passed to this function is the target for 'fg' on hover leave.
+            revert_fg_color = default_fg
+            try: # Validate the provided default_fg
+                self._hex_to_rgb(revert_fg_color)
+            except (ValueError, TypeError):
+                print(f"Warning: Invalid default_fg '{revert_fg_color}' for {button}. Using black.")
+                revert_fg_color = "#000000"
+
+
+            # Define hover state colors
+            hover_target_bg = self.global_highlight_color
+            hover_target_fg = "#FFFFFF"  # As per original logic for this function
+
+            # --- Store original/default colors for potential use by _get_validated_current_color
+            # and to define revert targets clearly.
+            if button not in self.widget_original_colors:
+                self.widget_original_colors[button] = {}
+            # Store the BG as it was at bind time, and the custom default FG.
+            self.widget_original_colors[button].update({'bg': initial_bg_at_bind, 'fg': revert_fg_color})
+
+            # --- Define NEW internal animation handlers ---
+            def _internal_on_hover_enter(event, widget=button, ht_bg=hover_target_bg, ht_fg=hover_target_fg):
+                try:
+                    if widget.winfo_exists():
+                        # NOTE: No state check ('widget['state'] == tk.NORMAL') is performed here
+                        self._start_animation(widget, {'bg': ht_bg, 'fg': ht_fg})
+                except tk.TclError: pass
+
+            def _internal_on_hover_leave(event, widget=button, rev_bg=initial_bg_at_bind, rev_fg=revert_fg_color):
+                try:
+                    if widget.winfo_exists():
+                        # NOTE: No state check performed here
+                        self._start_animation(widget, {'bg': rev_bg, 'fg': rev_fg})
+                except tk.TclError: pass
+
+            def _internal_on_destroy(event, widget=button):
+                # Cleanup animation state
+                if widget in self.animation_states:
+                    state = self.animation_states[widget]
+                    anim_id = state.get('anim_id')
+                    if anim_id:
+                        try: widget.after_cancel(anim_id)
+                        except tk.TclError: pass # Widget might be gone or anim_id stale
+                    del self.animation_states[widget]
+                # Cleanup original color storage
+                if widget in self.widget_original_colors:
+                    del self.widget_original_colors[widget]
+                # Cleanup other states if this function were to use them
+                # if widget in self.widget_animation_configs: del self.widget_animation_configs[widget]
+                # if widget in self.actively_hovered_widgets: self.actively_hovered_widgets.discard(widget)
+
+
+            # --- Bind the NEW internal handlers ---
+            button.bind("<Enter>", _internal_on_hover_enter, add='+')
+            button.bind("<Leave>", _internal_on_hover_leave, add='+')
+            button.bind("<Destroy>", _internal_on_destroy, add='+')
+            # --- DO NOT bind <Button-1> ---
+
+        except tk.TclError:
+            # This top-level try-except catches errors if 'button.cget("bg")' fails
+            # (e.g., widget destroyed before/during call).
+            print(f"Warning: Could not bind animated events for widget {button} in _bind_button_events_custom_fg, it might be destroyed.")
+        except Exception as e:
+            print(f"Error in _bind_button_events_custom_fg for {button}: {e}")
+
+
+    def _cleanup_animation_data_for_widget(self, widget):
+        """Cleans up animation state and original color storage for a widget."""
+        if widget in self.animation_states:
+            state = self.animation_states[widget]
+            anim_id = state.get('anim_id')
+            if anim_id:
+                try:
+                    widget.after_cancel(anim_id)
+                except tk.TclError:  # Widget might be gone
+                    pass
+                except Exception as e:
+                    print(f"Error cancelling animation for {widget}: {e}")
+            del self.animation_states[widget]
+
+        if widget in self.widget_original_colors:
+            del self.widget_original_colors[widget]
+
+
+# END OF ANIMATED HOVER CODE
+
+
+    def _start_generic_animation(self, group_key, property_config_list_target, on_complete_callback=None):
+        """
+        Starts or redirects animation for a group of widget properties.
+        Includes support for an optional callback to run on animation completion.
+
+        group_key: Unique key for this animation group.
+        property_config_list_target: List of dicts defining target state:
+            {'widget': widget_obj, 'property': 'bg' or 'fg', 'target_color': hex_str}
+        on_complete_callback: Optional function to call after animation finishes.
+        """
+        # Ensure group state exists
+        if group_key not in self.animation_states:
+            self.animation_states[group_key] = {'anim_id': None, 'start_time': 0}
+        group_state = self.animation_states[group_key]
+
+        # Cancel pending animation for this group
+        if group_state.get('anim_id'):
+            try:
+                self.master.after_cancel(group_state['anim_id'])
+            except tk.TclError: pass
+            group_state['anim_id'] = None
+
+        # Store the callback
+        group_state['on_complete_callback'] = on_complete_callback
+
+        # Build the full property_config_list with start_colors
+        property_config_list_full = []
+        all_widgets_exist = True
+
+        for target_config in property_config_list_target:
+            widget = target_config['widget']
+            prop = target_config['property']
+            target_color = target_config['target_color']
+
+            if not widget or not widget.winfo_exists(): # Check widget existence
+                 all_widgets_exist = False
+                 print(f"DEBUG: Widget {widget} for animation {group_key} does not exist.")
+                 break
+
+            try:
+
+                 current_color_val = widget.cget(prop)
+
+
+                 try:
+                     self._hex_to_rgb(current_color_val) # Test if it's a hex color
+                 except (ValueError, TypeError):
+
+                    if prop == 'fg' and widget in self.fadeable_sidebar_labels:
+                        current_color_val = "#333333" # Assume start is the background
+                        print(f"Warning: Unreadable current FG for {widget}. Starting fade from #333333.")
+                    else:
+                        # Fallback for other properties/widgets not covered by specific logic
+                        print(f"Warning: Unreadable current color '{current_color_val}' for {widget}.{prop}. Using target color as start.")
+                        current_color_val = target_color # Prevent crash, but animation won't happen
+
+            except tk.TclError:
+                 all_widgets_exist = False # Widget may have disappeared between check and cget
+                 print(f"DEBUG: TclError getting color for {widget}.{prop} during animation setup.")
+                 break
+            except Exception as e:
+                 print(f"Error getting color for {widget}.{prop} during animation setup: {e}")
+                 all_widgets_exist = False
+                 break
+
+
+            property_config_list_full.append({
+                'widget': widget, 'property': prop,
+                'start_color': current_color_val, 'target_color': target_color
+            })
+
+        if not all_widgets_exist:
+             # Clean up the group state if we can't proceed
+            if group_key in self.animation_states: del self.animation_states[group_key]
+            print(f"DEBUG: Cancelling generic animation {group_key} due to missing widgets.")
+            return
+
+        group_state['start_time'] = time.time()
+        # Store the full config list in the state so the step function doesn't rebuild it
+        group_state['property_config_list'] = property_config_list_full
+        self._run_generic_animation_step(group_key)
+
+
+    def _run_generic_animation_step(self, group_key):
+        """
+        Performs one step of animation for a group of widget properties.
+        Checks for and runs a completion callback if provided.
+        """
+        group_state = self.animation_states.get(group_key)
+        if not group_state: return # Group state is gone, animation was cancelled or finished
+
+        group_state['anim_id'] = None # Clear current anim_id before scheduling the next one
+
+        start_time = group_state.get('start_time', 0)
+        property_config_list = group_state.get('property_config_list') # Retrieve list from state
+        on_complete_callback = group_state.get('on_complete_callback') # Retrieve callback
+
+        if not property_config_list: # Should not happen if start was successful
+            if group_key in self.animation_states: del self.animation_states[group_key]
+            return
+
+        elapsed = time.time() - start_time
+        # Ensure self.transition_duration_sec is not zero
+        duration = self.transition_duration_sec if self.transition_duration_sec > 0 else 0.01
+        progress = min(1.0, elapsed / duration)
+
+        all_widgets_exist = True
+        for config in property_config_list:
+            widget = config['widget']
+            if not widget or not widget.winfo_exists():
+                all_widgets_exist = False
+                break
+        if not all_widgets_exist:
+            print(f"DEBUG: Generic animation step cancelled for {group_key} due to missing widget.")
+            if group_key in self.animation_states: del self.animation_states[group_key]
+            return # Stop animation if any widget is gone
+
+        for config in property_config_list:
+            widget = config['widget']
+            prop = config['property']
+            start_c = config['start_color']
+            target_c = config['target_color']
+            try:
+                current_color = self._interpolate_color(start_c, target_c, progress)
+                # Use try-except per widget config in case one disappears mid-loop
+                if widget.winfo_exists(): # Double check just before config
+                    widget.config(**{prop: current_color})
+            except tk.TclError: pass # Widget might have been destroyed mid-config
+            except Exception as e:
+                 print(f"Error during animation config for {widget}.{prop}: {e}")
+
+
+        if progress < 1.0:
+            delay_ms = 15
+            # Schedule the next step using the same group key
+            anim_id = self.master.after(delay_ms, lambda gk=group_key: self._run_generic_animation_step(gk))
+            group_state['anim_id'] = anim_id # Store the new ID
+        else: # Animation finished
+            # Ensure final colors are set
+            for config in property_config_list:
+                widget = config['widget']
+                prop = config['property']
+                target_c = config['target_color']
+                try:
+                     if widget.winfo_exists(): widget.config(**{prop: target_c})
+                except tk.TclError: pass
+                except Exception as e:
+                     print(f"Error setting final color for {widget}.{prop}: {e}")
+
+
+            # Execute the completion callback if it exists
+            if on_complete_callback:
+                try:
+                    on_complete_callback()
+                except Exception as e:
+                    print(f"Error executing animation completion callback for group '{group_key}': {e}")
+
+            # Clean up state *after* the callback
+            if group_key in self.animation_states:
+                 del self.animation_states[group_key]
+
+
+#window fading code
+
+
+    def _fade_window(self, window, start_alpha, end_alpha, duration_ms, steps, callback=None):
+        """
+        Fades a window's transparency from start_alpha to end_alpha over a duration.
+
+        Args:
+            window: The Tkinter Toplevel or root window to fade.
+            start_alpha: The starting transparency (0.0 to 1.0).
+            end_alpha: The target transparency (0.0 to 1.0).
+            duration_ms: The total duration of the fade in milliseconds.
+            steps: The number of steps for the fade. More steps = smoother, potentially slower.
+            callback: An optional function to call after the fade completes.
+        """
+        # print(f"DEBUG: _fade_window called on {window} from {start_alpha:.2f} to {end_alpha:.2f} over {duration_ms}ms in {steps} steps") # DEBUG
+
+        if not window or not window.winfo_exists():
+            # print("DEBUG: _fade_window - Window non-existent at start.") # DEBUG
+            if callback:
+                try:
+                    callback()
+                except Exception:
+                     pass
+            return
+
+        # Avoid division by zero or unnecessary animation if start and end are the same
+        tolerance = 0.005 # Use a small tolerance for float comparison
+        if abs(end_alpha - start_alpha) < tolerance or steps <= 0 or duration_ms <= 0:
+             # print("DEBUG: _fade_window - No significant change or zero duration/steps, jumping to end.") # DEBUG
+             try:
+                 window.wm_attributes('-alpha', end_alpha)
+             except tk.TclError:
+                 pass # Window might have been destroyed just now
+             if callback:
+                 try:
+                    callback()
+                 except Exception:
+                    pass
+             return
+
+
+        alpha_step = (end_alpha - start_alpha) / steps
+        delay_per_step = max(1, duration_ms // steps) # Ensure delay is at least 1ms if steps > 0
+
+        # Set initial alpha immediately (redundant if caller set it, but safe)
+        try:
+            window.wm_attributes('-alpha', start_alpha)
+        except tk.TclError:
+             # print("DEBUG: _fade_window - Tk Error setting initial alpha.") # DEBUG
+             if callback:
+                 try:
+                     callback()
+                 except Exception:
+                     pass
+             return
+
+
+        def animate_fade(current_step):
+            if not window or not window.winfo_exists():
+                # print(f"DEBUG: _fade_window - Window disappeared during step {current_step}.") # DEBUG
+                if callback:
+                    try:
+                        callback()
+                    except Exception:
+                         pass
+                return
+
+            # Calculate the target alpha for this step
+            target_alpha_this_step = start_alpha + alpha_step * current_step
+
+            # Clamp the alpha to stay within the [0.0, 1.0] range
+            clamped_alpha = max(0.0, min(1.0, target_alpha_this_step))
+
+            # Check if we have reached or surpassed the end_alpha (considering direction)
+            fade_finished = False
+            if alpha_step > 0: # Fading in (alpha is increasing)
+                 if clamped_alpha >= end_alpha - tolerance:
+                     clamped_alpha = end_alpha # Snap to final value
+                     fade_finished = True
+            elif alpha_step < 0: # Fading out (alpha is decreasing)
+                 if clamped_alpha <= end_alpha + tolerance:
+                     clamped_alpha = end_alpha # Snap to final value
+                     fade_finished = True
+            # If alpha_step is 0, this case is handled before the animation starts.
+
+            try:
+                window.wm_attributes('-alpha', clamped_alpha)
+                # print(f"DEBUG: _fade_window - Set alpha to {clamped_alpha:.2f} at step {current_step}") # DEBUG
+            except tk.TclError:
+                 # print(f"DEBUG: _fade_window - Tk Error setting alpha at step {current_step}.") # DEBUG
+                 if callback:
+                     try:
+                         callback()
+                     except Exception:
+                         pass
+                 return
+
+            if not fade_finished and current_step < steps:
+                 # Schedule the next step
+                 window.after(delay_per_step, lambda: animate_fade(current_step + 1))
+            else:
+                 # Animation finished
+                 # print("DEBUG: _fade_window - Animation finished.") # DEBUG
+                 if callback:
+                     try:
+                         callback() # Execute the callback
+                     except Exception:
+                          pass
+
+
+        # Start the animation from step 1 (step 0 is the initial setting)
+        animate_fade(1)
+
+# window animation code 
+
+
+    def _animate_window_height(self, window, target_height, current_height, step, delay, fixed_x, final_width, anchor_y, anchor_point='top'):
+        """
+        Helper method to animate the height of a Toplevel window.
+
+        Args:
+            window: The Toplevel window to animate.
+            target_height: The final height the window should reach.
+            current_height: The current height of the window.
+            step: The amount to increase the height in each step.
+            delay: The delay between steps in milliseconds.
+            fixed_x: The X coordinate of the window's top-left corner (remains constant).
+            final_width: The width of the window (remains constant).
+            anchor_y: The Y coordinate of the edge that should remain fixed
+                      (either the intended fixed top Y or fixed bottom Y).
+            anchor_point: 'top' to anchor the top edge (animates downwards),
+                          'bottom' to anchor the bottom edge (animates upwards).
+                          Defaults to 'top'.
+        """
+        # Calculate the next height in the animation
+        new_height = min(current_height + step, target_height)
+
+        # Determine the new Y position based on the anchor point
+        if anchor_point == 'top':
+            # If anchoring the top, the Y coordinate is simply the anchor_y
+            new_y = anchor_y
+        elif anchor_point == 'bottom':
+            # If anchoring the bottom, the Y coordinate (top edge) moves up
+            # as height increases, relative to the fixed bottom (anchor_y)
+            new_y = anchor_y - new_height
+        else:
+            # Handle invalid anchor_point
+            print(f"Warning: Invalid anchor_point '{anchor_point}'. Using default 'top'.")
+            new_y = anchor_y
+            anchor_point = 'top' # Default
+
+        # Update the window's geometry
+        window.geometry(f"{final_width}x{new_height}+{fixed_x}+{new_y}")
+
+        # If the target height hasn't been reached, schedule the next step
+        if new_height < target_height:
+            window.after(delay, lambda: self._animate_window_height(
+                window,
+                target_height,
+                new_height,       # Pass the updated current height
+                step,
+                delay,
+                fixed_x,          # Pass the fixed X
+                final_width,      # Pass the fixed width
+                anchor_y,         # Pass the fixed anchor Y
+                anchor_point      # Pass the anchor point
+            ))
+        else:
+            # Animation finished, ensure the final geometry is set precisely
+            # Calculate the final Y based on the final height and anchor point
+            final_y = anchor_y
+            if anchor_point == 'bottom':
+                 final_y = anchor_y - target_height
+
+            window.geometry(f"{final_width}x{target_height}+{fixed_x}+{final_y}")
+
+
+
            
         
 #----------------------toggle console-------------------------
 # ------------------------------------------------------------
 
     def toggle_console(self):
+
+        #self.disable_hover_temporarily = True
+
         if not self.is_console_visible:
             self.show_console()
         else:
@@ -23490,7 +27655,7 @@ class ConfigViewerApp:
             sys.stderr = self.console_window  # Redirect stderr to the console window
 
             # Initial message in the console window
-            print("Console output is now redirected here.")
+            print("Console output is now redirected here. Right Click the console output window to see the list of debug shortcuts.")
             print("---")
 
         self.console_window.deiconify() # Show the console window if it was hidden or minimized
@@ -23513,11 +27678,169 @@ class ConfigViewerApp:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+#----------------------------------------------------------------------------------------------
+
+
+    def enter_command(self, event=None):
+        """Opens or brings to front the debug console window."""
+        if self.conwin and self.conwin.winfo_exists():
+            self.conwin.lift()
+            self.conwin.focus_force() # Try to force focus
+            if hasattr(self, 'conwin_command_entry'):
+                self.conwin_command_entry.focus_set()
+            return
+
+        try:
+            # Assuming FadingToplevel is defined. If not, use tk.Toplevel
+            self.conwin = FadingToplevel(self.master, self) # Or FadingToplevel(self.master)
+        except NameError: # Fallback if FadingToplevel isn't defined for this example
+            print("Warning: FadingToplevel not found, using tk.Toplevel.")
+            self.conwin = tk.Toplevel(self.master)
+
+
+        self.conwin.title("Debug Console")
+        self.conwin.geometry("600x400")
+        self.conwin.transient(self.master) # Stays on top of the master window
+        # self.conwin.grab_set() # Makes it modal, uncomment if you want this behavior
+
+        # --- Widgets are now children of self.conwin ---
+
+        # Frame for input
+        input_frame = tk.Frame(self.conwin) # Parent is self.conwin
+        input_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Label(input_frame, text="Cmd:").pack(side=tk.LEFT)
+        self.conwin_command_entry = tk.Entry(input_frame, width=70) # Store as self.conwin_command_entry
+        self.conwin_command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.conwin_command_entry.bind("<Return>", self._conwin_execute_command_event) # Calls helper
+        self.conwin_command_entry.focus_set()
+
+        # Output area
+        self.conwin_output_text = scrolledtext.ScrolledText(self.conwin, wrap=tk.WORD, height=15, state=tk.DISABLED)
+        self.conwin_output_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Frame for buttons
+        button_frame = tk.Frame(self.conwin) # Parent is self.conwin
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+
+        tk.Button(button_frame, text="Execute", command=self._conwin_execute_command_event).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Clear Log", command=self._conwin_clear_log).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Close", command=self._conwin_close_console).pack(side=tk.RIGHT, padx=5)
+
+        self.conwin.protocol("WM_DELETE_WINDOW", self._conwin_close_console)
+
+        self._conwin_insert_output("Debug console initialized. Type Python expressions.\n")
+        self._conwin_insert_output("`self` in commands refers to the main application instance.\n")
+        self._conwin_insert_output("Example: self.some_app_method() or 1 + 1\n")
+
+    def _conwin_insert_output(self, text, tags=None):
+        if not self.conwin or not self.conwin.winfo_exists() or not hasattr(self, 'conwin_output_text'):
+            return
+        self.conwin_output_text.config(state=tk.NORMAL)
+        self.conwin_output_text.insert(tk.END, text, tags)
+        self.conwin_output_text.see(tk.END)
+        self.conwin_output_text.config(state=tk.DISABLED)
+
+    def _conwin_clear_log(self):
+        if not self.conwin or not self.conwin.winfo_exists() or not hasattr(self, 'conwin_output_text'):
+            return
+        self.conwin_output_text.config(state=tk.NORMAL)
+        self.conwin_output_text.delete(1.0, tk.END)
+        self.conwin_output_text.config(state=tk.DISABLED)
+
+    def _conwin_close_console(self):
+        if self.conwin and self.conwin.winfo_exists():
+            self.conwin.destroy()
+        self.conwin = None # Allow it to be reopened
+
+    def _conwin_execute_command_event(self, event=None):
+        if not self.conwin or not self.conwin.winfo_exists() or not hasattr(self, 'conwin_command_entry'):
+            return
+
+        command_string = self.conwin_command_entry.get()
+        if not command_string.strip():
+            return
+
+        self._conwin_insert_output(f">>> {command_string}\n", ("input_command",))
+        self.conwin_command_entry.delete(0, tk.END)
+
+        # --- Check attribute (self here is the main app instance) ---
+        if command_string.isidentifier():
+            try:
+                attr = getattr(self, command_string, None) # 'self' IS the app_instance
+                if callable(attr):
+                    self._conwin_insert_output(f"Info: '{command_string}' is a callable method of the app instance.\n", ("info",))
+                elif attr is not None:
+                    self._conwin_insert_output(f"Info: '{command_string}' is an attribute (not callable).\n", ("info",))
+                else:
+                    self._conwin_insert_output(f"Info: '{command_string}' is not a direct attribute.\n", ("info",))
+            except Exception as e:
+                self._conwin_insert_output(f"Info: Error checking attribute '{command_string}': {e}\n", ("error",))
+
+        try:
+            eval_globals = {
+                "self": self,  # 'self' of YourMainApplicationClass IS the app_instance
+                "app": self,   # Alias
+                "__builtins__": __builtins__,
+            }
+            result = eval(command_string, eval_globals)
+
+            if result is not None:
+                self._conwin_insert_output(f"{repr(result)}\n", ("result",))
+            else:
+                self._conwin_insert_output("Command executed (returned None or no return value).\n", ("info",))
+
+        except SyntaxError as se:
+            self._conwin_insert_output("SyntaxError: Invalid Python syntax.\n", ("error",))
+            self._conwin_insert_output(f"{traceback.format_exc(limit=0)}\n", ("traceback_info",))
+            self._conwin_insert_output("Hint: `eval()` for expressions. `exec()` for statements (e.g. assignments).\n", ("info",))
+        except Exception as e:
+            self._conwin_insert_output(f"Error: {type(e).__name__}: {e}\n", ("error",))
+            tb_lines = traceback.format_exc().splitlines()
+            # Basic filtering to make traceback cleaner for app-specific issues
+            filtered_tb = [line for line in tb_lines if "_conwin_" not in line and "tkinter" not in line]
+            self._conwin_insert_output("\n".join(filtered_tb) + "\n", ("traceback_info",))
+
+        if hasattr(self, 'conwin_output_text'): # Check if text widget still exists
+            self.conwin_output_text.tag_config("input_command", foreground="blue")
+            self.conwin_output_text.tag_config("result", foreground="green")
+            self.conwin_output_text.tag_config("error", foreground="red", font=('TkDefaultFont', 9, 'bold'))
+            self.conwin_output_text.tag_config("info", foreground="gray")
+            self.conwin_output_text.tag_config("traceback_info", foreground="purple", font=('TkFixedFont', 8))
+
+
+
+
+
+
+
+
+    # Helper to check if a folder name is likely vanilla
+    def _is_vanilla_folder(self, folder_name):
+        if not folder_name or not hasattr(self, 'ZIP_BASE_NAMES'):
+            return False # Cannot determine if attributes missing
+        # Ensure case-insensitive comparison
+        return folder_name.lower() in [name.lower() for name in self.ZIP_BASE_NAMES]
+
+
 # ------------------------------------------------------------
 #------MAIN------MAIN------MAIN------MAIN------MAIN------MAIN-
 # ------------------------------------------------------------
       
-      
+
       
       
       
@@ -23625,6 +27948,7 @@ def main():
 
     delete_lua_path = script_dir / "data/Delete.lua"
 
+    #this really shouldn't happen, this file is and should always be included with the package
     if not os.path.exists(delete_lua_path):
         with open(delete_lua_path, "w") as f:
             f.write("local file = io.open(\"mods/EllexiumModManager/data/commandconfirmation.txt\", \"w\")\n")
@@ -23676,15 +28000,15 @@ def main():
 
     
 
-    first_time_run_check_folder = os.path.join(script_dir, "data/empty_folder_check")
+    first_time_run_check_file = os.path.join(script_dir, "data/first_time_run_check_file.txt")
 
     initial_scan_win_txt_file = os.path.join(script_dir, "data/initial_scan_win_text.txt")
 
-    if not os.path.exists(first_time_run_check_folder):
+    if not os.path.exists(first_time_run_check_file):
         try:
             with open(initial_scan_win_txt_file, "w", encoding='utf-8') as f:
-                f.write("Loading Stage: Launching Ellexium Mod Manager for the first time...")
-            print(f"Successfully wrote initial content: Loading Stage: Launching Ellexium Mod Manager for the first time...'")
+                f.write("Loading Stage: Launching Ellexium's Advanced Vehicle Selector for the first time...")
+            print(f"Successfully wrote initial content: Loading Stage: Launching Ellexium's Advanced Vehicle Selector for the first time...'")
         except Exception as e:
             print(f"Error writing initial content to file: {e}")
 
@@ -23841,9 +28165,9 @@ def main():
 
 
 
-    target_line_start = "Loading Stage: Launching Ellexium Mod Manager for the first time..."
+    target_line_start = "Loading Stage: Launching Ellexium's Advanced Vehicle Selector for the first time..."
     # The content to write if the file needs to be created/reset
-    initial_write_content = "Loading Stage: Initializing Ellexium Mod Manager..."
+    initial_write_content = "Loading Stage: Initializing Ellexium's Advanced Vehicle Selector..."
 
     # --- Logic ---
     needs_initial_write = False
@@ -23865,6 +28189,7 @@ def main():
                         break # Stop reading once found
 
             if special_line_found:
+
                 print("Target line found indicating first launch.")
 
 
@@ -23878,9 +28203,9 @@ def main():
 
                 # Define shortcut parameters
                 bat_file = "EllexiumModManagerLauncher.bat" # Your BAT file name
-                shortcut_name = "Ellexium Mod Manager"     # Name on the desktop
+                shortcut_name = "Ellexium's Advanced Vehicle Selector"     # Name on the desktop
                 icon_file_relative = "data/icon_converted.ico" # Relative path from script_dir
-                description = "Launch Ellexium Mod Manager"     # Optional description
+                description = "Launch Ellexium's Advanced Vehicle Selector"     # Optional description
 
                 # --- NEW: Set Icon for the Temporary Root Window ---
                 print(f"Attempting to set icon for temporary messagebox parent...")
@@ -23901,12 +28226,17 @@ def main():
                 # Ask the user if they want the shortcut (messagebox will inherit icon from temp_root_shortcut)
                 create_shortcut = messagebox.askyesno(
                     "Create Desktop Shortcut?",
-                    f"Thanks for trying out the Ellexium Mod Manager.\n\n"
+                    f"Thanks for trying out Ellexium's Advanced Vehicle Selector.\n\n"
                     f"Would you like to create a shortcut on the desktop "
-                    f"to quickly launch the manager?",
+                    f"to quickly launch the application?",
                     parent=temp_root_shortcut # Parent to the temporary window
                 )
 
+                proceed_with_text = ("\n\nPlease note that first time initialization may take a couple more minutes than normal and the application may appear to be unresponsive during this time."
+                                     "\n\nIf you experience bugs, face any other issues, or would just like talk about the application, you may leave a message on the forum post. Your feedback is welcome!"
+                                     "\n\nImportant note: Before migrating to a newer version (like for example 0.34 to 0.35), please take the EllexiumModManager folder out of the mods folder, place it "
+                                     "somewhere else (like on the desktop), then put it into the new mods folder to avoid issues.")
+                
                 if create_shortcut:
                     print("User chose Yes. Creating shortcut...")
                     # Call the pywin32 version of the function
@@ -23919,12 +28249,12 @@ def main():
                     )
                     if success:
                         # This messagebox will also inherit the icon
-                        messagebox.showinfo("Success", "Desktop shortcut created successfully! Proceeding with first time initialization.\n\nPlease note that first time initialization may take a couple more minutes than normal and the application may appear to be unresponsive during this time.\n\nIf you experience bugs, face any other issues, or would just like talk about the manager, you may leave a message on the forum post. Your feedback is welcome!", parent=temp_root_shortcut)
+                        messagebox.showinfo("Success", f"Desktop shortcut created successfully! Proceeding with first time initialization.{proceed_with_text}", parent=temp_root_shortcut)
                     # Error message is shown within the function (parented correctly)
                 else:
                     print("User chose No. Shortcut not created.")
                     # This messagebox will also inherit the icon
-                    messagebox.showinfo("Skipped", "Shortcut creation skipped. Proceeding with first time initialization.\n\nnPlease note that first time initialization may take a couple more minutes than normal and the application may appear to be unresponsive during this time.\n\nIf you experience bugs, face any other issues, or would just like talk about the manager, you may leave a message on the forum post. Your feedback is welcome!", parent=temp_root_shortcut)
+                    messagebox.showinfo("Skipped", f"Shortcut creation skipped. Proceeding with first time initialization.{proceed_with_text}", parent=temp_root_shortcut)
 
                 # --- IMPORTANT: Destroy the temporary Tkinter root ---
                 temp_root_shortcut.destroy()
@@ -24488,7 +28818,14 @@ def main():
     try:
         with open(initial_scan_win_txt_file, "w") as f:
             print(f"Writing Stage 4 to initial_scan_win.txt file at: {initial_scan_win_txt_file}")
-            f.write("Loading Stage: Finalizing initialization process...")
+
+            dev_mode_check = script_dir / "dev_mode.txt"
+
+            if os.path.exists(dev_mode_check):
+                f.write("Loading Stage: Finalizing initialization process... (Development Mode)")
+            else:
+                f.write("Loading Stage: Finalizing initialization process...")
+
     except Exception as e:
         print(f"Error writing to initial_scan_win.txt: {e}")
 
