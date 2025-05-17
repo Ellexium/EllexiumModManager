@@ -195,6 +195,7 @@ def on_mousewheel_main(app, event):
     # --- NEW: Set scrolling flag to True ---
     app.is_scrolling_main_grid = True
 
+
     if os.name == 'nt':
         delta = int(-1 * (event.delta / 120))
     else:
@@ -233,10 +234,21 @@ def start_scroll_debounce_timer_main_grid(app):
     if app.scroll_debounce_timer_id:
         app.master.after_cancel(app.scroll_debounce_timer_id) # Cancel existing timer
 
+
     app.scroll_debounce_timer_id = app.master.after(
         app.scroll_debounce_delay,
         lambda: on_scroll_debounce_complete_main_grid(app) # Callback when timer finishes
     )
+
+
+
+def on_scroll_debounce_complete_main_grid_unhide_mouse(app):
+    """Callback function when main grid scroll debounce timer completes.
+    Made to unhide the mouse
+    """
+    print("restoring cursor position")
+    app.scroll_mouse_unhide_timer_id = None  # Clear timer ID
+
 
 
 def on_scroll_debounce_complete_main_grid(app):
@@ -246,6 +258,8 @@ def on_scroll_debounce_complete_main_grid(app):
     """
     app.is_scrolling_main_grid = False  # Reset scrolling flag to False
     app.scroll_debounce_timer_id = None  # Clear timer ID
+
+    
     print("Main Grid Scroll Debounce Complete - Hovers Re-enabled - Checking Mouse Position...")  # Debug print
 
     # --- NEW: Check mouse position and widget ---
@@ -281,10 +295,13 @@ def on_scroll_debounce_complete_main_grid(app):
 
         if item_frame and app.is_descendant_of(item_frame, app.scrollable_frame):  # Check if part of main grid
             #print("Mouse is over a main grid item (descendant of scrollable_frame)")  # Debug
+            
+
 
             # --- NEW: Trigger sidebar update ALWAYS if mouse is over a main grid item (Image Label or Info Label) ---
             pil_image, info_data, picture_path, zip_file, folder_name, spawn_cmd, img_label_widget, info_label_widget = item_frame.item_data_tuple  # Get stored data (now with labels)
             app.show_main_sidebar_info(info_data, picture_path, zip_file, folder_name, item=(picture_path, spawn_cmd, zip_file, info_data, folder_name))  # Call sidebar update
+
             print("Sidebar updated (triggered by debounce complete)")  # Debug
 
             # --- MODIFIED Highlight Logic: Trigger background change for IMAGE LABEL (lbl_img) ---
@@ -387,6 +404,7 @@ def animate_scroll_main(app, step):
     if step > app.scroll_animation_steps:
         app.canvas.yview_moveto(app.scroll_target_yview) # Final position - ensure target is reached exactly
         app.scroll_animation_timer = None  # Animation finished
+
         return
 
     easing_factor = ease_out_quintic_modified_speed(step / app.scroll_animation_steps, speed_factor=1.8)
@@ -495,6 +513,26 @@ def calculate_columns_for_width(app, width, is_details=False): #using the window
     print(f"DEBUG: calculate_columns_for_width - width_based_subtraction (before return): {width_based_subtraction}")
     print(f"DEBUG: [calculate_columns_for_width] - END Function Execution - About to RETURN") # <-- ADD THIS LINE - END
 
+
+    # minsize of window prevents this from being less than 2
+    if num_columns == 2:
+        app.grid_layout_split_value = 260
+    elif num_columns == 3:
+        app.grid_layout_split_value = 380
+    elif num_columns == 4:
+        app.grid_layout_split_value = 400
+    elif num_columns == 5:
+        app.grid_layout_split_value = 675
+    elif num_columns == 6:
+        app.grid_layout_split_value = 810
+    elif num_columns == 7:
+        app.grid_layout_split_value = 945
+    elif num_columns >= 8:
+        app.grid_layout_split_value = 1080
+    else:
+        app.grid_layout_split_value = 260 # fallback
+
+
     return num_columns, h_padding
     
     
@@ -517,3 +555,6 @@ def animate_scroll_search_results(app, step, canvas_sub):
         app.scroll_animation_duration // app.scroll_animation_steps,
         lambda: animate_scroll_search_results(app, step + 1, canvas_sub)
     )
+
+
+
