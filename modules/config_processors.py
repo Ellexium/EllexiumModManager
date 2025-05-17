@@ -514,6 +514,97 @@ def run_mod_command_line_config_gen_custom_integrated(script_dir, user_folder, c
     debug_print("  MOD_COMMAND_LINE_CONFIG_GEN_CUSTOM.py process completed (integrated method).") # Confirmation print - NEW
     debug_print("--- run_mod_command_line_config_gen_custom_integrated() EXIT - EXTREME DEBUGGING - PATHLIB IMPORTED ---\n") # Debug Exit - EXTREME DEBUGGING - PATHLIB IMPORTED
 
+
+def reorder_output_good(output_good_path, vanilla_zip_base_names):
+    """
+    Reads outputGOOD.txt, identifies vanilla entries, and rewrites the file
+    with vanilla entries placed at the top.
+
+    Args:
+        output_good_path (pathlib.Path): The path to the outputGOOD.txt file.
+        vanilla_zip_base_names (list or set): A list/set of lowercase vanilla zip
+                                               base names (e.g., ['pickup', 'covet']).
+    """
+    print(f"\n--- Reordering {output_good_path.name} ---")
+    if not output_good_path.is_file():
+        print(f"  WARNING: {output_good_path.name} not found. Skipping reordering.")
+        return
+
+    vanilla_entries = []
+    mod_entries = []
+    current_entry = []
+    is_current_entry_vanilla = False
+
+    try:
+        with open(output_good_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            stripped_line = line.strip()
+
+            # Identify the start of a new entry block (package line)
+            if "(package)" in stripped_line:
+                # Process the previous entry block if it exists
+                if current_entry:
+                    if is_current_entry_vanilla:
+                        vanilla_entries.extend(current_entry)
+                    else:
+                        mod_entries.extend(current_entry)
+                    # print(f"  Processed previous block ({'Vanilla' if is_current_entry_vanilla else 'Mod'}). Lines: {len(current_entry)}")
+
+                # Start a new entry
+                current_entry = [line] # Start with the package line
+                is_current_entry_vanilla = False # Reset flag
+
+                # Determine if this new entry is vanilla
+                try:
+                    # Extract zip filename (robustly handle potential variations)
+                    package_part = stripped_line.split(" (package)")[0].strip()
+                    zip_filename = os.path.basename(package_part) # Get just the filename.zip
+                    zip_base_name = os.path.splitext(zip_filename)[0].lower() # Get base name, lowercase
+
+                    if zip_base_name in vanilla_zip_base_names:
+                        is_current_entry_vanilla = True
+                        # print(f"  Detected VANILLA entry starting with: {stripped_line}")
+                    # else:
+                        # print(f"  Detected MOD entry starting with: {stripped_line}")
+
+                except Exception as e:
+                    print(f"  WARNING: Could not parse package line '{stripped_line}': {e}")
+                    # Treat as mod if parsing fails
+                    is_current_entry_vanilla = False
+
+            elif current_entry: # If we are already inside an entry block
+                current_entry.append(line)
+
+            # Optional: Handle lines that appear before the first package line (shouldn't happen in valid file)
+            elif not current_entry and stripped_line:
+                 print(f"  WARNING: Line found before first package line, treating as mod entry: {stripped_line}")
+                 mod_entries.append(line)
+
+
+        # Process the very last entry block after the loop finishes
+        if current_entry:
+            if is_current_entry_vanilla:
+                vanilla_entries.extend(current_entry)
+            else:
+                mod_entries.extend(current_entry)
+            # print(f"  Processed FINAL block ({'Vanilla' if is_current_entry_vanilla else 'Mod'}). Lines: {len(current_entry)}")
+
+        # Combine the lists: vanilla first, then mods
+        reordered_lines = vanilla_entries + mod_entries
+
+        # Write the reordered content back to the file
+        with open(output_good_path, 'w', encoding='utf-8', errors='replace') as f:
+            f.writelines(reordered_lines)
+
+        print(f"  Finished reordering. Vanilla entries: {len(vanilla_entries)} lines, Mod entries: {len(mod_entries)} lines.")
+        print(f"--- Reordering {output_good_path.name} Complete ---")
+
+    except Exception as e:
+        print(f"  ERROR during reordering of {output_good_path.name}: {e}")
+
+        
 def process_lines(self, lines, full_data, is_custom):
     """
     Processes lines (regular or custom) and updates the provided full_data dictionary.
