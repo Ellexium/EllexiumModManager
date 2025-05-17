@@ -1,4 +1,4 @@
-# Ellexium’s (aka Day420) Mod Manager/Vehicle Selector
+# Ellexium’s (aka Day420) Advanced Vehicle Selector
 
 
 
@@ -7,15 +7,15 @@
 
 # How to Install?
 
-- Copy the EllexiumModManager folder from the EllexiumModManager zip attached to this post and put it in your Mods folder.
+Copy the EllexiumModManager folder from the EllexiumModManager zip attached to this post and put it in your Mods folder.
 
 
-- Don't take the contents out of the folder. Put the folder in the mods directory as is. After that, double click the EllexiumModManager.bat file to run it.
+Don't take the contents out of the folder. Put the folder in the mods directory as is. After that, double click the EllexiumModManagerLauncher.bat file to run it.
 
-- Ensure that BeamNG.drive is always running before you run the EllexiumModManager.bat file. You don't have to be loaded into a map or anything, the game just needs to be running so the application can look through the game's files and properly display default vehicle configurations. It does not modify any of the game's files. The first launch will be very slow as it copies the files initially, but subsequent runs will be faster since the files will be copied already.
+Ensure that BeamNG.drive is always running before you run the EllexiumModManager.bat file. You don't have to be loaded into a map or anything, the game just needs to be running so the application can look through the game's files and properly display default vehicle configurations. It does not modify any of the game's files. The first launch will be very slow as it copies the files initially, but subsequent runs will be faster since the files will be copied already.
 
 
-# Some features include:
+Some features include:
 
 - Seamless and much faster than default switching between the game and the selector using a customizable shortcut or the switcher window.
 
@@ -90,6 +90,46 @@ Hope you enjoy if you give it a try!
 
 # Update History (from newest to oldest)
 # ---------------------------------------
+# Version: 0.2.0 (Public Experimental Snapshot - 15th Release | May 17, 2025
+
+
+- Added smooth animations to buttons, windows appearing and closing, and tooltips.
+
+- Added an optional Pinned favorites category to the main list so you can immediately see which vehicles and configs you have favorited.
+
+- Added an option to the settings menu to allow you to customize which categorization mode you'd like to have on startup.
+
+- Added an option to the settings menu that allows you to keep the details list open when spawning and replacing configurations.
+
+- Added an option that allows you to clear BeamNG's vehicle cache. This will clean the vehicle cache specifically in a targeted way that should help with vehicle material and texture issues without having to reload the cache for everything non-vehicle related else as well.
+
+- Added options to the Player Vehicle and Spawn Vehicle drop downs that allow for: Spawning/Replacing with a random Car specifically, or Spawning/Replacing with a random Bus/Truck/Van specifically.
+
+- Added options to the Spawn Vehicles dropdown to spawn just parked traffic vehicles, or spawn just moving traffic vehicles.
+
+- Added a label to the top of the details list that indicates if the list is filtered and the type of filter that may be applied.
+
+- Made category orders more consistent overall - so when searching or filtering the categories are highly likely to remain in the same order throughout the entire session.
+
+- When the categorization mode is None, and installation date sorting isn't applied, the main list ordering will more closely resemble vanilla BeamNG's.
+
+- Improved loading mechanisms when hiding and unhiding categories.
+
+- Optimized configuration loading in many cases in the details list.
+
+- Fixed cases where the notification window could get stuck on "Checking for changes..." and not go away.
+
+- Fixed cases where some vehicles and configs would be thrown under unknown categories and have their information missing by reorganizing the prioritization order of data loading.
+
+- Fixed bugs that caused the main list of vehicles to become invisible in certain cases after resizing or changing the UI scale.
+
+- Fixed the "Remove All Other Vehicles" and "Spawn Traffic and Parked Vehicles" buttons not working correctly due to changes from the 0.35 BeamNG.drive update.
+
+- Fixed many cases where the main list visually glitching out and tearing frames could occur if scrolling was done quickly.
+
+
+
+
 # Version: 0.1.9 (Public Experimental Snapshot - 14th Release | April 13, 2025)
 
 
