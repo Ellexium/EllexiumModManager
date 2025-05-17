@@ -5,6 +5,10 @@ import os
 import random # Import the random module
 from pathlib import Path
 import re # Import the regular expression module
+import time
+
+
+
 
 
 class CustomSlider(tk.Frame):
@@ -233,12 +237,22 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
 
         # Set scaling factor - only if running standalone, otherwise inherit from master
         if master is None:
-            self.tk.call('tk', 'scaling', 1.25)
+            try:
+                # Use try-except for safety if tk not fully initialized
+                self.tk.call('tk', 'scaling', 1.25)
+            except tk.TclError as e:
+                print(f"Could not set Tk scaling: {e}")
 
         self.title("Pick Color") # Changed title
         self.configure(bg="#333333") # Set background for the main window
 
         self.font_size_add = self._load_font_size_setting()
+
+        # --- Animation Parameters (INITIALIZED HERE) ---
+        self.widget_original_colors = {} # Stores original colors for widgets
+        self.animation_states = {}      # Tracks ongoing animations
+        self.global_highlight_color = "orange" # Default hover color for backgrounds/highlights
+        self.transition_duration_sec = 0.15   # Animation speed
 
         # Main frame to contain everything and handle centering
         self.main_frame = tk.Frame(self, bg="#333333")
@@ -254,130 +268,454 @@ class ColorPickerApp(tk.Toplevel): # Changed from tk.Tk to tk.Toplevel
         # Font for all widgets
         font = ("Segoe UI", 12+self.font_size_add)
 
-        # Button default and hover colors
+        # Button default and hover colors (Used for initial setup and binding)
         button_default_bg = "#555555"
         button_default_fg = "white"
-        button_hover_bg = "orange"
-        button_hover_fg = "white"
+        # hover_bg will default to self.global_highlight_color ("orange")
+        button_hover_fg = "white" # Can be customized if needed
 
-        self.randomize_button = tk.Button(self.main_frame, text="Randomize", command=self.randomize_settings, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0) # Renamed button and command
-        self.randomize_button.grid(row=1, column=0, columnspan=2, pady=10, sticky="ew") # Span 2 columns in main_frame
+        # --- Create Buttons (with active colors for click feedback) ---
+        self.randomize_button = tk.Button(self.main_frame, text="Randomize", command=self.randomize_settings, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0, activebackground="white", activeforeground="black")
+        self.randomize_button.grid(row=1, column=0, columnspan=2, pady=10, sticky="ew")
 
-        self.replace_current_button = tk.Button(self.main_frame, text="Replace Current", command=self.replace_current_vehicle_lua, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0) # New Replace Current button
-        self.replace_current_button.grid(row=5, column=0, columnspan=2, pady=5, sticky="ew") # Column 0, moved below sliders and span 2 cols now
+        self.replace_current_button = tk.Button(self.main_frame, text="Replace Current", command=self.replace_current_vehicle_lua, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0, activebackground="white", activeforeground="black")
+        self.replace_current_button.grid(row=5, column=0, columnspan=2, pady=5, sticky="ew")
 
-        self.spawn_new_button = tk.Button(self.main_frame, text="Spawn New", command=self.spawn_new_vehicle_lua, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0) # New Spawn New button
-        self.spawn_new_button.grid(row=6, column=0, columnspan=2, pady=10, sticky="ew") # Column 0, moved below replace and span 2 cols now
+        self.spawn_new_button = tk.Button(self.main_frame, text="Spawn New", command=self.spawn_new_vehicle_lua, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0, activebackground="white", activeforeground="black")
+        self.spawn_new_button.grid(row=6, column=0, columnspan=2, pady=10, sticky="ew")
 
-        # New: Close Button - remains the same
-        self.close_button = tk.Button(self.main_frame, text="Close", command=self.close_window, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0) # New Close button
-        #self.close_button.grid(row=7, column=0, columnspan=2, pady=10, sticky="ew") # Placed below other buttons, span 2 cols
-
-        # Hover effect functions for buttons - remain the same
-        def on_enter_button(event):
-            event.widget.config(bg=button_hover_bg, fg=button_hover_fg)
-
-        def on_leave_button(event):
-            event.widget.config(bg=button_default_bg, fg=button_default_fg)
-
-        self.randomize_button.bind("<Enter>", on_enter_button)
-        self.randomize_button.bind("<Leave>", on_leave_button)
-        self.replace_current_button.bind("<Enter>", on_enter_button)
-        self.replace_current_button.bind("<Leave>", on_leave_button)
-        self.spawn_new_button.bind("<Enter>", on_enter_button)
-        self.spawn_new_button.bind("<Leave>", on_leave_button)
-        self.close_button.bind("<Enter>", on_enter_button)
-        self.close_button.bind("<Leave>", on_leave_button)
+        # New: Close Button
+        self.close_button = tk.Button(self.main_frame, text="Close", command=self.close_window, font=font, bg=button_default_bg, fg=button_default_fg, relief=tk.FLAT, highlightthickness=0, activebackground="white", activeforeground="black")
+        # If you want to show the close button, uncomment the grid line below
+        # self.close_button.grid(row=7, column=0, columnspan=2, pady=10, sticky="ew")
 
 
-        # Sliders Frame to hold all sliders and labels in columns - remain the same
+
+        # --- ADD NEW ANIMATED BINDINGS (AFTER BUTTON CREATION) ---
+        self._bind_animated_hover(self.randomize_button, button_default_bg, button_default_fg, hover_fg=button_hover_fg, check_state=False) # Button state doesn't change currently
+        self._bind_animated_hover(self.replace_current_button, button_default_bg, button_default_fg, hover_fg=button_hover_fg, check_state=False)
+        self._bind_animated_hover(self.spawn_new_button, button_default_bg, button_default_fg, hover_fg=button_hover_fg, check_state=False)
+        self._bind_animated_hover(self.close_button, button_default_bg, button_default_fg, hover_fg=button_hover_fg, check_state=False) # If using close button
+
+        # Sliders Frame
         self.sliders_frame = tk.Frame(self.main_frame, bg="#333333")
-        self.sliders_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10) # Span 2 columns, expand
+        self.sliders_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10)
+        self.sliders_frame.columnconfigure(0, weight=1) # Labels column
+        self.sliders_frame.columnconfigure(1, weight=1) # Sliders column
 
-        # Column configure for sliders_frame - important for layout! - remain the same
-        self.sliders_frame.columnconfigure(0, weight=1) # Weight for labels column
-        self.sliders_frame.columnconfigure(1, weight=1) # Weight for sliders column
-
-
-        # Labels Frame - New Frame for Labels Column - remain the same
+        # Labels Frame
         self.labels_column_frame = tk.Frame(self.sliders_frame, bg="#333333")
-        self.labels_column_frame.grid(row=0, column=0, sticky="new") # Column 0 for labels, sticky North, East, West
+        self.labels_column_frame.grid(row=0, column=0, sticky="new")
 
-        # Sliders Frame - New Frame for Sliders Column - remain the same
+        # Sliders Frame
         self.sliders_column_frame = tk.Frame(self.sliders_frame, bg="#333333")
-        self.sliders_column_frame.grid(row=0, column=1, sticky="new") # Column 1 for sliders, sticky North, East, West
+        self.sliders_column_frame.grid(row=0, column=1, sticky="new")
 
-        # Base Color Label - Moved to labels column frame - remain the same
+        # Base Color Label
         self.base_color_label = tk.Label(self.labels_column_frame, text="Base Color:", font=font, fg="white", bg="#333333")
-        self.base_color_label.grid(row=0, column=0, sticky="ne", padx=5, pady=7) # Placed at the top of labels column, pady increased
+        self.base_color_label.grid(row=0, column=0, sticky="ne", padx=5, pady=7)
 
-        # Color Swatch - Moved to sliders column frame, next to base color label - remain the same
-        self.color_swatch_canvas = tk.Canvas(self.sliders_column_frame, width=190, height=21, bg="white", highlightthickness=2, relief='solid', bd=1, highlightbackground="#808080") # Initial white swatch
-        self.color_swatch_canvas.grid(row=0, column=1, sticky="nw", padx=5, pady=8) # Placed at the top of sliders column, next to label, pady increased
-        self.color_swatch_canvas.bind("<Button-1>", lambda event: self._open_color_picker_from_swatch()) # Clicking swatch opens color picker - using new method
-        self.color_swatch_canvas.bind("<Enter>", self._on_swatch_enter) # Bind hover enter event for swatch
-        self.color_swatch_canvas.bind("<Leave>", self._on_swatch_leave) # Bind hover leave event for swatch
+        # --- Color Swatch ---
         self.default_swatch_highlightcolor = "#808080" # Store default highlight color
+        swatch_hover_highlightcolor = self.global_highlight_color # Use global orange for hover
 
-        # Sliders for paint properties - using grid inside respective column frames - remain the same
+        self.color_swatch_canvas = tk.Canvas(self.sliders_column_frame, width=190, height=21, bg="white", highlightthickness=2, relief='solid', bd=1, highlightbackground=self.default_swatch_highlightcolor) # Use variable
+        self.color_swatch_canvas.grid(row=0, column=1, sticky="nw", padx=5, pady=8)
+
+        # Keep the click binding for the swatch
+        self.color_swatch_canvas.bind("<Button-1>", lambda event: self._open_color_picker_from_swatch()) # Opens color picker
+
+        # --- REMOVED OLD SWATCH BINDINGS (<Enter>/<Leave>) ---
+
+        # --- ADD NEW ANIMATED BINDING FOR SWATCH HIGHLIGHT ---
+        self._bind_animated_hover(
+            widget=self.color_swatch_canvas,
+            original_bg=self.default_swatch_highlightcolor, # The color to animate
+            original_fg=self.color_swatch_canvas.cget("bg"), # Dummy FG - not used by canvas highlight
+            hover_bg=swatch_hover_highlightcolor,         # Target color for animation
+            hover_fg=None,                                # Dummy FG
+            property_to_animate="highlightbackground",    # <<< Animate this property
+            check_state=True                              # Swatch can be disabled
+        )
+
+        # --- Sliders for paint properties ---
         self.clearcoat_label = tk.Label(self.labels_column_frame, text="Clearcoat:", font=font, fg="white", bg="#333333")
-        # --- ADDED font_size_add ---
         self.clearcoat_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoat, font_size_add=self.font_size_add, bg="#333333")
         self.clearcoat_label.grid(row=1, column=0, sticky='ne', padx=5, pady=7)
         self.clearcoat_slider.grid(row=1, column=1, sticky='ew', padx=5, pady=7)
 
-
         self.clearcoatRoughness_label = tk.Label(self.labels_column_frame, text="Clearcoat Roughness:", font=font, fg="white", bg="#333333")
-        # --- ADDED font_size_add ---
         self.clearcoatRoughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_clearcoatRoughness, font_size_add=self.font_size_add, bg="#333333")
         self.clearcoatRoughness_label.grid(row=2, column=0, sticky='ne', padx=5, pady=7)
         self.clearcoatRoughness_slider.grid(row=2, column=1, sticky='ew', padx=5, pady=7)
 
-
         self.metallic_label = tk.Label(self.labels_column_frame, text="Metallic:", font=font, fg="white", bg="#333333")
-        # --- ADDED font_size_add ---
         self.metallic_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_metallic, font_size_add=self.font_size_add, bg="#333333")
         self.metallic_label.grid(row=3, column=0, sticky='ne', padx=5, pady=7)
         self.metallic_slider.grid(row=3, column=1, sticky='ew', padx=5, pady=7)
 
-
         self.roughness_label = tk.Label(self.labels_column_frame, text="Roughness:", font=font, fg="white", bg="#333333")
-        # --- ADDED font_size_add ---
         self.roughness_slider = CustomSlider(self.sliders_column_frame, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL, command=self.update_roughness, font_size_add=self.font_size_add, bg="#333333")
         self.roughness_label.grid(row=4, column=0, sticky='ne', padx=5, pady=7)
         self.roughness_slider.grid(row=4, column=1, sticky='ew', padx=5, pady=7)
 
+        # --- Save Button ---
+        save_button_default_bg = "#555555" # Specific color for save button when disabled/enabled
+        save_button_default_fg = "white"
+        save_button_disabled_fg = "#AAAAAA" # Lighter grey when disabled
+        save_button_hover_fg = "white"
 
-        self.save_button = tk.Button(self.main_frame, text="Save File", command=self.save_file, state=tk.DISABLED, font=font, bg="#555555", fg="white", relief=tk.FLAT, highlightthickness=0) # Initially disabled save button
-        # self.save_button.grid(row=6, column=0, columnspan=2, pady=10, sticky="ew") # Span 2 columns in main_frame # Removed from layout
+        self.save_button = tk.Button(self.main_frame, text="Save File", command=self.save_file, state=tk.DISABLED, font=font, bg=save_button_default_bg, fg=save_button_disabled_fg, relief=tk.FLAT, highlightthickness=0, activebackground=self.global_highlight_color, activeforeground=save_button_hover_fg) # Start with disabled fg
+        # self.save_button.grid(...) # Grid if needed
+
+        # --- ADD NEW ANIMATED BINDING FOR SAVE BUTTON ---
+        # We use save_button_default_fg as the 'original_fg' for the binder,
+        # because the actual fg will be updated by enable/disable_controls.
+        # The binder needs a consistent 'normal state' foreground to revert to.
+        # The check_state=True ensures hover only works when NORMAL.
+        self._bind_animated_hover(
+            widget=self.save_button,
+            original_bg=save_button_default_bg, # Normal background
+            original_fg=save_button_default_fg, # Normal foreground (used by binder logic)
+            hover_fg=save_button_hover_fg,    # Hover foreground
+            check_state=True                 # IMPORTANT: Save button state changes
+        )
+        # Note: We will manage the actual foreground color (white/grey) in enable/disable_controls
 
         self.file_label = tk.Label(self.main_frame, text="File: No file loaded", font=font, fg="white", bg="#333333")
-        # self.file_label.grid(row=7, column=0, columnspan=2, pady=5, sticky="ew") # Span 2 columns in main_frame # Removed from layout
+        # self.file_label.grid(...) # Grid if needed
 
-
+        # --- Instance Variables ---
         self.data = None
         self.filepath = None
 
-        # Initial disable, moved here so CustomSliders are created before disabling.
-        self.disable_controls()
-        self.update_color_swatch("#FFFFFF") # Initialize swatch to white
+        # --- Initial State ---
+        self.disable_controls() # Disable controls first
+        self.update_color_swatch("#FFFFFF") # Initialize swatch to white (before controls are disabled)
 
         # --- Icon Loading Code ---
-        self.script_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) # Define script_dir for ColorPickerApp
-        icon_path = self.script_dir / "data/icon.png"
+        try:
+             # Correct path calculation assuming script is in a subfolder
+             script_dir_path = Path(__file__).parent
+             self.script_dir = script_dir_path.parent # Go up one level
+             icon_path = self.script_dir / "data/icon.png"
 
-        if os.path.exists(icon_path):
+             if icon_path.exists():
+                icon_image = tk.PhotoImage(file=str(icon_path))
+                self.iconphoto(False, icon_image)
+             else:
+                 print(f"Icon file not found: {icon_path}")
+        except NameError:
+             # __file__ might not be defined (e.g., in interactive session)
+             print("Warning: Could not determine script directory to load icon.")
+        except tk.TclError as e: # Catch potential TclError for image loading issues
+            print(f"Error loading icon: {e}")
+            print(f"Make sure icon file is a valid PNG.")
+        except Exception as e: # Catch other potential errors
+            print(f"An unexpected error occurred during icon loading: {e}")
+
+
+        # --- Protocol Handler for Window Close Button ---
+        self.protocol("WM_DELETE_WINDOW", self.close_window) # Ensure proper cleanup on X button
+
+        # --- Load File ---
+        self.auto_load_file() # Call auto_load_file at the end of initialization
+
+
+# START OF ANIMATED HOVER CODE
+
+
+    def _hex_to_rgb(self, hex_color):
+        """Converts a hex color string to an RGB tuple (0-255). Handles Tkinter color names too."""
+        try:
+            # Attempt to get RGB directly using winfo_rgb (handles names like 'white', 'orange')
+            # Requires the widget the color is associated with, or the root window
+            # Using self (the Toplevel window) should be safe here.
+            rgb_short = self.winfo_rgb(hex_color)
+            # winfo_rgb returns 16-bit values, scale them down to 8-bit (0-255)
+            return tuple(c // 256 for c in rgb_short)
+        except tk.TclError:
+            # If winfo_rgb fails (e.g., invalid name or hex format), try manual hex parsing
+            hex_color = hex_color.lstrip('#')
+            if len(hex_color) == 6:
+                try:
+                    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                except ValueError:
+                    pass # Invalid hex
+            # Fallback for errors or invalid formats
+            print(f"Warning: Could not convert color '{hex_color}' to RGB. Using black (0, 0, 0).")
+            return (0, 0, 0)
+
+    def _rgb_to_hex(self, rgb_color):
+        """Converts an RGB tuple (0-255) to a hex color string."""
+        try:
+            r, g, b = map(int, rgb_color)
+            r = max(0, min(255, r)); g = max(0, min(255, g)); b = max(0, min(255, b))
+            return f'#{r:02x}{g:02x}{b:02x}'
+        except (ValueError, TypeError):
+             print(f"Warning: Invalid RGB color for conversion: {rgb_color}. Using #000000.")
+             return "#000000"
+
+    def _interpolate_color(self, color1_hex, color2_hex, factor):
+        """Linearly interpolates between two hex colors."""
+        rgb1 = self._hex_to_rgb(color1_hex)
+        rgb2 = self._hex_to_rgb(color2_hex)
+        factor = max(0.0, min(1.0, factor))
+        interpolated_rgb = [int(rgb1[i] + (rgb2[i] - rgb1[i]) * factor) for i in range(3)]
+        return self._rgb_to_hex(tuple(interpolated_rgb))
+
+    def _run_animation_step(self, widget, property_to_animate):
+        """Performs one step of the animation for the given widget and property."""
+        if widget not in self.animation_states:
+            return
+
+        state = self.animation_states[widget]
+        anim_id_key = f"{property_to_animate}_anim_id"
+        start_color_key = f"{property_to_animate}_start_color"
+        target_color_key = f"{property_to_animate}_target_color"
+        start_time_key = f"{property_to_animate}_start_time"
+
+        # Clear the stored ID now that this step is running
+        state[anim_id_key] = None
+
+        start_color = state.get(start_color_key)
+        target_color = state.get(target_color_key)
+        start_time = state.get(start_time_key, 0)
+
+        if start_color is None or target_color is None:
+             return # No active animation target for this property
+
+        elapsed = time.time() - start_time
+        progress = min(1.0, elapsed / self.transition_duration_sec)
+
+        current_color = self._interpolate_color(start_color, target_color, progress)
+
+        try:
+            if widget.winfo_exists():
+                # Apply the animation step using a dictionary for config
+                widget.config(**{property_to_animate: current_color})
+
+                if progress < 1.0:
+                    # Schedule the next step
+                    delay_ms = 15
+                    anim_id = widget.after(delay_ms, lambda w=widget, prop=property_to_animate: self._run_animation_step(w, prop))
+                    state[anim_id_key] = anim_id # Store the new ID for this property
+                else:
+                    # Animation finished
+                    widget.config(**{property_to_animate: target_color}) # Ensure final color
+                    # Mark this property's animation as inactive
+                    state[target_color_key] = None
+                    state[start_color_key] = None
+                    # Optionally check if *any* animations are running for this widget before deleting state entry
+
+        except tk.TclError:
+            # Widget might have been destroyed, clean up state
+            if widget in self.animation_states:
+                 # Attempt to cancel any pending animations for this widget
+                 for key in list(state.keys()):
+                     if key.endswith("_anim_id") and state[key]:
+                         try: widget.after_cancel(state[key])
+                         except tk.TclError: pass
+                 del self.animation_states[widget]
+            # print(f"Warning: Widget {widget} destroyed during animation.") # Optional debug
+        except Exception as e:
+             print(f"Error during animation step for {widget}, property {property_to_animate}: {e}")
+             if widget in self.animation_states:
+                 # Attempt cleanup on error
+                 if state.get(anim_id_key):
+                     try: widget.after_cancel(state[anim_id_key])
+                     except tk.TclError: pass
+                 # Consider if removing the whole widget state is appropriate on *any* error
+                 # For now, just cancel the specific animation ID if present
+                 state[anim_id_key] = None # Mark as cancelled
+
+
+    def _start_animation(self, widget, new_target_color, property_to_animate="bg"):
+        """Starts or redirects the animation for a specific property of a widget."""
+        # Ensure state dictionary exists for this widget
+        if widget not in self.animation_states:
+            self.animation_states[widget] = {} # General state for the widget
+        state = self.animation_states[widget]
+
+        # Define keys specific to the property being animated
+        anim_id_key = f"{property_to_animate}_anim_id"
+        start_color_key = f"{property_to_animate}_start_color"
+        target_color_key = f"{property_to_animate}_target_color"
+        start_time_key = f"{property_to_animate}_start_time"
+
+        current_target = state.get(target_color_key)
+
+        # If already animating towards the desired color for this property, do nothing
+        if current_target == new_target_color:
+            return
+
+        # Cancel any pending animation step *for this specific property*
+        anim_id = state.get(anim_id_key)
+        if anim_id:
             try:
-                icon_image = tk.PhotoImage(file=icon_path)
-                self.iconphoto(False, icon_image) # Use self (ColorPickerApp window) instead of detail_win
-            except tk.TclError as e: # Catch potential TclError for image loading issues
-                print(f"Error loading icon: {e}")
-                print(f"Make sure icon file is a valid PNG and located at: {icon_path}")
-        else:
-            print(f"Icon file not found: {icon_path}")
+                widget.after_cancel(anim_id)
+            except tk.TclError: pass # Widget might be gone
+            state[anim_id_key] = None
+
+        try:
+            if not widget.winfo_exists():
+                 # Clean up state if widget is already destroyed
+                 if widget in self.animation_states: del self.animation_states[widget]
+                 return
+
+            # Get the *actual current* color of the property being animated
+            # Use try-except for cget as it can fail if property doesn't exist
+            try:
+                current_color = widget.cget(property_to_animate)
+            except tk.TclError:
+                print(f"Warning: Could not get property '{property_to_animate}' for widget {widget}. Using target color as start.")
+                current_color = new_target_color # Fallback
+
+            # Set new animation parameters in the state dictionary for this property
+            state[start_color_key] = current_color
+            state[target_color_key] = new_target_color
+            state[start_time_key] = time.time()
+
+            # Start the animation loop immediately for this property
+            self._run_animation_step(widget, property_to_animate)
+
+        except tk.TclError:
+             # print(f"Warning: Widget {widget} likely destroyed just before starting animation for {property_to_animate}.") # Optional debug
+             # Clean up if TclError occurs (e.g., widget destroyed between checks)
+             if widget in self.animation_states:
+                 del self.animation_states[widget] # Remove all state for this widget
+        except Exception as e:
+             print(f"Error starting animation for {widget}, property {property_to_animate}: {e}")
+             # Attempt cleanup on other errors
+             if widget in self.animation_states:
+                 if state.get(anim_id_key):
+                     try: widget.after_cancel(state[anim_id_key])
+                     except tk.TclError: pass
+                 # Decide if the whole widget state should be removed or just this property's animation keys
+                 state[anim_id_key] = None
+                 state[target_color_key] = None
+                 state[start_color_key] = None
 
 
-        self.auto_load_file() # Call auto_load_file at startup
+    def _bind_animated_hover(self, widget, original_bg, original_fg,
+                             hover_bg=None, hover_fg=None,
+                             property_to_animate="bg", check_state=False):
+        """
+        Binds Enter, Leave, FocusOut, and Destroy events for smooth hover animation
+        on a specified color property.
+
+        Args:
+            widget: The tkinter widget to bind events to.
+            original_bg: The normal color value for the animated property (e.g., "#555555").
+            original_fg: The normal foreground color (e.g., "white"). Used for fg config.
+            hover_bg: The target color for the animated property on hover.
+                      Defaults to self.global_highlight_color if None.
+            hover_fg: The foreground color on hover. Defaults to original_fg if None.
+            property_to_animate: The widget config option to animate (e.g., "bg", "highlightbackground").
+            check_state: If True, handlers will check widget['state'] before changing appearance.
+        """
+        if hover_fg is None:
+            hover_fg = original_fg
+        if hover_bg is None:
+             # Use the globally defined highlight color if a specific one isn't provided
+             hover_bg = self.global_highlight_color
+
+        # --- Store Original Colors ---
+        if widget not in self.widget_original_colors:
+             self.widget_original_colors[widget] = {}
+        # Store original values for *both* the animated property and foreground
+        self.widget_original_colors[widget][property_to_animate] = original_bg
+        self.widget_original_colors[widget]['fg'] = original_fg # Store original fg separately
+
+        # --- Define Event Handlers ---
+        def _on_hover_enter(event, w=widget, target_prop_color=hover_bg, target_fg_color=hover_fg, prop=property_to_animate):
+            try:
+                if not w.winfo_exists(): return
+                if not check_state or w['state'] == tk.NORMAL:
+                    # Set foreground immediately (if applicable and different)
+                    if 'fg' in w.config() and w.cget('fg') != target_fg_color:
+                         w.config(fg=target_fg_color)
+                    # Start the animation for the specified property
+                    self._start_animation(w, target_prop_color, property_to_animate=prop)
+            except tk.TclError: pass
+
+        def _on_hover_leave(event, w=widget, target_prop_color=original_bg, target_fg_color=original_fg, prop=property_to_animate):
+            try:
+                if not w.winfo_exists(): return
+
+                # Improved check: Ensure mouse is actually outside widget bounds
+                x, y = event.x_root, event.y_root
+                widget_x, widget_y = w.winfo_rootx(), w.winfo_rooty()
+                widget_w, widget_h = w.winfo_width(), w.winfo_height()
+
+                #if not (widget_x <= x < widget_x + widget_w and widget_y <= y < widget_y + widget_h):
+                
+                if not check_state or w['state'] == tk.NORMAL:
+                        # Set foreground immediately (if applicable and different)
+                        if 'fg' in w.config() and w.cget('fg') != target_fg_color:
+                            w.config(fg=target_fg_color)
+                        # Start animation back to original for the specified property
+                        self._start_animation(w, target_prop_color, property_to_animate=prop)
+            except tk.TclError: pass # Widget info might not be available
+            except Exception as e: # Catch potential errors getting geometry if window disappears
+                print(f"Error during hover leave check for {w}: {e}")
+
+
+        def _on_focus_out(event, w=widget, target_prop_color=original_bg, target_fg_color=original_fg, prop=property_to_animate):
+             try:
+                if not w.winfo_exists(): return
+
+                # Check mouse position relative to widget at the time of focus loss
+                root = w.winfo_toplevel()
+                mouse_x, mouse_y = root.winfo_pointerxy() # Get mouse coords relative to screen
+                widget_x, widget_y = w.winfo_rootx(), w.winfo_rooty()
+                widget_w, widget_h = w.winfo_width(), w.winfo_height()
+
+                is_mouse_outside = not (widget_x <= mouse_x < widget_x + widget_w and
+                                        widget_y <= mouse_y < widget_y + widget_h)
+
+                # Determine if reset is needed based on state and mouse position
+                should_reset = False
+                if check_state and w['state'] != tk.NORMAL:
+                    should_reset = True # Always reset if disabled (and state checking is on)
+                elif not check_state or w['state'] == tk.NORMAL:
+                    if is_mouse_outside:
+                        should_reset = True # Reset if enabled and mouse is outside
+
+                if should_reset:
+                     # Set foreground immediately (if applicable and different)
+                     if 'fg' in w.config() and w.cget('fg') != target_fg_color:
+                         w.config(fg=target_fg_color)
+                     # Start animation back to original for the specified property
+                     self._start_animation(w, target_prop_color, property_to_animate=prop)
+
+             except tk.TclError: pass # Widget info might not be available
+             except Exception as e:
+                 print(f"Error during focus out check for {w}: {e}")
+
+
+        def _on_destroy(event, w=widget):
+            # Cleanup animation state and original color storage
+            if w in self.animation_states:
+                state = self.animation_states[w]
+                # Cancel all potential animations for this widget
+                for key in list(state.keys()):
+                     if key.endswith("_anim_id") and state[key]:
+                         try: w.after_cancel(state[key])
+                         except tk.TclError: pass
+                del self.animation_states[w]
+            if w in self.widget_original_colors:
+                del self.widget_original_colors[w]
+
+        # --- Perform Binding ---
+        widget.bind("<Enter>", _on_hover_enter, add='+')
+        widget.bind("<Leave>", _on_hover_leave, add='+')
+        widget.bind("<FocusOut>", _on_focus_out, add='+') # Handle losing focus
+        widget.bind("<Destroy>", _on_destroy, add='+') # Handle widget destruction
+
+# END OF ANIMATED HOVER CODE (REVISED)
+
+# END OF ANIMATED HOVER CODE
 
 
     def _load_font_size_setting(self):
