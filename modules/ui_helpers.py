@@ -238,7 +238,12 @@ def focus_config_viewer_from_floating_button(app): # 'app' is 'self' if called f
                 # It might close the floating button's own window, etc.
                 # Keep it if it's required for your workflow after focusing the main window.
                 print("Debug: Calling app.on_details_window_close() after focusing main window...") # Optional Debug Print
-                app.on_details_window_close() # Call your function regardless of focus success if window handle was found
+                
+                
+                if not app.leave_config_window_open:
+                    app.details_window_intentionally_closed = True
+                    
+                    app.on_details_window_close()  # Call your function regardless of focus success if window handle was found
 
                 return True # Indicate that the window was found and focus was attempted
 
